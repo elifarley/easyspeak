@@ -27,6 +27,9 @@ msgstr "Grille fermée"
 msgid "I couldn't move the pointer."
 msgstr "Je n'ai pas pu déplacer le pointeur."
 
+msgid "I couldn't show the grid."
+msgstr "Je n'ai pas pu afficher la grille."
+
 msgid "I tried, but I'm not sure it worked."
 msgstr "J'ai essayé, mais je ne suis pas sûr que cela ait fonctionné."
 

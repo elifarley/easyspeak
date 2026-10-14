@@ -1,11 +1,21 @@
 """Tests for the gridydotool plugin: the zone math, its parity with mousegrid,
 and the parser that turns an utterance into zone numbers."""
 
+import io
+import time
 from unittest.mock import Mock
 
 import pytest
 from easyspeak.plugins import gridydotool, mousegrid
 from easyspeak.plugins import gridydotool as g
+
+
+@pytest.fixture(autouse=True)
+def _reap_leaked_helper():
+    """No test — passing or failing — leaves a spawned helper behind."""
+    yield
+    if g._helper is not None:
+        g.stop_helper("test cleanup")
 
 
 class TestZoneMath:
@@ -407,3 +417,209 @@ class TestRedraw:
         monkeypatch.setattr(g, "_send", sent.append, raising=False)
         g._redraw((0, 0, 900, 600))
         assert sent == [{"cmd": "show", "bounds": [0, 0, 900, 600]}]
+
+
+class TestHelperChannel:
+    def _fake_helper(self, tmp_path, script):
+        path = tmp_path / "helper.py"
+        path.write_text(script, encoding="utf-8")
+        return str(path)
+
+    def test_ready_then_presented_are_logged_and_geometry_returned(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        helper = self._fake_helper(
+            tmp_path,
+            "import json, sys\n"
+            "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 1920, 1080],"
+            " 'scale': 1.0}), flush=True)\n"
+            "print(json.dumps({'event': 'presented'}), flush=True)\n"
+            "sys.stdin.readline()\n",
+        )
+        monkeypatch.setattr(g, "HELPER", helper)
+        monkeypatch.setattr(g, "grid_python", lambda: "python3")
+        with caplog.at_level("DEBUG"):
+            assert g._start_helper() == (0, 0, 1920, 1080)
+        g.stop_helper("test")
+        assert any("ready" in r.message and "1920" in r.message for r in caplog.records)
+
+    def test_a_silent_helper_hits_the_deadline_and_is_reaped(
+        self, monkeypatch, tmp_path
+    ):
+        helper = self._fake_helper(tmp_path, "import time\ntime.sleep(60)\n")
+        monkeypatch.setattr(g, "HELPER", helper)
+        monkeypatch.setattr(g, "grid_python", lambda: "python3")
+        monkeypatch.setattr(g, "PROBE_TIMEOUT", 0.5)
+        assert g._start_helper() is None
+        assert g._helper is None
+
+    def test_an_error_answer_ends_the_handshake_with_its_message(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        helper = self._fake_helper(
+            tmp_path,
+            "import json, sys, time\n"
+            "print(json.dumps({'event': 'error',"
+            " 'message': 'layer-shell unsupported'}), flush=True)\n"
+            "time.sleep(60)\n",
+        )
+        monkeypatch.setattr(g, "HELPER", helper)
+        monkeypatch.setattr(g, "grid_python", lambda: "python3")
+        with caplog.at_level("WARNING"):
+            assert g._start_helper() is None
+        assert any("layer-shell unsupported" in r.message for r in caplog.records)
+
+    def test_a_helper_that_dies_first_is_reaped(self, monkeypatch, tmp_path):
+        helper = self._fake_helper(tmp_path, "raise SystemExit(1)\n")
+        monkeypatch.setattr(g, "HELPER", helper)
+        monkeypatch.setattr(g, "grid_python", lambda: "python3")
+        assert g._start_helper() is None
+        assert g._helper is None
+
+    def test_a_bad_line_is_logged_and_ignored(self, monkeypatch, tmp_path):
+        helper = self._fake_helper(
+            tmp_path,
+            "import json, sys\n"
+            "print('not json at all', flush=True)\n"
+            "print(json.dumps({'event': 'ready', 'monitor': [1, 2, 3, 4]}), flush=True)\n"
+            "sys.stdin.readline()\n",
+        )
+        monkeypatch.setattr(g, "HELPER", helper)
+        monkeypatch.setattr(g, "grid_python", lambda: "python3")
+        assert g._start_helper() == (1, 2, 3, 4)
+        g.stop_helper("test")
+
+
+@pytest.fixture
+def start_helper(monkeypatch, tmp_path):
+    """Run the handshake against a fake helper written from `script`."""
+
+    def _start(script):
+        path = tmp_path / "helper.py"
+        path.write_text(script, encoding="utf-8")
+        monkeypatch.setattr(g, "HELPER", str(path))
+        monkeypatch.setattr(g, "grid_python", lambda: "python3")
+        return g._start_helper()
+
+    return _start
+
+
+class TestHelperLifecycle:
+    """Closing is idempotent: every mode exit closes the session twice.
+
+    A dismissal runs `_dismiss()` → `_close_session()`, then `_open_session`'s
+    `finally` calls it again, and the same two calls happen when no helper was
+    ever started.
+    """
+
+    def test_closing_twice_reaps_once_and_survives_the_second_call(self, start_helper):
+        assert start_helper(
+            "import json, sys\n"
+            "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 8, 8]}), flush=True)\n"
+            "sys.stdin.readline()\n",
+        ) == (0, 0, 8, 8)
+        helper = g._helper
+        g._close_session()
+        g._close_session()
+        assert g._helper is None
+        assert helper.poll() is not None
+
+    def test_closing_twice_writes_one_hide(self, monkeypatch):
+        stdin = io.StringIO()
+        monkeypatch.setattr(g, "_helper", Mock(stdin=stdin, poll=Mock(return_value=0)))
+        g._close_session()
+        g._close_session()
+        assert stdin.getvalue() == '{"cmd": "hide"}\n'
+
+    def test_closing_with_nothing_running_is_a_no_op(self, monkeypatch):
+        monkeypatch.setattr(g, "_helper", None)
+        assert g._send({"cmd": "hide"}) is False
+        g._close_session()
+        g._close_session()
+
+    def test_a_helper_that_ignores_sigterm_is_killed(
+        self, monkeypatch, start_helper, caplog
+    ):
+        monkeypatch.setattr(g, "REAP_GRACE", 0.2)
+        assert start_helper(
+            "import json, signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 8, 8]}), flush=True)\n"
+            "time.sleep(60)\n",
+        ) == (0, 0, 8, 8)
+        helper = g._helper
+        with caplog.at_level("WARNING"):
+            g.stop_helper("stubborn")
+        assert helper.poll() is not None
+        assert g._helper is None
+        assert any("ignored SIGTERM" in r.message for r in caplog.records)
+
+    def test_a_broken_pipe_swallows_the_command(self, monkeypatch, caplog):
+        """A helper that died between the handshake and a command is not a
+        crash: the write fails, the line is dropped, and the log says so."""
+        stdin = Mock()
+        stdin.write.side_effect = BrokenPipeError("the helper is gone")
+        monkeypatch.setattr(g, "_helper", Mock(stdin=stdin, poll=Mock(return_value=1)))
+        with caplog.at_level("WARNING"):
+            assert g._send({"cmd": "hide"}) is False
+        assert any("the helper is gone" in r.message for r in caplog.records)
+
+
+class TestHelperStartFailures:
+    def test_no_interpreter_means_no_helper(self, monkeypatch):
+        spawn = Mock()
+        monkeypatch.setattr(g, "grid_python", lambda: None)
+        monkeypatch.setattr(g.subprocess, "Popen", spawn)
+        assert g._start_helper() is None
+        spawn.assert_not_called()
+
+    def test_a_helper_that_cannot_spawn_is_logged(self, monkeypatch, caplog):
+        monkeypatch.setattr(g, "grid_python", lambda: "python3")
+        monkeypatch.setattr(g.subprocess, "Popen", Mock(side_effect=OSError("gone")))
+        with caplog.at_level("WARNING"):
+            assert g._start_helper() is None
+        assert g._helper is None
+        assert any("could not start" in r.message for r in caplog.records)
+
+    def test_a_ready_event_without_geometry_is_refused(self, start_helper, caplog):
+        with caplog.at_level("WARNING"):
+            assert (
+                start_helper(
+                    "import json, time\n"
+                    "print(json.dumps({'event': 'ready', 'monitor': []}), flush=True)\n"
+                    "time.sleep(60)\n",
+                )
+                is None
+            )
+        assert g._helper is None
+        assert any("no usable geometry" in r.message for r in caplog.records)
+
+    def test_an_event_before_ready_is_logged_and_skipped(self, start_helper, caplog):
+        with caplog.at_level("DEBUG"):
+            assert start_helper(
+                "import json, sys\n"
+                "print(json.dumps({'event': 'presented'}), flush=True)\n"
+                "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 10, 10]}),"
+                " flush=True)\n"
+                "sys.stdin.readline()\n",
+            ) == (0, 0, 10, 10)
+        assert any("presented" in r.message for r in caplog.records)
+        g.stop_helper("test")
+
+    def test_open_session_speaks_when_the_helper_cannot_start(self, monkeypatch, core):
+        monkeypatch.setattr(g, "_start_helper", lambda: None)
+        assert g._open_session(core) is None
+        core.speak.assert_called_once_with("I couldn't show the grid.")
+
+
+class TestReadUntil:
+    def test_a_deadline_that_has_passed_gives_up(self, tmp_path):
+        path = tmp_path / "stream"
+        path.write_text("", encoding="utf-8")
+        with path.open() as stream:
+            assert g.read_until(stream, 0) is None
+
+    def test_a_stream_that_cannot_be_polled_gives_up(self):
+        stream = Mock()
+        stream.fileno.side_effect = ValueError("closed")
+        assert g.read_until(stream, time.monotonic() + 1) is None

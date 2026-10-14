@@ -8,12 +8,15 @@ shadows the same phrases, so one utterance must land on the same pixel whichever
 backend answers.
 """
 
+import json
 import logging
 import os
 import re
+import select
 import shutil
 import socket
 import subprocess
+import time
 from pathlib import Path
 
 from easyspeak.core.i18n import translator
@@ -151,6 +154,7 @@ _monitor = None
 _monitor_origin = (0, 0)
 _grid_open = False
 _last_bounds = None
+_helper = None
 
 
 def active():
@@ -391,8 +395,9 @@ def _open_session(core, bounds=None):
     to say.
     """
     global _monitor, _monitor_origin, _bounds, _grid_open
-    geometry = _start_helper()  # Task 4 fills this in
+    geometry = _start_helper()
     if geometry is None:
+        core.speak(_("I couldn't show the grid."))
         return None
     _monitor = geometry
     _monitor_origin = (geometry[0], geometry[1])
@@ -530,3 +535,139 @@ def _fire_click(kind, core):
         core.speak(_("I couldn't move the pointer."))
     elif outcome == "unknown":
         core.speak(_("I tried, but I'm not sure it worked."))
+
+
+def _start_helper():
+    """Spawn the helper, take its geometry, and return it or None.
+
+    The helper is spawned with `Popen`, not `run`: `run` would only return once
+    the process exits, and this process must stay up and keep rendering. The
+    `ready` wait is a read on a live child's pipe, so it is bounded by a `select`
+    deadline rather than a subprocess timeout, which cannot reach a pipe read. A
+    helper that stays alive and writes nothing is the case that distinction
+    exists for.
+    """
+    global _helper
+    python = grid_python()
+    if python is None:
+        return None
+    try:
+        _helper = subprocess.Popen(
+            [python, HELPER],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as exc:
+        logger.warning("grid: the helper could not start: %s", exc)
+        _helper = None
+        return None
+
+    deadline = time.monotonic() + PROBE_TIMEOUT
+    while True:
+        message = read_until(_helper.stdout, deadline)
+        if message is None:
+            logger.warning("grid: the helper never reported ready (deadline)")
+            stop_helper("no ready inside PROBE_TIMEOUT")
+            return None
+        event = message.get("event")
+        if event == "ready":
+            logger.info(
+                "grid: ready on %s (scale %s)",
+                message.get("monitor"),
+                message.get("scale"),
+            )
+            break
+        if event == "error":
+            logger.warning("grid: helper refused: %s", message.get("message"))
+            stop_helper("helper error")
+            return None
+        logger.debug("grid: %s", event)
+
+    monitor = message.get("monitor")
+    if not monitor or len(monitor) != 4:
+        logger.warning("grid: the ready event carried no usable geometry")
+        stop_helper("bad geometry")
+        return None
+    return tuple(monitor)
+
+
+def read_until(stream, deadline):
+    """Read one JSON line from `stream`, or None when the deadline passes.
+
+    The bound is a mechanism here, not a property: `select` is what lets a
+    blocking read give up. The line is assembled from single bytes off the
+    descriptor rather than read back with `stream.readline()`, whose text layer
+    reads ahead: a line that layer holds is invisible to `select`, and a chunk
+    read here would strand every line after the one returned. One byte at a
+    time is what leaves the unread protocol in the one place `select` can see
+    it. Anything that does not parse is logged and skipped, and EOF reads as
+    None.
+    """
+    pending = b""
+    while True:
+        if pending.endswith(b"\n"):
+            line = pending.decode("utf-8", "replace")
+            pending = b""
+            try:
+                return json.loads(line)
+            except ValueError:
+                logger.warning(
+                    "grid: ignoring unparsable protocol line: %r", line[:120]
+                )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            ready, _, _ = select.select([stream], [], [], remaining)
+        except (OSError, ValueError):
+            return None
+        if not ready:
+            return None
+        chunk = os.read(stream.fileno(), 1)
+        if not chunk:
+            logger.warning("grid: the helper closed its output")
+            return None
+        pending += chunk
+
+
+def _send(payload):
+    """Write one protocol line to the helper, if one is running."""
+    if _helper is None or _helper.stdin is None:
+        return False
+    try:
+        _helper.stdin.write(json.dumps(payload) + "\n")
+        _helper.stdin.flush()
+    except (BrokenPipeError, ValueError):
+        logger.warning("grid: the helper is gone; dropping %s", payload.get("cmd"))
+        return False
+    return True
+
+
+def stop_helper(reason):
+    """Stop and reap the helper, escalating when it will not go.
+
+    `terminate()`, a bounded wait, then `kill()`, logging which rung was needed:
+    an unbounded `wait()` would freeze the mode at exactly the point this
+    function exists to make safe, and a process that cannot be scheduled to
+    handle SIGTERM still takes a kill from the kernel.
+    """
+    global _helper
+    helper, _helper = _helper, None
+    if helper is None or helper.poll() is not None:
+        return
+    helper.terminate()
+    try:
+        helper.wait(timeout=REAP_GRACE)
+        logger.debug("grid: helper stopped (%s)", reason)
+    except subprocess.TimeoutExpired:
+        logger.warning("grid: helper ignored SIGTERM (%s); killing", reason)
+        helper.kill()
+        helper.wait(timeout=REAP_GRACE)
+
+
+def _close_session():
+    """Tear the surface down and reap the helper; safe to call twice."""
+    _send({"cmd": "hide"})
+    stop_helper("session closed")
