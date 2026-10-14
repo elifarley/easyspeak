@@ -49,10 +49,10 @@ constraints), and one was confirmed independently:
 | Absolute move | `mousemove <x> <y>` — first emits `RelativeMove({-INT32_MAX, -INT32_MAX})` (clamps at the desktop origin), then the relative delta | "absolute" is an approximation; pointer acceleration can bias it |
 | Move syntax | positional `x y` (1.0.x's `--absolute -x -y` does not exist here) | argv is `["mousemove", str(x), str(y)]` |
 | Click buttons | `1` left, `2` right, `3` middle; press+release in one call, no `--repeat` | double-click = two sequential invocations |
-| Default delay | 100 ms before the action, per invocation (`--delay`) | two invocations ~200 ms apart; inside a typical 400 ms double-click window |
+| Default delay | 100 ms before the action, per invocation (`--delay`) | the plugin passes **`--delay 0`** — the daemon's device is already recognised — so a double-click pair carries no sleeps at all and its gap is measured in the harness (open item 4), not assumed |
 | Scroll | **no wheel verb at all** (`click`/`key`/`type`/`mousemove`/`mousemove_relative`) | scroll verbs are not expressible in this version — deferred, not silently dropped |
 | Daemon socket | hardcoded `/tmp/.ydotool_socket`, `chmod 0600`, no CLI flags | `ydotoold` must run **as the user**; a system-level daemon is unreachable by the client |
-| No daemon | client falls back to creating its own uinput device ("ydotoold backend unavailable (may have latency+delay issues)") | a reachable socket is **not** a prerequisite; the gate probes the binary functionally |
+| No daemon | client falls back to creating its own uinput device ("ydotoold backend unavailable (may have latency+delay issues)") | this fallback is exactly why the socket **is** a prerequisite for the click path: a device created per invocation may not be recognised before the events are emitted, so the gate requires the daemon and a fallback `notice:` classifies as `unknown` |
 | Failure signals | errors go to stderr (`error: …`, `Which coordinate …`, `Unknown tool …`); the daemon notice also goes to stderr | stderr signatures identify `errored`; they cannot identify `unknown`, which is why the seam returns one of three outcomes instead of a boolean |
 
 ### gtk4-layer-shell (Python binding)
