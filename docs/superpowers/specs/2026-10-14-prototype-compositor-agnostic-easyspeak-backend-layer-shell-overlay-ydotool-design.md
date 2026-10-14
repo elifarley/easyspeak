@@ -429,7 +429,7 @@ makes the ordering (move, then click) deterministic.
 | `docs/commands.md` | the grid verb table (`:36-53`): mark the verbs this backend cannot honour — `scroll` (`:48-49`) is not expressible in ydotool 0.1.8 at all, and `mark`/`drag` (`:50-51`) are deferred — so the table stops promising them uniformly across backends |
 | `docs/troubleshooting.md` | its grid section (`:3`) explains only the extension path; add what a missing layer-shell/ydotoold stack looks like on this backend |
 | `docs/index.md`, `README.md` | the feature lines (`index.md:33`, `README.md:25`) name the mouse grid without saying the extension is one of two ways to reach it |
-| `tests/integration/README.md` | the harness's layout entry and `EASYSPEAK_GRID_LIVE` (test-only, so it is documented with the harness, not with user settings) |
+| `tests/integration/README.md` | the harness's layout entry, its prerequisite set in one maintained place (sway, ydotool, the layer-shell build, and a `ydotoold` for arm B only), and `EASYSPEAK_GRID_LIVE` (test-only, so it is documented with the harness, not with user settings) |
 | `mgmt/ADL/<date>.adl.md` (in **system-priv**) | the agent's autonomous choices (D5, D6, D8, D9) — placed there, not here, so this fork's diff against upstream stays about the plugin, and because system-priv owns the `mgmt/` convention and the decision context for the issue |
 
 ## Testing
@@ -489,12 +489,26 @@ and its conftest's heavy-dependency stubs so no mic or model is needed. It:
    point is otherwise biased by pointer acceleration;
 2. launches the probe window and the plugin's helper inside that session, with
    `GI_TYPELIB_PATH`/`LD_LIBRARY_PATH` pointing at the layer-shell build tree;
-3. calls `gridydotool.setup(fake_core)` for real (the gate is part of what is
-   under test), then `handle("grid", fake_core)` with a fake `listen_modal` that
-   replays `["3 7 5", "click"]`;
+3. exercises the gate and the plugin in **two shapes**, because the gate's daemon
+   requirement and a privilege-free dry-run arm otherwise pull in opposite
+   directions:
+
+   - **as the box stands** — with no running `ydotoold`, the plugin must come out
+     inert: `handle("grid")` returns `None`, the INFO log names the socket, and the
+     word is left to `mousegrid`. That is a real gate assertion and it needs no
+     privileges at all;
+   - **with `EASYSPEAK_GRID_BACKEND=uinput`** forcing the backend, so the overlay
+     and argv assertions have a session to observe. The forced value
+     short-circuits the probes by design, which is what keeps this arm free of any
+     `/dev/uinput` requirement — arm B is the one that keeps the daemon, because
+     arm B is the one that injects.
+
+   Then `handle("grid", fake_core)` runs with a fake `listen_modal` that replays
+   `["3 7 5", "click"]`;
 4. asserts, in **two arms, and the separation is the point**:
 
-   **Arm A — dry run (the default, and the arm CI can run).** The plugin logs each
+   **Arm A — dry run (the default, and the arm CI can run precisely because it is
+   forced and never injects).** The plugin logs each
    helper event it consumes — `ready` with the geometry at INFO, `presented` at
    DEBUG — so the harness asserts on captured log records: the helper's stdout
    belongs to the plugin, and a test cannot claim to assert on a channel it does
@@ -570,10 +584,12 @@ worth doing rather than a nice-to-have.
 
 1. Branch pushed to the fork (`hug bpush`), CI green: `just format`, `lint`,
    `types`, `pytest`, `check-translations`, `check-python-packages` — and
-   `just integration` wherever sway, ydotool and the layer-shell build exist, since
-   that run is where arm A's assertions live. The folder's convention is to skip
-   gracefully when those binaries are absent, so a green run that skipped them says
-   so rather than being read as a pass.
+   `just integration` wherever sway, ydotool and the layer-shell build exist — plus
+   a running `ydotoold` for arm B, which is the only arm that injects, since arm A
+   forces the backend and needs none. That run is where arm A's assertions live, so
+   the folder's convention of skipping gracefully when a prerequisite is absent
+   means a green run has to say *which* prerequisite it skipped rather than being
+   read as a pass.
 2. Upstream issue on `ctsdownloads/easyspeak` carrying the findings: the ydotool
    0.1.8 semantics table (exit codes, `mousemove`, the 0600 socket), the
    layer-shell-on-Smithay-but-not-GNOME boundary as the natural gate, the
