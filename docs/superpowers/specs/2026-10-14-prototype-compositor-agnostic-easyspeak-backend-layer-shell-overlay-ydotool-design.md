@@ -191,11 +191,20 @@ protocol only; diagnostics go to stderr, which the plugin logs.
 | → helper | `{"cmd":"hide"}` / `{"cmd":"quit"}` | tear the surface down / exit |
 | ← helper | `{"event":"ready","monitor":[x,y,w,h],"scale":1.0}` | surface configured; monitor geometry — **the geometry authority** |
 | ← helper | `{"event":"presented"}` | first frame drawn (the harness asserts on this) |
-| ← helper | `{"event":"error","message":"…"}` | a failure the plugin should surface |
+| ← helper | `{"event":"error","message":"…"}` | a failure the plugin surfaces: during the handshake it ends the session at once, and afterwards it is logged |
 
 The helper exits on stdin EOF, so a daemon death can never leave an orphan
 overlay; `--probe` is a one-shot mode that prints `supported` / `unsupported`
 (off `is_supported()`), exits 0/1, and never maps a surface.
+
+**`show` refuses rather than degrades.** It re-checks `is_supported()` before
+mapping anything, and on a compositor without layer-shell — the forced-backend
+path, or a session that lost the protocol after startup — it answers
+`{"event":"error","message":"layer-shell unsupported"}` and maps nothing.
+Degrading to an ordinary window would be the worse failure: the overlay would look
+wrong while the injections still worked, which reads as a rendering bug instead of
+a refusal, and it is reachable on any GNOME session the moment someone forces the
+backend to see what happens.
 
 Geometry is in the compositor's **logical** coordinate space — the same space
 layer-shell anchors in and that `ydotool`'s relative motion lands in — and the
@@ -216,7 +225,7 @@ would sail past a bound written only as a property, which is the shape this desi
 must not have (and the shape a prior capture records: OB `a5e9d0fc`, a documented
 client timeout defeated by a peer that held the connection open and idle).
 
-Four cases, all specified rather than left to the implementer:
+Five cases, all specified rather than left to the implementer:
 
 - `ready` arrives — the mode starts.
 - the helper dies — the read returns EOF immediately; **kill and reap the helper
@@ -227,6 +236,11 @@ Four cases, all specified rather than left to the implementer:
   overlay, which is the design's own named worst outcome; the stdin-EOF rule only
   covers the case where something closes the pipe, and closing it is exactly what
   the reap does.
+- the helper answers `error` — the handshake ends *at that line* instead of waiting
+  out the deadline for a failure it has already been told about: reap, log the
+  helper's message verbatim, speak the grid-unavailable string. The helper is the
+  only component that knows why a surface was refused, so discarding its message is
+  the one case where the diagnostic matters most.
 - a command arrives before `ready` — it cannot be honoured, because a subdivision
   without geometry has no coordinates. The mode has not started, so this is
   unreachable rather than queued, which is what keeps a user's utterance order
@@ -399,7 +413,7 @@ makes the ordering (move, then click) deterministic.
 | Condition | Behaviour |
 |---|---|
 | Gate failed at setup | every `handle` returns `None`; `mousegrid` answers as today; INFO log names the reason |
-| Helper never reports `ready` inside `PROBE_TIMEOUT`, or dies first | helper killed and reaped **before** anything is spoken (a helper that mapped after the deadline must not be left ownerless); WARNING names the reason; the overlay was never wanted, so nothing is dismissed and nothing is aimed at |
+| Helper never reports `ready` inside `PROBE_TIMEOUT`, dies first, or answers `error` | helper stopped and reaped **before** anything is spoken (a helper that mapped after the deadline must not be left ownerless); WARNING names the reason, and the helper's own message is logged verbatim when it sent one; the overlay was never wanted, so nothing is dismissed and nothing is aimed at |
 | Helper stays alive and silent (the case a blocking read cannot escape) | same as above — that is what the `select` deadline is for, and why the bound is not a `subprocess` timeout |
 | Helper dies with the grid open | logged; mode ends; no orphan surface; the daemon keeps running |
 | The helper's output disappears mid-mode (monitor unplugged, compositor restarted) | the surface is gone, so the mode ends and the bounds are discarded — a click is never injected against geometry that no longer exists |
@@ -508,8 +522,8 @@ and its conftest's heavy-dependency stubs so no mic or model is needed. It:
 4. asserts, in **two arms, and the separation is the point**:
 
    **Arm A — dry run (the default, and the arm CI can run precisely because it is
-   forced and never injects).** The plugin logs each
-   helper event it consumes — `ready` with the geometry at INFO, `presented` at
+   forced and never injects).** The plugin logs each helper event it consumes —
+   `ready` with the geometry at INFO, `presented` at
    DEBUG — so the harness asserts on captured log records: the helper's stdout
    belongs to the plugin, and a test cannot claim to assert on a channel it does
    not own. Alongside that: the nine cells' sampled `grim` points differ from a
