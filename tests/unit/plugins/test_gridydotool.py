@@ -216,7 +216,11 @@ class TestGate:
 
     def test_injector_probe_requires_the_socket(self, monkeypatch):
         monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
-        monkeypatch.setattr(g.socket, "socket", Mock())  # never connects
+        # `connect` raises, so the probe fails on the socket alone and never
+        # spawns: deterministic also on a host with ydotool and a live daemon.
+        stub = Mock()
+        stub.connect.side_effect = OSError("connection refused")
+        monkeypatch.setattr(g.socket, "socket", Mock(return_value=stub))
         assert g._probe_injector() is False
 
 
