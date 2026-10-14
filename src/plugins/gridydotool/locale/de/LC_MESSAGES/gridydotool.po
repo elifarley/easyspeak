@@ -24,6 +24,12 @@ msgstr "Raster"
 msgid "Grid closed"
 msgstr "Raster geschlossen"
 
+msgid "I couldn't move the pointer."
+msgstr "Ich konnte den Zeiger nicht bewegen."
+
+msgid "I tried, but I'm not sure it worked."
+msgstr "Ich habe es versucht, aber ich bin nicht sicher, ob es geklappt hat."
+
 msgid "again - reopen at the last spot"
 msgstr "again - an der letzten Stelle wieder öffnen"
 

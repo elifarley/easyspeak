@@ -249,3 +249,65 @@ class TestRouting:
 
     def test_inert_plugin_never_claims_anything(self, core):
         assert g.handle("grid", core) is None
+
+
+class TestModeDispatch:
+    def test_digits_subdivide_and_redraw(self, monkeypatch, core):
+        calls = []
+        monkeypatch.setattr(g, "_redraw", calls.append)
+        g._bounds = (0, 0, 900, 600)
+        core.listen_modal = Mock(return_value=iter(["3 7 5"]))
+        g._run_mode(core)
+        # 3 -> (600, 0, 300, 200); 7 -> (600, 132, 100, 66); 5 -> (633, 154, 33, 22)
+        assert calls[-1] == (633, 154, 33, 22)
+
+    def test_click_moves_then_clicks_then_ends(self, monkeypatch, core):
+        seen = []
+        monkeypatch.setattr(g, "move_to", lambda x, y: seen.append(("move", x, y)))
+        monkeypatch.setattr(
+            g, "click", lambda button="click": seen.append(("click", button))
+        )
+        monkeypatch.setattr(g, "_dismiss", lambda: seen.append(("dismiss",)))
+        g._bounds = (0, 0, 900, 600)
+        core.listen_modal = Mock(return_value=iter(["click"]))
+        g._run_mode(core)
+        # Centre of the whole output: (450, 300), and the cell is remembered.
+        assert seen[-3:] == [("move", 450, 300), ("click", "click"), ("dismiss",)]
+        assert g._last_bounds == (0, 0, 900, 600)
+
+    def test_close_ends_the_mode_without_clicking(self, monkeypatch, core):
+        monkeypatch.setattr(g, "move_to", Mock())
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        core.listen_modal = Mock(return_value=iter(["close"]))
+        g._run_mode(core)
+        g.move_to.assert_not_called()
+        g._dismiss.assert_called_once()
+
+    def test_unrecognised_utterance_keeps_the_mode(self, monkeypatch, core):
+        monkeypatch.setattr(g, "move_to", Mock())
+        # `_dismiss` is stubbed as in the two tests above: its real body calls
+        # `_close_session`, which is Task 4's seam and undefined at this commit.
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        core.listen_modal = Mock(return_value=iter(["open firefox", "close"]))
+        g._run_mode(core)
+
+    def test_unknown_outcome_speaks_the_uncertain_line(self, monkeypatch, core):
+        monkeypatch.setattr(g, "move_to", lambda x, y: "unknown")
+        monkeypatch.setattr(g, "click", lambda button="click": "unknown")
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        g._bounds = (0, 0, 900, 600)
+        core.listen_modal = Mock(return_value=iter(["click"]))
+        g._run_mode(core)
+        assert (
+            core.speak.call_args_list[-1].args[0]
+            == "I tried, but I'm not sure it worked."
+        )
+
+    def test_errored_outcome_speaks_the_definite_line(self, monkeypatch, core):
+        monkeypatch.setattr(g, "move_to", lambda x, y: "errored")
+        monkeypatch.setattr(g, "click", lambda button="click": "errored")
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        g._bounds = (0, 0, 900, 600)
+        core.listen_modal = Mock(return_value=iter(["click"]))
+        g._run_mode(core)
+        assert core.speak.call_args_list[-1].args[0] == "I couldn't move the pointer."

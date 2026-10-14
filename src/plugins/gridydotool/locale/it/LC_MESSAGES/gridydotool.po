@@ -24,6 +24,12 @@ msgstr "Griglia"
 msgid "Grid closed"
 msgstr "Griglia chiusa"
 
+msgid "I couldn't move the pointer."
+msgstr "Non sono riuscito a spostare il puntatore."
+
+msgid "I tried, but I'm not sure it worked."
+msgstr "Ci ho provato, ma non sono sicuro che abbia funzionato."
+
 msgid "again - reopen at the last spot"
 msgstr "again - riapre nell'ultimo punto"
 

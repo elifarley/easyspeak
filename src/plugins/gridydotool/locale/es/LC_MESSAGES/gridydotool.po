@@ -24,6 +24,12 @@ msgstr "Cuadrícula"
 msgid "Grid closed"
 msgstr "Cuadrícula cerrada"
 
+msgid "I couldn't move the pointer."
+msgstr "No he podido mover el puntero."
+
+msgid "I tried, but I'm not sure it worked."
+msgstr "Lo intenté, pero no estoy seguro de que haya funcionado."
+
 msgid "again - reopen at the last spot"
 msgstr "again - reabrir en el último punto"
 

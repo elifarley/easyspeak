@@ -447,3 +447,89 @@ def handle(cmd, core):
         return True
 
     return None
+
+
+CLICK_VERBS = {
+    "double": "double",
+    "middle": "middle",
+    "right": "right",
+}
+
+
+def _redraw(bounds):
+    """Tell the helper to redraw the numbered grid over these bounds."""
+    _send({"cmd": "show", "bounds": list(bounds)})
+
+
+def _run_mode(core):
+    """Dispatch one utterance per round until the mode ends.
+
+    Core owns the loop (see listen_modal) so the tray stays live and an
+    unattended grid times out instead of holding the microphone for ever.
+    """
+    global _bounds, _last_bounds
+    for spoken in core.listen_modal(
+        "grid",
+        prompt=(
+            "one two three four five six seven eight nine click double "
+            "right close cancel"
+        ),
+        timeout=10,
+        idle_timeout=30,
+    ):
+        text = spoken.lower()
+        words = set(text.split())
+
+        if words & DISMISS_WORDS:
+            _dismiss()
+            core.speak(_("Grid closed"))
+            return
+
+        if _click_kind(text, words):
+            _fire_click(_click_kind(text, words), core)
+            return
+
+        zones = parse_number_sequence(text)
+        if zones and _bounds:
+            for zone in zones:
+                _bounds = subdivide(_bounds, zone)
+            _redraw(_bounds)
+
+
+def _click_kind(_text, words):
+    """Return the click flavour named by an utterance, or None."""
+    for marker, kind in CLICK_VERBS.items():
+        if marker in words:
+            return kind
+    if "click" in words or "lick" in words or "clique" in words:
+        return "click"
+    return None
+
+
+def _fire_click(kind, core):
+    """Move to the cell centre, click, remember the cell, and hide the grid.
+
+    The cell is remembered here rather than on every subdivision, mirroring
+    mousegrid: "again" means "back to where I last clicked", not "back to the
+    last cell I walked past".
+    """
+    global _last_bounds
+    if not _bounds:
+        return
+    x, y = center(_bounds)
+    _last_bounds = _bounds
+    outcome = move_to(x, y)
+    if outcome != "errored":
+        # Only a refused move stops the click: the tool rejected that very
+        # invocation, so the pointer's position is unproven. An `unknown`
+        # move is not a refusal — the click is still attempted — and the
+        # move's own outcome stands for what is spoken, because an injection
+        # that timed out is never answered with silence.
+        clicked = double_click() if kind == "double" else click(kind)
+        if outcome == "ran":
+            outcome = clicked
+    _dismiss()
+    if outcome == "errored":
+        core.speak(_("I couldn't move the pointer."))
+    elif outcome == "unknown":
+        core.speak(_("I tried, but I'm not sure it worked."))
