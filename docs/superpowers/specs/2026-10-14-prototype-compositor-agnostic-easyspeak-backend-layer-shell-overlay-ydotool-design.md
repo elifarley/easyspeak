@@ -480,8 +480,13 @@ conventions (excluded from default discovery, skip fixtures for missing binaries
 and its conftest's heavy-dependency stubs so no mic or model is needed. It:
 
 1. starts `sway` with `WLR_BACKENDS=headless`, `WLR_LIBINPUT_NO_DEVICES=1` and a
-   generated config whose `input *` section sets **`accel_profile flat`** — the
-   relative move's landing point is otherwise biased by pointer acceleration;
+   generated config that **pins the output mode** (`output HEADLESS-1 mode
+   1920x1080`, the syntax sway's own `output` command documents) and whose
+   `input *` section sets **`accel_profile flat`** — the mode is pinned because
+   arm B's literal is computed for exactly that geometry, and a headless output
+   takes whatever mode the config gives it, so its default is not a premise
+   anything may be built on; the flat profile because the relative move's landing
+   point is otherwise biased by pointer acceleration;
 2. launches the probe window and the plugin's helper inside that session, with
    `GI_TYPELIB_PATH`/`LD_LIBRARY_PATH` pointing at the layer-shell build tree;
 3. calls `gridydotool.setup(fake_core)` for real (the gate is part of what is
@@ -501,12 +506,17 @@ and its conftest's heavy-dependency stubs so no mic or model is needed. It:
    **Arm B — live injection, opened explicitly and never by default.** With
    `EASYSPEAK_GRID_LIVE=click`, the probe window must report coordinates inside the
    expected cell and a button-1 press there, and the expectation is a
-   **hand-computed literal** rather than a re-derivation: for a 1920×1080 output
-   and the sequence `3 7 5`, zone 3 gives `(1280, 0, 640, 360)`, zone 7 gives
-   `(1280, 240, 213, 120)`, and zone 5 gives `(1351, 280, 71, 40)` — so the click
-   landing inside `x` in `[1351, 1422)` and `y` in `[280, 320)`, centre
-   `(1386, 300)`, with whatever tolerance the acceleration measurement settles.
-   Deriving that rect with the same algorithm the plugin uses would make the
+   **hand-computed literal** rather than a re-derivation — with its premise
+   asserted *before* the arithmetic: the plugin's captured `ready` geometry must
+   equal the pinned 1920×1080, so a config drift fails at the premise instead of
+   arriving as a mysterious coordinate mismatch. Then, for the sequence `3 7 5`:
+   zone 3 gives `(1280, 0, 640, 360)`, zone 7 gives `(1280, 240, 213, 120)`, and
+   zone 5 gives `(1351, 280, 71, 40)` — so the click must land inside `x` in
+   `[1351, 1422)` and `y` in `[280, 320)`, centre `(1386, 300)`, with a tolerance
+   that is **bounded rather than left to the measurement**: inside that rect
+   expanded by at most a quarter of the cell's smaller dimension (17 px here), so
+   that widening the tolerance can never be the reason the assertion passes.
+   Deriving the rect with the same algorithm the plugin uses would make the
    assertion agree with any shared off-by-one; the algorithmic prediction stays
    only as a cross-check, with that reason written down next to it.
 
@@ -584,8 +594,10 @@ worth doing rather than a nice-to-have.
    desktop's double-click window turns the pair into two single clicks. Log the
    measured gap when it exceeds the window, and record the number.
 5. **How large is the acceleration bias?** Measured in the harness with a flat
-   profile; the assertion tolerance is set from the measurement, and the numbers
-   are recorded in the docs.
+   profile; the measurement sets the tolerance *within the bound arm B states* (a
+   quarter of the cell's smaller dimension), and the recorded number goes in the
+   docs. The bound exists so that a measurement cannot quietly turn the assertion
+   into a formality.
 6. **Does headless `sway` pick up a uinput device that appears after startup?**
    (wlroots monitors udev; if not, the device is created before sway starts.)
 7. **Multi-output**: the grid opens on the default monitor today, and D6's single
@@ -608,9 +620,10 @@ Mapped to the issue's, with how each is discharged:
    scripted** — scored as two criteria so the safety default cannot read as a
    failure: **3a** (always runnable, the default) asserts the exact `ydotool` argv
    per verb and the overlay lifecycle under dry run; **3b** (opened explicitly with
-   `EASYSPEAK_GRID_LIVE=click`, ideally in the isolated VM) asserts the probe
-   window's reported coordinates inside the hand-computed literal cell rect and the
-   button-1 press there.
+   `EASYSPEAK_GRID_LIVE=click`, ideally in the isolated VM) asserts the pinned
+   geometry first, then the probe window's reported coordinates inside the
+   hand-computed literal cell rect with the tolerance bounded to a quarter of the
+   cell, and the button-1 press there.
 4. **Daemon-only stack shows no regression** — the full `just pytest` suite
    (including `mousegrid`'s own), `just integration`, and a live daemon smoke on
    this box: wake word, commands, dictation, TTS. The gate matrix proves the
