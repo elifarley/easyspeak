@@ -44,7 +44,8 @@ constraints), and one was confirmed independently:
 
 | Behaviour | Verified detail | Consequence for the plugin |
 |---|---|---|
-| Exit code | `MouseMove::Exec` and `Click::Exec` both `return argc` | `ydotool click 1` **exits 2 on success**; exit codes are advisory only |
+| Exit code | `MouseMove::Exec` and `Click::Exec` both `return argc` | `ydotool click 1` **exits 2 on success**; the code carries no failure meaning on its own |
+| Success code per invocation | `argc` of the argv the tool itself sees: `mousemove_relative 0 0` returns **3**, `click 1` returns **2** — which collides with the parse-error return of the move tools | the gate's probe uses the unambiguous form (`mousemove_relative 0 0`, success 3) and never `click`, whose success code is indistinguishable from an error |
 | Absolute move | `mousemove <x> <y>` — first emits `RelativeMove({-INT32_MAX, -INT32_MAX})` (clamps at the desktop origin), then the relative delta | "absolute" is an approximation; pointer acceleration can bias it |
 | Move syntax | positional `x y` (1.0.x's `--absolute -x -y` does not exist here) | argv is `["mousemove", str(x), str(y)]` |
 | Click buttons | `1` left, `2` right, `3` middle; press+release in one call, no `--repeat` | double-click = two sequential invocations |
@@ -52,7 +53,7 @@ constraints), and one was confirmed independently:
 | Scroll | **no wheel verb at all** (`click`/`key`/`type`/`mousemove`/`mousemove_relative`) | scroll verbs are not expressible in this version — deferred, not silently dropped |
 | Daemon socket | hardcoded `/tmp/.ydotool_socket`, `chmod 0600`, no CLI flags | `ydotoold` must run **as the user**; a system-level daemon is unreachable by the client |
 | No daemon | client falls back to creating its own uinput device ("ydotoold backend unavailable (may have latency+delay issues)") | a reachable socket is **not** a prerequisite; the gate probes the binary functionally |
-| Failure signals | errors go to stderr (`error: …`, `Which coordinate …`, `Unknown tool …`); the daemon notice also goes to stderr | probe on **stderr signatures**, never on exit code |
+| Failure signals | errors go to stderr (`error: …`, `Which coordinate …`, `Unknown tool …`); the daemon notice also goes to stderr | stderr signatures identify `errored`; they cannot identify `unknown`, which is why the seam returns one of three outcomes instead of a boolean |
 
 ### gtk4-layer-shell (Python binding)
 
@@ -130,13 +131,17 @@ constraints), and one was confirmed independently:
   not a surprise.
 - **D8 — Ship complete reply catalogs (agent decision).** The completeness test
   forbids empty/fuzzy entries and `check-translations` would create stub catalogs
-  for any package with translatable strings, so the plugin ships **three** strings
+  for any package with translatable strings, so the plugin ships **four** strings
   per language in de/es/fr/it, drafted by the agent and flagged for human review:
-  the open acknowledgement (`Grid`), the dismissal (`Grid closed.`) and the
-  injection failure (`I couldn't move the pointer.`). Rejected: silence (no `_()`
-  calls) — a voice-driven UI with no spoken acknowledgement of a click, and no
-  audible signal when injection fails, would be a worse prototype than
-  `mousegrid`.
+  the open acknowledgement (`Grid`), the dismissal (`Grid closed.`), the definite
+  injection failure (`I couldn't move the pointer.`) and the unknown outcome
+  (`I tried, but I'm not sure it worked.`). The fourth string exists because a
+  timeout leaves the outcome genuinely unknown, so "it didn't work" would be a
+  claim the plugin cannot make — and the user acts differently on the two: one
+  invites a retry, the other warns that the retry may be a second click.
+  Rejected: silence (no `_()` calls) — a voice-driven UI with no spoken
+  acknowledgement of a click, and no audible signal when injection fails, would be
+  a worse prototype than `mousegrid`.
 - **D9 — A dry-run seam, because uinput is kernel-global (agent decision).**
   Injected events reach *every* compositor on the machine, including the user's
   live session, even when the harness runs its own headless `sway`. Real injection
@@ -196,15 +201,38 @@ forced = EASYSPEAK_GRID_BACKEND
   "gnome"  -> inert
   unset    -> overlay_ready AND injector_ready
 
-overlay_ready  = grid_python() is not None AND helper --probe exits 0
-injector_ready = shutil.which("ydotool") AND a no-op mousemove_relative 0 0
-                 whose stderr carries no error signature
+overlay_ready  = grid_python() is not None
+                 AND helper --probe exits 0 within PROBE_TIMEOUT
+injector_ready = shutil.which("ydotool")
+                 AND a no-op mousemove_relative 0 0 reports outcome `ran`
+                     (success code 3, no error signature) within PROBE_TIMEOUT
 ```
 
 `grid_python()` mirrors dictation's probe: `EASYSPEAK_GRID_PYTHON` override, then
 `python3`, `/usr/bin/python3`, `/usr/bin/python`, each tested with the helper's
 real import chain (`gi` + `Gtk 4.0` + `Gtk4LayerShell 1.0`). A failed gate logs at
 INFO with the reason, so `journalctl` explains why the backend is inert.
+
+**Every process in the gate is bounded, and the bound is the point.** `setup()`
+runs during daemon startup, where a hang is worse than a failure: the loader guards
+`setup()` with `try/except Exception` (`src/core/main.py:266-273`), which catches a
+raise but not a wait, so an unbounded probe would leave the daemon short of its
+wake-word loop with nothing in the log. The blocking risk is documented upstream,
+not inferred — gtk4-layer-shell says of `gtk_layer_is_supported()` that it "May
+block for a Wayland roundtrip the first time it's called" — and the precedent this
+probe mirrors is *lazy*, not startup-time: dictation reaches `atspi_python()` from
+`insert_via_atspi` (`src/plugins/dictation/__init__.py:579`), never from its
+`setup()`. So: `PROBE_TIMEOUT = 5.0` on each candidate and on `helper --probe`
+(generous for a cold `gi` import plus a GTK init and one roundtrip), and a timeout
+is **not ready** — fail closed toward `mousegrid`, which is the correct backend
+wherever this one cannot work.
+
+Readiness is a *positive* signal, never the absence of a negative one. "No error
+signature on stderr" also describes a probe that was killed before it could write
+anything, which would activate a dead injector and then silently swallow every
+click (see the outcome table below). `ran` is what the gate requires, and its
+success code is unambiguous because the probe's argv is chosen for that property.
+A `--probe` that exits 0 inside the timeout is the only other way in.
 
 ### Routing
 
@@ -257,12 +285,32 @@ click(button)      -> ["ydotool", "click",       str(BUTTONS[button])]
 double_click()     -> two sequential ["ydotool", "click", "1"] calls
 ```
 
-Policy: **exit codes are never the success signal** (they are `argc`); failure is
-judged on stderr signatures only, and a `notice: … backend unavailable` line is
-success plus a latency warning. Moves and clicks are sequential subprocess calls,
-which is what makes the ordering (move, then click) deterministic. Everything goes
-through one module-level `_run_ydotool(args)` seam that unit tests patch, and that
-honours the dry-run switch by logging the argv and returning a synthetic result.
+Every external process — the gate's probes, the helper, and the injections — goes
+through one module-level seam, `_run_bounded(args, timeout)`, which unit tests
+patch (and which the dry-run switch short-circuits by logging the argv and
+returning `ran` without spawning anything). It never returns a bare exit code,
+because the exit code here is `argc` and carries no failure meaning: it returns one
+of exactly three outcomes.
+
+| Outcome | Detected by | What it means |
+|---|---|---|
+| `ran` | returncode equals the invocation's own success code, and stderr carries no error signature | the tool did what was asked |
+| `errored` | an error signature on stderr, or a usage/parse returncode | the tool refused; nothing was clicked |
+| `unknown` | `TimeoutExpired`, a negative returncode (killed by a signal), or `OSError` from the spawn | **the click may or may not have landed** |
+
+`unknown` is the outcome a review misses, and the reason this is a table rather
+than a boolean: a timeout is not a failure, and it is certainly not a success. It
+is logged at WARNING with the captured stderr and spoken as its own string (D8),
+and **no path retries it** — a repeated click is a second click, so the user's own
+utterance is the only retry this design allows. A `notice: … backend unavailable`
+line is not an error either: it is `ran` plus a latency warning, logged as such.
+
+`INJECT_TIMEOUT = 2.0` bounds each injection (the tool's own pre-action delay is
+100 ms, so this is generous by an order of magnitude), which is what keeps a wedged
+`ydotoold` from freezing the modal loop with the overlay up — the loop exists so
+the tray stays live and an unattended mode ends itself, and a blocking call
+defeats both. Moves and clicks are sequential calls, which is what makes the
+ordering (move, then click) deterministic.
 
 ### Session lifecycle and failure handling
 
@@ -271,7 +319,8 @@ honours the dry-run switch by logging the argv and returning a synthetic result.
 | Gate failed at setup | every `handle` returns `None`; `mousegrid` answers as today; INFO log names the reason |
 | Helper says `unsupported` | same as above (probe result, not a runtime surprise) |
 | Helper dies with the grid open | logged; mode ends; no orphan surface; the daemon keeps running |
-| `ydotool` fails at click time | WARNING with the captured stderr; overlay hidden anyway (never leave a stuck overlay); one spoken line |
+| `ydotool` reports `errored` | WARNING with the captured stderr; overlay hidden anyway (never leave a stuck overlay); the definite-failure string |
+| `ydotool` reports `unknown` (timeout, killed, spawn failure) | WARNING with the captured stderr; overlay hidden anyway; the unknown-outcome string — never silence, and never a claim about which way it went |
 | Mode ends by idle timeout, `close`, or a completed click | the same `finally` path hides the surface and reaps the helper |
 | Daemon exits mid-mode | helper exits on stdin EOF; `atexit` reap as belt-and-braces |
 | Any exception inside `handle` | core catches it per-plugin (loader contract); our cleanup runs first |
@@ -282,7 +331,7 @@ honours the dry-run switch by logging the argv and returning a synthetic result.
 |---|---|
 | `src/plugins/gridydotool/__init__.py` | routing, zone math, gating, injection adapter, session lifecycle, `_ = translator(__file__)` |
 | `src/plugins/gridydotool/_overlay.py` | GTK4 + gtk4-layer-shell renderer; `--probe`; JSON IPC; `CDLL` before `gi` |
-| `src/plugins/gridydotool/locale/{de,es,fr,it}/LC_MESSAGES/gridydotool.po` | complete catalogs — the 3 strings named in D8, agent-drafted, flagged for review |
+| `src/plugins/gridydotool/locale/{de,es,fr,it}/LC_MESSAGES/gridydotool.po` | complete catalogs — the 4 strings named in D8, agent-drafted, flagged for review |
 | `tests/unit/plugins/test_gridydotool.py` | unit matrix, gate matrix, parity/drift tests |
 | `tests/integration/test_gridydotool_harness.py` | headless-sway loop; opt-in; skips when binaries are absent |
 | `tests/integration/grid_probe_window.py` | fullscreen GTK4 probe reporting pointer motion and button events as JSON |
@@ -311,10 +360,16 @@ honours the dry-run switch by logging the argv and returning a synthetic result.
   `GRID_TRIGGERS`, `WORD_TO_NUM` and parser behaviour match `mousegrid`'s over a
   shared sample.
 - **Injection**: exact argv per verb; monitor offset applied to moves only;
-  double-click issues two calls in order; exit codes are ignored (a returning
-  `CompletedProcess(returncode=2)` with clean stderr is a *success*); stderr error
-  signatures are failures; `notice:` lines are not; dry-run records without
-  executing.
+  double-click issues two calls in order; the outcome matrix — `ran` for the
+  invocation's own success code with clean stderr, `errored` for an error signature
+  or a usage returncode, `unknown` for a timeout, a negative returncode or a spawn
+  failure; `notice:` lines are `ran` with a latency warning, never failures; an
+  `unknown` outcome is logged and spoken but never counted as a success; dry-run
+  records without executing; nothing retries a click.
+- **Bounded waits**: every probe and every injection is exercised against a stub
+  that never returns, asserting that the timeout fires, that the gate then reports
+  not-ready (so `mousegrid` keeps the words), and that the mode still ends with the
+  overlay hidden.
 - **Lifecycle**: helper spawn/hide/reap on click, close, idle-exit and exception;
   helper death mid-mode ends the mode; no orphan process is left.
 
