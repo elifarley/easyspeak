@@ -491,14 +491,24 @@ class TestHelperChannel:
 
 
 @pytest.fixture
-def start_helper(monkeypatch, tmp_path):
-    """Run the handshake against a fake helper written from `script`."""
+def fake_helper(monkeypatch, tmp_path):
+    """Point the plugin at a fake helper written from `script`."""
 
-    def _start(script):
+    def _point(script):
         path = tmp_path / "helper.py"
         path.write_text(script, encoding="utf-8")
         monkeypatch.setattr(g, "HELPER", str(path))
         monkeypatch.setattr(g, "grid_python", lambda: "python3")
+
+    return _point
+
+
+@pytest.fixture
+def start_helper(fake_helper):
+    """Run the handshake against a fake helper written from `script`."""
+
+    def _start(script):
+        fake_helper(script)
         return g._start_helper()
 
     return _start
@@ -511,6 +521,37 @@ class TestHelperLifecycle:
     `finally` calls it again, and the same two calls happen when no helper was
     ever started.
     """
+
+    def _ready_script(self):
+        return (
+            "import json, sys\n"
+            "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 900, 600]}),"
+            " flush=True)\n"
+            "sys.stdin.readline()\n"
+        )
+
+    def test_a_real_session_that_ends_on_idle_still_closes(self, core, fake_helper):
+        """Nothing dismissed the grid, so `_open_session`'s `finally` is what
+        has to reap the helper and drop the session."""
+        fake_helper(self._ready_script())
+        core.listen_modal = Mock(return_value=iter([]))
+        assert g._open_session(core) == "done"
+        assert g._helper is None
+        assert g._grid_open is False
+        assert [call.args[0] for call in core.speak.call_args_list] == [g._("Grid")]
+
+    def test_a_real_session_dismisses_then_closes_again(self, core, fake_helper):
+        """The production shape of the double close: `_run_mode` dismisses the
+        grid, then the `finally` closes the session a second time."""
+        fake_helper(self._ready_script())
+        core.listen_modal = Mock(return_value=iter(["close"]))
+        assert g._open_session(core) == "done"
+        assert g._helper is None
+        assert g._grid_open is False
+        assert [call.args[0] for call in core.speak.call_args_list] == [
+            g._("Grid"),
+            g._("Grid closed"),
+        ]
 
     def test_closing_twice_reaps_once_and_survives_the_second_call(self, start_helper):
         assert start_helper(
