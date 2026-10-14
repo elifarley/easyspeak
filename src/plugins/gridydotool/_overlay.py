@@ -1,0 +1,290 @@
+"""Standalone GTK4 layer-shell overlay for the gridydotool plugin.
+
+Runs as a script in an interpreter that has PyGObject and the gtk4-layer-shell
+typelib, both of which the daemon's venv lacks. It is a real module rather than
+an embedded `-c` string so Ruff lints it and the unit suite can exercise the pure
+parts (the `_atspi_insert.py` precedent), which is also why `gi` is imported
+inside functions: importing it at module scope would make the whole file
+unimportable from the venv.
+
+Protocol: newline-delimited JSON on stdin and stdout, diagnostics on stderr.
+
+    {"cmd": "show", "bounds": [x, y, w, h]}   draw a 3x3 grid over this rect
+    {"cmd": "hide"}                            tear the surface down
+    {"cmd": "stop"}                            exit (alias: "quit"; EOF does too)
+
+    {"event": "ready", "monitor": [x, y, w, h], "scale": 1.0}
+    {"event": "presented"}
+    {"event": "error", "message": "..."}
+
+`--probe` answers whether this compositor supports layer-shell and exits 0 or 1
+without mapping anything.
+"""
+
+import json
+import os
+import sys
+
+DEFAULT_NAMESPACE = "gridydotool"
+
+
+def cell_rects(bounds):
+    """Return the nine cell rectangles of a 3x3 grid over `bounds`, row-major."""
+    x, y, w, h = bounds
+    cell_w, cell_h = w // 3, h // 3
+    return [
+        (x + col * cell_w, y + row * cell_h, cell_w, cell_h)
+        for row in range(3)
+        for col in range(3)
+    ]
+
+
+def parse_command(line):
+    """Return the command object on a protocol line, or None if there is none."""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        payload = json.loads(line)
+    except ValueError:
+        sys.stderr.write(f"grid-overlay: ignoring unparsable line: {line[:120]}\n")
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def emit(payload):
+    """Write one event to the parent."""
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+
+def load_layer_shell():
+    """Load gtk4-layer-shell and Gtk, or return (None, None).
+
+    The library must be loaded before Gtk's Wayland client is, which is what the
+    CDLL call buys: linking it later lets libwayland-client win the symbol
+    resolution and the layer surface silently comes up as an ordinary window.
+    """
+    from ctypes import CDLL
+
+    try:
+        CDLL("libgtk4-layer-shell.so")
+    except OSError as exc:
+        sys.stderr.write(f"grid-overlay: libgtk4-layer-shell.so not found: {exc}\n")
+        return None, None
+    import gi  # pragma: no cover - PyGObject is absent from the daemon's venv
+
+    try:  # pragma: no cover - needs the layer-shell typelib from the live stack
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Gtk4LayerShell", "1.0")
+        from gi.repository import Gtk, Gtk4LayerShell
+    except (ValueError, ImportError) as exc:  # pragma: no cover - live stack only
+        sys.stderr.write(f"grid-overlay: cannot load Gtk4LayerShell: {exc}\n")
+        return None, None
+    return Gtk, Gtk4LayerShell  # pragma: no cover - live stack only
+
+
+def is_supported():
+    """True when this compositor speaks wlr-layer-shell."""
+    _, layer_shell = load_layer_shell()
+    if layer_shell is None:
+        return False
+    return bool(layer_shell.is_supported())  # pragma: no cover - live shell only
+
+
+class Overlay:  # pragma: no cover - needs GTK; run live
+    """The layer surface, its nine cells, and the redraws they ask for."""
+
+    def __init__(self, gtk, layer_shell, app):
+        self.gtk = gtk
+        self.layer_shell = layer_shell
+        # Associate the window with the application: an app-managed window is what
+        # the application's lifecycle (activate, quit, and the stdin watch that
+        # ends the process) is written for.
+        self.window = gtk.Window(application=app)
+        self.area = gtk.DrawingArea()
+        self.bounds = None
+        self.origin = (0, 0)
+        self.presented = False
+        self.window.set_child(self.area)
+        self.area.set_draw_func(self._draw)
+        layer_shell.init_for_window(self.window)
+        for edge in (
+            layer_shell.Edge.LEFT,
+            layer_shell.Edge.RIGHT,
+            layer_shell.Edge.TOP,
+            layer_shell.Edge.BOTTOM,
+        ):
+            layer_shell.set_anchor(self.window, edge, True)  # noqa: FBT003
+        layer_shell.set_layer(self.window, layer_shell.Layer.OVERLAY)
+        # Never take focus, and let the injected click pass through to whatever
+        # is underneath: a grid that swallows its own click is useless.
+        layer_shell.set_keyboard_mode(self.window, layer_shell.KeyboardMode.NONE)
+        self.window.set_can_target(False)
+
+    def _draw(self, area, cr, width, height):
+        """Paint the nine cells with their digits.
+
+        PyGObject calls a `set_draw_func` callback with exactly these four
+        arguments - it does not pass the C callback's trailing user_data - and a
+        five-argument signature raises TypeError on every frame, which loses
+        both the grid and the `presented` event.
+        """
+        if not self.bounds:
+            return
+        origin_x, origin_y = self.origin
+        cr.set_source_rgba(0.05, 0.05, 0.08, 0.55)
+        cr.paint()
+        cr.set_source_rgba(0.95, 0.95, 0.95, 0.95)
+        for index, (x, y, w, h) in enumerate(cell_rects(self.bounds), start=1):
+            left, top = x - origin_x, y - origin_y
+            cr.rectangle(left, top, w, h)
+            cr.stroke()
+            cr.move_to(left + w / 2 - 8, top + h / 2 + 8)
+            cr.set_font_size(28)
+            cr.show_text(str(index))
+        del area, width, height
+        if not self.presented:
+            # The first frame of an actual grid is on the glass now; the plugin
+            # reads this as "it is on screen", once, never per redraw.
+            self.presented = True
+            emit({"event": "presented"})
+
+    def show(self, bounds):
+        self.bounds = tuple(bounds)
+        self.window.present()
+        self.area.queue_draw()  # the bounds changed: repaint, mapped or not
+
+    def hide(self):
+        self.window.set_visible(False)
+
+
+def report_monitor(overlay):  # pragma: no cover - needs a live surface
+    """Emit the ready event once the surface is configured.
+
+    The monitor geometry comes from the surface, not from an assumption: the
+    compositor chooses the output (the helper makes no set_monitor call), and
+    this report is the plugin's only source of screen size.
+    """
+    surface = overlay.window.get_surface()
+    display = surface.get_display()
+    monitor = display.get_monitor_at_surface(surface)
+    geometry = monitor.get_geometry()
+    overlay.origin = (geometry.x, geometry.y)
+    emit(
+        {
+            "event": "ready",
+            "monitor": [geometry.x, geometry.y, geometry.width, geometry.height],
+            "scale": monitor.get_scale_factor(),
+        }
+    )
+
+
+def run(gtk, layer_shell):  # pragma: no cover - drives the GTK loop
+    """Wire the protocol to the surface and pump the GTK loop."""
+    import gi
+
+    GLib = gi.repository.GLib
+
+    app = gtk.Application(application_id="dev.easyspeak.gridydotool.overlay")
+    overlay = None
+
+    def on_activate(_app):
+        """Build and present the surface inside the application's lifetime.
+
+        The window cannot be made before `app.run`: GTK refuses to add a window
+        created before the `startup` signal ("New application windows must be
+        added after the GApplication::startup signal has been emitted"), and an
+        application holding no windows returns from `run` as soon as activation
+        ends - which would end the helper right after `ready` and leave the
+        plugin talking to a corpse.
+        """
+        nonlocal overlay
+        overlay = Overlay(gtk, layer_shell, app)
+        overlay.window.present()
+        GLib.idle_add(emit_ready_when_mapped)
+
+    def emit_ready_when_mapped():
+        """Report geometry only once the surface exists, then stop polling.
+
+        `ready` is what the plugin waits for before it can compute a single
+        coordinate, so it must be sent after GTK has a surface to ask, not from
+        the constructor where there is none yet.
+        """
+        if overlay is None or overlay.window.get_surface() is None:
+            return True
+        report_monitor(overlay)
+        return False
+
+    app.connect("activate", on_activate)
+
+    pending = ""
+
+    def handle_line(line):
+        """Act on one protocol line; False means the process should end."""
+        command = parse_command(line)
+        if command is None:
+            return True
+        name = command.get("cmd")
+        if name == "show" and overlay is not None:
+            overlay.show(command["bounds"])
+        elif name == "hide" and overlay is not None:
+            overlay.hide()
+        elif name in ("stop", "quit"):
+            app.quit()
+            return False
+        return True
+
+    def on_stdin_ready(_source, _condition):
+        """Consume every complete line the descriptor holds, not just one.
+
+        `sys.stdin.readline()` reads ahead into the text layer, and the io watch
+        is blind to a line left there: a `stop` sitting behind another command
+        in the same write never ends the process. Reading the descriptor
+        directly - and doing our own buffering - keeps unread lines where the
+        watch can see them, and the chunk boundary is safe because a partial
+        line waits here for the next wake-up.
+        """
+        nonlocal pending
+        chunk = os.read(sys.stdin.fileno(), 4096)
+        if not chunk:  # the plugin is gone; never outlive it
+            app.quit()
+            return False
+        pending += chunk.decode("utf-8", "replace")
+        keep_going = True
+        while keep_going and "\n" in pending:
+            line, _, pending = pending.partition("\n")
+            keep_going = handle_line(line)
+        return keep_going
+
+    GLib.io_add_watch(sys.stdin.fileno(), GLib.IO_IN | GLib.IO_HUP, on_stdin_ready)
+    app.run([])
+    return 0
+
+
+def main(argv=None):
+    """Entry point: `--probe` one-shots the support question, otherwise serve."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--probe" in argv:
+        supported = is_supported()
+        sys.stdout.write("supported\n" if supported else "unsupported\n")
+        return 0 if supported else 1
+    Gtk, layer_shell = load_layer_shell()
+    if Gtk is None:
+        emit(
+            {
+                "event": "error",
+                "message": "PyGObject or the layer-shell typelib is missing",
+            }
+        )
+        return 1
+    if not layer_shell.is_supported():
+        # Refuse rather than degrade: an ordinary window would look like a
+        # rendering bug while the injections kept working.
+        emit({"event": "error", "message": "layer-shell unsupported"})
+        return 1
+    return run(Gtk, layer_shell)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,8 +1,11 @@
 """Tests for the gridydotool plugin: the zone math, its parity with mousegrid,
 and the parser that turns an utterance into zone numbers."""
 
+import importlib.util
 import io
+import json
 import time
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -664,3 +667,71 @@ class TestReadUntil:
         stream = Mock()
         stream.fileno.side_effect = ValueError("closed")
         assert g.read_until(stream, time.monotonic() + 1) is None
+
+
+def _overlay_module():
+    """Import the helper without importing gi: the module defers that import so
+    the daemon's venv can test its pure parts."""
+    path = Path(g.__file__).with_name("_overlay.py")
+    spec = importlib.util.spec_from_file_location("grid_overlay", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestOverlayPureParts:
+    def test_cell_rects_are_the_nine_thirds(self):
+        overlay = _overlay_module()
+        rects = overlay.cell_rects((0, 0, 900, 600))
+        assert rects[0] == (0, 0, 300, 200)
+        assert rects[8] == (600, 400, 300, 200)
+        assert len(rects) == 9
+
+    def test_parse_command_accepts_show_and_hide(self):
+        overlay = _overlay_module()
+        assert overlay.parse_command('{"cmd": "hide"}') == {"cmd": "hide"}
+        assert overlay.parse_command("") is None
+        assert overlay.parse_command("{oops") is None
+
+    def test_probe_mode_reports_unsupported_without_a_display(self):
+        overlay = _overlay_module()
+        assert overlay.main(["--probe"]) == 1
+
+    def test_the_module_imports_without_gi(self):
+        assert _overlay_module() is not None
+
+
+class TestOverlayServePath:
+    """`main` without `--probe`: refuse rather than degrade, then hand over.
+
+    The refusal is the counterpart of the plugin's handshake: a silent window
+    would look like a rendering bug while the injections kept working.
+    """
+
+    def test_refuses_with_an_error_event_without_the_library(self, monkeypatch, capsys):
+        overlay = _overlay_module()
+        monkeypatch.setattr(overlay, "load_layer_shell", lambda: (None, None))
+        assert overlay.main([]) == 1
+        assert json.loads(capsys.readouterr().out.strip()) == {
+            "event": "error",
+            "message": "PyGObject or the layer-shell typelib is missing",
+        }
+
+    def test_refuses_when_layer_shell_is_unsupported(self, monkeypatch, capsys):
+        overlay = _overlay_module()
+        stack = (Mock(), Mock(is_supported=Mock(return_value=False)))
+        monkeypatch.setattr(overlay, "load_layer_shell", lambda: stack)
+        assert overlay.main([]) == 1
+        assert json.loads(capsys.readouterr().out.strip()) == {
+            "event": "error",
+            "message": "layer-shell unsupported",
+        }
+
+    def test_hands_a_supported_stack_to_run(self, monkeypatch):
+        overlay = _overlay_module()
+        stack = (Mock(), Mock(is_supported=Mock(return_value=True)))
+        run = Mock(return_value=7)
+        monkeypatch.setattr(overlay, "load_layer_shell", lambda: stack)
+        monkeypatch.setattr(overlay, "run", run)
+        assert overlay.main([]) == 7
+        run.assert_called_once_with(*stack)
