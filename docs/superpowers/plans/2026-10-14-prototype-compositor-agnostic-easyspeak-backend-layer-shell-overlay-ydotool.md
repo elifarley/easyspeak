@@ -1,0 +1,2150 @@
+# gridydotool Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Ship the `gridydotool` plugin — a compositor-agnostic pointer grid (GTK4 layer-shell overlay + ydotool injection) that activates only where the stack works and leaves `mousegrid` in charge everywhere else.
+
+**Architecture:** All logic (routing, zone math, gating, injection, session state) lives in the plugin module inside the daemon's venv; rendering lives in `_overlay.py`, a GTK4 + gtk4-layer-shell helper spawned in a `gi`-capable interpreter with a `Popen` pipe. The helper reports its monitor's geometry, which is the plugin's only source of screen size, and the plugin injects input through `ydotool` via one bounded seam.
+
+**Tech Stack:** Python 3.10+ (venv), GTK4 + gtk4-layer-shell via PyGObject (system interpreter), `ydotool` 0.1.8 + `ydotoold` (uinput), pytest / uv / just, headless `sway` + `grim` for the integration harness.
+
+**Spec:** `docs/superpowers/specs/2026-10-14-prototype-compositor-agnostic-easyspeak-backend-layer-shell-overlay-ydotool-design.md` (read it first; this plan implements it and every decision reference below points into it).
+
+## Global Constraints
+
+- `NAME = "gridydotool"`, `PRIORITY = 0` (ahead of `mousegrid`'s 1), and every `handle` returns `None` unless the gate passed.
+- Timers, exactly: `PROBE_TIMEOUT = 5.0`, `INJECT_TIMEOUT = 2.0`, `REAP_GRACE = 2.0`.
+- Every `ydotool` invocation passes `--delay 0`, and the daemon socket `/tmp/.ydotool_socket` must accept a connection before the plugin activates.
+- Env knobs: `EASYSPEAK_GRID_BACKEND=uinput|gnome` (forced override, short-circuits the probes), `EASYSPEAK_GRID_PYTHON` (interpreter override), `EASYSPEAK_GRID_LIVE=move|click` (test-only, harness).
+- Zero edits under `src/core/**`. The only existing files touched are `tests/unit/core/test_main.py` (two assertions), `tests/packaging/test_python_wheel.sh`, `pyproject.toml`, the docs and `tests/integration/README.md`.
+- `_ = translator(__file__)` at module top, and every spoken string wrapped in `_()`. Catalogs are complete for `de`, `es`, `fr`, `it` — no empty and no fuzzy entries ever committed.
+- Bounds are monitor-local; the monitor origin from the helper's `ready` event is added only at injection time.
+- Zone math: 3×3 recursion with integer thirds (`w // 3`), no clamp, containment invariant holds.
+- `handle` returns `True` whenever the phrase was claimed and answered (including every failure path); only the gate-inert case returns `None`.
+- Helper: lazy `import gi` (so the venv can import the module in tests), `CDLL("libgtk4-layer-shell.so")` immediately before the gi import, `is_supported()` re-checked in `show`, empty input region, `keyboard_mode` NONE, never `auto_exclusive_zone_enable()`.
+
+---
+
+## File Structure
+
+| File | Responsibility |
+|---|---|
+| `src/plugins/gridydotool/__init__.py` | Everything the daemon owns: gate, routing, zone math, injection adapter, helper channel, session lifecycle |
+| `src/plugins/gridydotool/_overlay.py` | The GTK4 layer-shell renderer + `--probe`; pure cell geometry and the JSON protocol live here too, importable without `gi` |
+| `src/plugins/gridydotool/locale/{de,es,fr,it}/LC_MESSAGES/gridydotool.po` | Complete reply + help catalogs |
+| `tests/unit/plugins/test_gridydotool.py` | Unit suite: math, parity, gate matrix, routing, adapter, helper channel, lifecycle |
+| `tests/integration/test_gridydotool_harness.py` | Headless-sway harness: two gate shapes, two assertion arms |
+| `tests/integration/grid_probe_window.py` | Fullscreen probe that reports pointer motion and button events as JSON |
+| `pyproject.toml` | `easyspeak.plugins.gridydotool` in `[tool.setuptools] packages` |
+| `tests/unit/core/test_main.py` | Roster set + load-order assertions (mechanical plugin-addition edit) |
+| `tests/packaging/test_python_wheel.sh` | `has locale/de/LC_MESSAGES/gridydotool.po` |
+| `tests/integration/README.md` | Harness entry, prerequisite set, `EASYSPEAK_GRID_LIVE` |
+| `docs/reference/plugins.md`, `docs/how-it-works.md`, `docs/commands.md`, `docs/troubleshooting.md`, `docs/compatibility.md`, `docs/usage.md`, `docs/index.md`, `README.md` | Reference entry, tree, verb caveats, requirements, env vars, feature lines |
+
+---
+
+### Task 1: Skeleton, zone math, parser, packaging
+
+**Files:**
+- Create: `src/plugins/gridydotool/__init__.py`
+- Create: `tests/unit/plugins/test_gridydotool.py`
+- Modify: `pyproject.toml` (the `[tool.setuptools] packages` list)
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: `NAME`, `DESCRIPTION`, `COMMANDS`, `PRIORITY`, `ZONE_MAP`, `subdivide(bounds, zone) -> (x, y, w, h)`, `center(bounds) -> (x, y)`, `parse_number_sequence(text) -> list[int]`, `GRID_TRIGGERS: set[str]`, `WORD_TO_NUM: dict[str, int]`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/unit/plugins/test_gridydotool.py`:
+
+```python
+"""Tests for the gridydotool plugin: the zone math, its parity with mousegrid,
+and the parser that turns an utterance into zone numbers."""
+
+from easyspeak.plugins import gridydotool, mousegrid
+
+
+class TestZoneMath:
+    def test_subdivide_each_zone(self):
+        bounds = (0, 0, 900, 600)
+        expected = {
+            1: (0, 0, 300, 200),
+            2: (300, 0, 300, 200),
+            3: (600, 0, 300, 200),
+            4: (0, 200, 300, 200),
+            5: (300, 200, 300, 200),
+            6: (600, 200, 300, 200),
+            7: (0, 400, 300, 200),
+            8: (300, 400, 300, 200),
+            9: (600, 400, 300, 200),
+        }
+        for zone, want in expected.items():
+            assert gridydotool.subdivide(bounds, zone) == want
+
+    def test_subdivide_truncates_like_the_extension_backend(self):
+        # 1000 // 3 == 333, and the same recursion must produce the same cell on
+        # both backends or the parity invariant is gone.
+        assert gridydotool.subdivide((0, 0, 1000, 1000), 9) == (666, 666, 333, 333)
+
+    def test_center(self):
+        assert gridydotool.center((1351, 280, 71, 40)) == (1386, 300)
+
+
+class TestContainmentInvariant:
+    def test_bounds_never_leave_the_monitor(self):
+        """x + w and y + h stay inside the monitor for every sequence."""
+        monitor = (1920, 1080)
+        for a in range(1, 10):
+            for b in range(1, 10):
+                for c in range(1, 10):
+                    bounds = (0, 0, monitor[0], monitor[1])
+                    for zone in (a, b, c):
+                        bounds = gridydotool.subdivide(bounds, zone)
+                    x, y, w, h = bounds
+                    assert x + w <= monitor[0], (a, b, c)
+                    assert y + h <= monitor[1], (a, b, c)
+
+
+class TestParityWithMousegrid:
+    """The gate shadows mousegrid's words, so both must land on the same pixel.
+
+    Driven against mousegrid's own implementation, which is the only
+    independent oracle available for this arithmetic.
+    """
+
+    @staticmethod
+    def _mousegrid_bounds(sequence, monitor, monkeypatch):
+        monkeypatch.setattr(mousegrid, "dbus_call", lambda *args: True)
+        monkeypatch.setattr(mousegrid, "screen_size", monitor)
+        monkeypatch.setattr(mousegrid, "grid_active", True)
+        monkeypatch.setattr(mousegrid, "grid_bounds", (0, 0, monitor[0], monitor[1]))
+        for zone in sequence:
+            mousegrid.update_grid(zone)
+        return mousegrid.grid_bounds
+
+    def test_all_sequences_agree(self, monkeypatch):
+        monitor = (1920, 1080)
+        for a in range(1, 10):
+            for b in range(1, 10):
+                for c in range(1, 10):
+                    theirs = self._mousegrid_bounds((a, b, c), monitor, monkeypatch)
+                    bounds = (0, 0, monitor[0], monitor[1])
+                    for zone in (a, b, c):
+                        bounds = gridydotool.subdivide(bounds, zone)
+                    assert bounds == theirs, (a, b, c)
+                    assert gridydotool.center(bounds) == mousegrid.get_center()
+
+    def test_trigger_words_equal(self):
+        assert gridydotool.GRID_TRIGGERS == mousegrid.GRID_TRIGGERS
+
+    def test_number_words_equal(self):
+        assert gridydotool.WORD_TO_NUM == mousegrid.WORD_TO_NUM
+
+    def test_parser_agrees_on_a_sample(self):
+        for text in ("3 7 5", "three seven five", "tree ate nein", "one two"):
+            assert gridydotool.parse_number_sequence(text) == (
+                mousegrid.parse_number_sequence(text)
+            )
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `uv run --extra=unittest pytest tests/unit/plugins/test_gridydotool.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'easyspeak.plugins.gridydotool'`
+
+- [ ] **Step 3: Write the module**
+
+Create `src/plugins/gridydotool/__init__.py` (Task 1 scope only — later tasks append to it):
+
+```python
+"""Grid mouse control through ydotool, without the GNOME Shell extension.
+
+Routes the grid conversation, computes cell bounds, and delegates rendering to
+`_overlay.py` (a GTK4 layer-shell surface in a gi-capable interpreter) while
+`ydotool` moves and clicks the pointer at kernel level. The zone math, the
+trigger words and the number tables mirror `mousegrid` on purpose: this plugin
+shadows the same phrases, so one utterance must land on the same pixel whichever
+backend answers.
+"""
+
+import logging
+import re
+
+from easyspeak.core.i18n import translator
+
+logger = logging.getLogger(__name__)
+
+_ = translator(__file__)
+
+NAME = "gridydotool"
+DESCRIPTION = "Voice-controlled mouse grid (overlay + kernel-level injection)"
+PRIORITY = 0
+
+COMMANDS = [
+    _("grid/mouse/pointer/cursor - show mouse grid"),
+    _("1-9 or chains like '3 7 5' - zoom to zone(s)"),
+    _("click - left click"),
+    _("right click / double click / middle click"),
+    _("close/cancel - hide the grid"),
+    _("again - reopen at the last spot"),
+]
+
+# Recognition data copied from mousegrid (asserted equal by the test suite):
+# Whisper mishears "grid" as any of these often enough that the extension
+# backend tunes a whole set, and a backend that hears fewer words than the one
+# it shadows is a regression in the user's eyes, not a simplification.
+GRID_TRIGGERS = {
+    "grid", "grit", "grip", "great", "greed", "grade", "grad", "grill",
+    "guild", "greet", "grin", "green", "grey", "gray", "grab", "grand",
+    "greek", "grew", "mouse", "pointer", "cursor", "crosshair",
+}
+
+WORD_TO_NUM = {
+    "one": 1, "won": 1, "wan": 1,
+    "two": 2, "to": 2, "too": 2, "tu": 2,
+    "three": 3, "tree": 3, "free": 3,
+    "four": 4, "for": 4, "fore": 4,
+    "five": 5,
+    "six": 6, "sex": 6,
+    "seven": 7,
+    "eight": 8, "ate": 8,
+    "nine": 9, "nein": 9,
+}
+
+ZONE_MAP = {
+    1: (0, 0), 2: (1, 0), 3: (2, 0),
+    4: (0, 1), 5: (1, 1), 6: (2, 1),
+    7: (0, 2), 8: (1, 2), 9: (2, 2),
+}
+
+
+def subdivide(bounds, zone):
+    """Return the ninth of `bounds` named by `zone` (1-9, row-major).
+
+    Integer thirds, exactly as `mousegrid.update_grid` computes them, including
+    its truncation: `w // 3` of a 1000-wide cell is 333, not 333.33, and the two
+    backends must agree on that. mousegrid's off-monitor safety clamp is absent
+    here because it cannot fire: x + w stays inside the monitor by construction.
+    """
+    x, y, w, h = bounds
+    zone_w, zone_h = w // 3, h // 3
+    col, row = ZONE_MAP[zone]
+    return (x + col * zone_w, y + row * zone_h, zone_w, zone_h)
+
+
+def center(bounds):
+    """Return the (x, y) centre of `bounds`."""
+    x, y, w, h = bounds
+    return (x + w // 2, y + h // 2)
+
+
+def parse_number_sequence(text):
+    """Extract every zone number from an utterance, in order.
+
+    `"3 7 5"` and `"three seven five"` both give `[3, 7, 5]`; the word table
+    carries Whisper's usual mishearings, mirroring mousegrid's parser so the same
+    utterance chains the same zooms on either backend.
+    """
+    lowered = text.lower()
+    for word, num in WORD_TO_NUM.items():
+        lowered = re.sub(rf"\b{word}\b", str(num), lowered)
+    return [int(char) for char in lowered if char.isdigit() and char != "0"]
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `uv run --extra=unittest pytest tests/unit/plugins/test_gridydotool.py -v`
+Expected: PASS (all zones, the containment property, the 819-sequence parity sweep, the table equality).
+
+- [ ] **Step 5: Register the package for wheels**
+
+In `pyproject.toml`, add to `[tool.setuptools] packages`, keeping the list alphabetical:
+
+```toml
+  "easyspeak.plugins.gridydotool",
+```
+
+- [ ] **Step 6: Run the whole unit suite to prove nothing else moved**
+
+Run: `uv run --extra=unittest coverage run -m pytest && uvx coverage[toml] report`
+Expected: PASS. `test_load_plugins_loads_all_shipped_plugins` still passes because a module without `handle` is not loaded — this package gains `handle` in Task 2, where that test is updated.
+
+- [ ] **Step 7: Commit**
+
+```bash
+hug a src/plugins/gridydotool/__init__.py tests/unit/plugins/test_gridydotool.py pyproject.toml
+hug c -F - <<'EOF'
+feat(gridydotool): zone math, parser and packaging
+
+The arithmetic that makes this backend and the extension backend
+interchangeable: integer thirds with mousegrid's truncation, mirrored trigger
+words and number tables, and a parity test that drives mousegrid's own
+implementation over all 819 one-to-three digit sequences rather than trusting a
+copy of the formula.
+
+The clamp mousegrid carries is deliberately absent: it cannot fire, because
+x + w stays inside the monitor by construction, and the containment invariant is
+asserted as a property instead of guarded by dead code.
+
+No handle yet, so the loader skips the package and the roster assertion stays
+valid until the next task.
+
+Co-authored-by: CommandCodeBot <noreply@commandcode.ai>
+EOF
+```
+
+---
+
+### Task 2: Gate, bounded seam, adapter, routing
+
+**Files:**
+- Modify: `src/plugins/gridydotool/__init__.py`
+- Modify: `tests/unit/plugins/test_gridydotool.py`
+- Modify: `tests/unit/core/test_main.py:278-306` (roster set + load order)
+- Create: `src/plugins/gridydotool/locale/{de,es,fr,it}/LC_MESSAGES/gridydotool.po`
+
+**Interfaces:**
+- Consumes: `subdivide`, `center`, `parse_number_sequence`, `GRID_TRIGGERS`, `WORD_TO_NUM`, `COMMANDS` (Task 1).
+- Produces: `Outcome` (`"ran" | "errored" | "unknown"`), `_run_bounded(args, timeout=INJECT_TIMEOUT)`, `run_ydotool(args)`, `move_to(x, y)`, `click(button)`, `active()`, `setup(core)`, `handle(cmd, core)`, `PROBE_TIMEOUT`, `INJECT_TIMEOUT`, `REAP_GRACE`, `YDTOOL_SOCKET`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/unit/plugins/test_gridydotool.py`:
+
+```python
+from unittest.mock import Mock
+
+import pytest
+
+from easyspeak.plugins import gridydotool as g
+
+
+@pytest.fixture
+def core():
+    """A core stub with the plugin-facing surface this module touches."""
+    stub = Mock()
+    stub.speak = Mock()
+    stub.listen_modal = Mock(return_value=iter([]))
+    return stub
+
+
+class TestOutcomeClassification:
+    """`ydotool` exits with argc, so the exit code alone says nothing; the seam
+    returns one of three outcomes and the tests pin all three."""
+
+    def _result(self, returncode=3, stderr="", stdout=""):
+        return Mock(returncode=returncode, stderr=stderr, stdout=stdout)
+
+    def test_ran_is_the_invocations_own_success_code(self, monkeypatch):
+        monkeypatch.setattr(g, "_spawn", lambda *a, **k: self._result(3))
+        assert g._run_bounded(["ydotool", "mousemove_relative", "0", "0"]) == "ran"
+
+    def test_errored_on_an_error_signature(self, monkeypatch):
+        monkeypatch.setattr(
+            g, "_spawn", lambda *a, **k: self._result(1, stderr="Unknown tool: x")
+        )
+        assert g._run_bounded(["ydotool", "bogus"]) == "errored"
+
+    def test_unknown_on_a_signal_kill(self, monkeypatch):
+        monkeypatch.setattr(g, "_spawn", lambda *a, **k: self._result(-9, stderr=""))
+        assert g._run_bounded(["ydotool", "click", "1"]) == "unknown"
+
+    def test_unknown_on_a_timeout(self, monkeypatch):
+        import subprocess
+
+        def boom(*_a, **_k):
+            raise subprocess.TimeoutExpired(cmd="ydotool", timeout=2.0)
+
+        monkeypatch.setattr(g, "_spawn", boom)
+        assert g._run_bounded(["ydotool", "click", "1"]) == "unknown"
+
+    def test_unknown_when_the_binary_is_missing(self, monkeypatch):
+        monkeypatch.setattr(g, "_spawn", Mock(side_effect=FileNotFoundError("ydotool")))
+        assert g._run_bounded(["ydotool", "click", "1"]) == "unknown"
+
+    def test_notice_is_unknown_not_ran(self, monkeypatch):
+        """A fallback notice means the client built a one-shot device, which is
+        exactly the case `ran` excludes."""
+        monkeypatch.setattr(
+            g,
+            "_spawn",
+            lambda *a, **k: self._result(
+                3, stderr="ydotool: notice: ydotoold backend unavailable ..."
+            ),
+        )
+        assert g._run_bounded(["ydotool", "mousemove_relative", "0", "0"]) == "unknown"
+
+    def test_dry_run_records_without_spawning(self, monkeypatch):
+        spawn = Mock()
+        monkeypatch.setattr(g, "_spawn", spawn)
+        monkeypatch.setenv("EASYSPEAK_GRID_DRY_RUN", "1")
+        assert g._run_bounded(["ydotool", "click", "1"]) == "ran"
+        spawn.assert_not_called()
+
+
+class TestAdapterArgv:
+    def test_move_applies_the_monitor_origin(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(g, "_run_bounded", lambda args, **k: seen.append(args) or "ran")
+        g._monitor_origin = (1920, 0)
+        g.move_to(1351, 280)
+        assert seen == [["ydotool", "mousemove", "3271", "280", "--delay", "0"]]
+
+    def test_click_buttons(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(g, "_run_bounded", lambda args, **k: seen.append(args) or "ran")
+        g.click("click")
+        g.click("right")
+        g.click("middle")
+        assert seen == [
+            ["ydotool", "click", "1", "--delay", "0"],
+            ["ydotool", "click", "2", "--delay", "0"],
+            ["ydotool", "click", "3", "--delay", "0"],
+        ]
+
+    def test_double_click_is_two_calls_in_order(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(g, "_run_bounded", lambda args, **k: seen.append(args) or "ran")
+        g.double_click()
+        assert [a[2] for a in seen] == ["1", "1"]
+
+
+class TestGate:
+    def test_inert_at_import(self):
+        assert g.active() is False
+
+    def test_forced_backend_is_active_without_probing(self, monkeypatch, core):
+        monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "uinput")
+        monkeypatch.setattr(g, "_probe_overlay", Mock(side_effect=AssertionError))
+        monkeypatch.setattr(g, "_probe_injector", Mock(side_effect=AssertionError))
+        g.setup(core)
+        assert g.active() is True
+
+    def test_forced_gnome_is_inert(self, monkeypatch, core):
+        monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "gnome")
+        g.setup(core)
+        assert g.active() is False
+
+    def test_needs_both_halves(self, monkeypatch, core):
+        monkeypatch.delenv("EASYSPEAK_GRID_BACKEND", raising=False)
+        monkeypatch.setattr(g, "_probe_overlay", lambda: True)
+        monkeypatch.setattr(g, "_probe_injector", lambda: False)
+        g.setup(core)
+        assert g.active() is False
+        monkeypatch.setattr(g, "_probe_overlay", lambda: False)
+        monkeypatch.setattr(g, "_probe_injector", lambda: True)
+        g.setup(core)
+        assert g.active() is False
+
+    def test_injector_probe_requires_the_socket(self, monkeypatch):
+        monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(g.socket, "socket", Mock())  # never connects
+        assert g._probe_injector() is False
+
+
+class TestRouting:
+    def test_triggers_open_the_grid(self, monkeypatch, core):
+        monkeypatch.setattr(g, "_active", True)
+        opened = Mock(return_value=(0, 0, 100, 100))
+        monkeypatch.setattr(g, "_open_session", opened)
+        assert g.handle("grid", core) is True
+        assert g.handle("pointer", core) is True
+        assert opened.call_count == 2
+
+    def test_a_word_merely_containing_a_trigger_is_not_ours(self, monkeypatch, core):
+        monkeypatch.setattr(g, "_active", True)
+        assert g.handle("greatest", core) is None
+
+    def test_close_after_a_trigger_is_a_dismissal(self, monkeypatch, core):
+        monkeypatch.setattr(g, "_active", True)
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        assert g.handle("close the grid", core) is True
+        g._dismiss.assert_called_once()
+
+    def test_unknown_input_passes_to_the_next_plugin(self, monkeypatch, core):
+        monkeypatch.setattr(g, "_active", True)
+        assert g.handle("open firefox", core) is None
+
+    def test_inert_plugin_never_claims_anything(self, core):
+        assert g.handle("grid", core) is None
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `uv run --extra=unittest pytest tests/unit/plugins/test_gridydotool.py -v`
+Expected: FAIL — `AttributeError: module ... has no attribute '_run_bounded'` (and the rest).
+
+- [ ] **Step 3: Write the gate, the seam and the adapter**
+
+Append to `src/plugins/gridydotool/__init__.py`:
+
+```python
+import os
+import shutil
+import socket
+import subprocess
+
+# The gate's probes run inside setup(), during daemon startup, where a hang is
+# worse than a failure: the loader guards setup() with try/except Exception
+# (core/main.py), which catches a raise but not a wait.
+PROBE_TIMEOUT = 5.0
+INJECT_TIMEOUT = 2.0
+REAP_GRACE = 2.0
+YDTOOL_SOCKET = "/tmp/.ydotool_socket"
+ERROR_SIGNATURES = ("error:", "Which coordinate", "Unknown tool", "failed to")
+FALLBACK_NOTICE = "backend unavailable"
+
+_core = None
+_active = False
+_bounds = None
+_monitor = None
+_monitor_origin = (0, 0)
+_grid_open = False
+_last_bounds = None
+
+
+def active():
+    """Return whether the gate let this plugin claim the grid words."""
+    return _active
+
+
+def _spawn(cmd, timeout):
+    """The only place a ydotool process is started; tests patch this."""
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=timeout, check=False
+    )
+
+
+def _run_bounded(args, timeout=INJECT_TIMEOUT):
+    """Run one ydotool invocation and return its outcome, never its exit code.
+
+    `MouseMove::Exec` and `Click::Exec` both `return argc`, so a successful
+    `click 1` exits 2 and a parse error can exit 2 as well: the code carries no
+    failure meaning. The three outcomes are what the rest of the module reasons
+    about.
+
+    `timeout` bounds the process, which is what keeps a wedged ydotoold from
+    freezing the modal loop with the overlay on screen.
+    """
+    if os.environ.get("EASYSPEAK_GRID_DRY_RUN"):
+        logger.info("dry run: %s", " ".join(args))
+        return "ran"
+    # The tool returns the argc it sees, which is this argv minus its own program
+    # name: ["ydotool", "mousemove_relative", "0", "0"] succeeds with 3, and the
+    # same probe with "--delay", "0" appended succeeds with 5. Deriving it from
+    # the argv we built is what keeps the expectation honest as the argv changes.
+    expected = len(args) - 1
+    try:
+        result = _spawn(args, timeout)
+    except subprocess.TimeoutExpired:
+        logger.warning("ydotool timed out after %ss: %s", timeout, " ".join(args))
+        return "unknown"
+    except OSError as exc:
+        logger.warning("ydotool could not start: %s", exc)
+        return "unknown"
+    if any(sig in result.stderr for sig in ERROR_SIGNATURES):
+        logger.warning("ydotool refused: %s", result.stderr.strip())
+        return "errored"
+    if FALLBACK_NOTICE in result.stderr:
+        # No daemon: the client built a device for this invocation, and a device
+        # that new may not be recognised before the events are emitted.
+        logger.warning("ydotool fell back to a per-invocation device")
+        return "unknown"
+    if result.returncode == expected:
+        return "ran"
+    if result.returncode < 0:
+        logger.warning("ydotool was killed by signal %s", -result.returncode)
+        return "unknown"
+    return "errored"
+
+
+def run_ydotool(args):
+    """Run an injection, logging whatever it was that happened."""
+    outcome = _run_bounded(args)
+    if outcome != "ran":
+        logger.warning("injection outcome: %s", outcome)
+    return outcome
+
+
+BUTTONS = {"click": 1, "right": 2, "middle": 3}
+
+
+def move_to(x, y):
+    """Move the pointer to a monitor-local point, in the global space ydotool
+    works in."""
+    return run_ydotool(
+        [
+            "ydotool", "mousemove",
+            str(_monitor_origin[0] + x), str(_monitor_origin[1] + y),
+            "--delay", "0",
+        ]
+    )
+
+
+def click(button="click"):
+    """Click a button at the current pointer position."""
+    return run_ydotool(["ydotool", "click", str(BUTTONS[button]), "--delay", "0"])
+
+
+def double_click():
+    """Two sequential left clicks, with no sleeps between them.
+
+    `--delay 0` is what keeps the pair inside the desktop's double-click window:
+    the tool's default 100 ms sleep per invocation would spend most of it.
+    """
+    first = click("click")
+    second = click("click")
+    return "ran" if first == second == "ran" else "unknown"
+```
+
+- [ ] **Step 4: Write the probes and the gate**
+
+Append:
+
+```python
+GRID_PYTHON_CANDIDATES = ("python3", "/usr/bin/python3", "/usr/bin/python")
+HELPER = str(Path(__file__).with_name("_overlay.py"))
+HELPER_PROBE = (
+    "import gi; gi.require_version('Gtk', '4.0'); "
+    "gi.require_version('Gtk4LayerShell', '1.0'); "
+    "from gi.repository import Gtk, Gtk4LayerShell"
+)
+
+
+def grid_python():
+    """Return an interpreter that can run the helper, or None.
+
+    Mirrors dictation's AT-SPI probe: the helper needs PyGObject and the
+    layer-shell typelib, which the daemon's venv does not have, so each
+    candidate is probed with the helper's own import chain. Bounded, because a
+    startup hang is invisible in a way an exception is not.
+    """
+    override = os.environ.get("EASYSPEAK_GRID_PYTHON")
+    candidates = (override,) if override else GRID_PYTHON_CANDIDATES
+    for candidate in candidates:
+        try:
+            probe = subprocess.run(
+                [candidate, "-c", HELPER_PROBE],
+                capture_output=True, check=False, timeout=PROBE_TIMEOUT,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0:
+            return candidate
+    return None
+
+
+def _probe_overlay():
+    """True when an interpreter can run the helper and the compositor supports
+    layer-shell (the helper answers that question in --probe mode)."""
+    python = grid_python()
+    if python is None:
+        logger.info("grid: no interpreter with PyGObject + Gtk4LayerShell")
+        return False
+    try:
+        probe = subprocess.run(
+            [python, HELPER, "--probe"],
+            capture_output=True, check=False, timeout=PROBE_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        logger.info("grid: the helper probe did not answer in time")
+        return False
+    if probe.returncode != 0:
+        logger.info("grid: layer-shell unsupported here (%s)", probe.stdout.strip())
+        return False
+    return True
+
+
+def _socket_accepts(sock_path=YDTOOL_SOCKET):
+    """True when the ydotoold socket takes a connection. No injection, no side
+    effect; the daemon holds an already-recognised device, which is what makes a
+    successful injection mean anything."""
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        conn.settimeout(PROBE_TIMEOUT)
+        conn.connect(sock_path)
+    except OSError:
+        return False
+    finally:
+        conn.close()
+    return True
+
+
+def _probe_injector():
+    """True when ydotool exists, the daemon answers, and a no-op move reports
+    `ran`.
+
+    `mousemove_relative 0 0` is the probe because it is a true no-op whose
+    success code (3) is unambiguous: `click 1` succeeds with 2, which collides
+    with the move tools' parse-error return.
+    """
+    if shutil.which("ydotool") is None:
+        logger.info("grid: ydotool is not installed")
+        return False
+    if not _socket_accepts():
+        logger.info("grid: no ydotoold on %s (clicks would be lost silently)", YDTOOL_SOCKET)
+        return False
+    outcome = _run_bounded(
+        ["ydotool", "mousemove_relative", "0", "0", "--delay", "0"]
+    )
+    if outcome != "ran":
+        logger.info("grid: the injector probe reported %s", outcome)
+        return False
+    return True
+
+
+def setup(core):
+    """Resolve the gate once, at daemon startup, and remember the core."""
+    global _core, _active
+    _core = core
+    forced = os.environ.get("EASYSPEAK_GRID_BACKEND")
+    if forced == "uinput":
+        # A deliberate override: it short-circuits the probes, because asking for
+        # this backend explicitly is the one case where a probe's answer is not
+        # the point (the harness uses it to observe the overlay without a daemon).
+        _active = True
+        logger.info("grid: forced active by EASYSPEAK_GRID_BACKEND=uinput")
+    elif forced == "gnome":
+        _active = False
+        logger.info("grid: forced inert by EASYSPEAK_GRID_BACKEND=gnome")
+    else:
+        overlay = _probe_overlay()
+        injector = _probe_injector() if overlay else False
+        _active = overlay and injector
+    logger.info("grid backend %s", "active" if _active else "inert")
+```
+
+- [ ] **Step 5: Write routing and the session entry points**
+
+Append:
+
+```python
+DISMISS_WORDS = {"close", "cancel", "stop", "hide", "escape", "exit", "done", "quit"}
+AGAIN_WORDS = {"again", "repeat", "reopen"}
+
+
+def _dismiss():
+    """Hide the grid and end whatever session is open."""
+    global _grid_open, _bounds
+    _close_session()
+    _grid_open = False
+    _bounds = None
+
+
+def _open_session(core):
+    """Open the overlay, take its geometry, and drive the mode until it ends.
+
+    Returns the mode's exit reason so the caller can decide what to say.
+    """
+    global _monitor, _monitor_origin, _bounds, _grid_open
+    geometry = _start_helper()          # Task 4 fills this in
+    if geometry is None:
+        return None
+    _monitor = geometry
+    _monitor_origin = (geometry[0], geometry[1])
+    _bounds = (0, 0, geometry[2], geometry[3])
+    _grid_open = True
+    core.speak(_("Grid"))
+    try:
+        _run_mode(core)
+    finally:
+        _close_session()
+        _grid_open = False
+    return "done"
+
+
+def handle(cmd, core):
+    """Claim the grid words when the gate passed, and only then.
+
+    Returns None when inert (so mousegrid keeps the words) or when the utterance
+    is not ours; True whenever the phrase was claimed and answered, failures
+    included, because the plugin has already spoken by then.
+    """
+    global _bounds, _last_bounds
+    if not _active:
+        return None
+    words = cmd.lower().strip().split()
+    if not words:
+        return None
+
+    if any(word in words for word in AGAIN_WORDS) and _last_bounds:
+        _bounds = _last_bounds
+        _open_session(core)
+        return True
+
+    if any(word in words for word in GRID_TRIGGERS) and not (
+        DISMISS_WORDS & set(words)
+    ):
+        _bounds = None
+        _open_session(core)
+        return True
+
+    if _grid_open and (DISMISS_WORDS & set(words)):
+        _dismiss()
+        core.speak(_("Grid closed"))
+        return True
+
+    return None
+```
+
+- [ ] **Step 6: Update the two core assertions**
+
+In `tests/unit/core/test_main.py`, add `"gridydotool"` to the set in
+`test_load_plugins_loads_all_shipped_plugins`, and change the ordering assertion in
+`test_load_plugins_routes_by_priority` to:
+
+```python
+        # The grid backend loads ahead of mousegrid: it shadows the same words,
+        # and the loader's order is what decides who is offered them first.
+        assert names[:3] == ["gridydotool", "headtrack", "mousegrid"]
+        assert names[-1] == "base"
+        assert names[3:-1] == sorted(names[3:-1])
+```
+
+- [ ] **Step 7: Run the tests**
+
+Run: `uv run --extra=unittest pytest tests/unit/plugins/test_gridydotool.py tests/unit/core/test_main.py -v`
+Expected: PASS.
+
+- [ ] **Step 8: Add the two reply strings to the catalogs**
+
+Run: `just translations de && just translations es && just translations fr && just translations it`
+
+Then fill the new entries (`Grid`, `Grid closed`) in each of the four files by
+copying mousegrid's existing translations for the same msgids — they are already
+translated there (`src/plugins/mousegrid/locale/<lang>/LC_MESSAGES/mousegrid.po`).
+
+- [ ] **Step 9: Verify the catalogs are complete and in step**
+
+Run: `uv run --extra=unittest pytest tests/unit/core/test_i18n.py -v && just check-translations`
+Expected: PASS, no diff.
+
+- [ ] **Step 10: Commit**
+
+```bash
+hug a src/plugins/gridydotool tests/unit/plugins/test_gridydotool.py tests/unit/core/test_main.py
+hug c -F - <<'EOF'
+feat(gridydotool): gate, bounded seam, adapter and routing
+
+The gate resolves once at startup and needs both halves: an interpreter that can
+run the helper, a compositor whose layer-shell the helper confirms, ydotool, a
+daemon socket that accepts a connection, and a no-op probe that reports ran. The
+socket is required because without the daemon the client builds a device per
+invocation and a device that new may not be recognised before the events are
+emitted, which is a click that exits cleanly and lands nowhere.
+
+Every subprocess goes through one seam that returns ran, errored or unknown
+instead of an exit code: ydotool returns argc, so a successful click exits 2 and
+a parse error can too. A fallback notice classifies as unknown rather than ran,
+for the same reason the socket is gated. Every invocation passes --delay 0, since
+the daemon already holds a recognised device and the delay would only widen the
+double-click pair.
+
+Routing mirrors mousegrid's word-boundary matching, and handle returns None only
+when inert: once the phrase is claimed and answered, failures included, it
+returns True so the other backend does not answer the same word twice.
+
+Co-authored-by: CommandCodeBot <noreply@commandcode.ai>
+EOF
+```
+
+---
+
+### Task 3: The click path and its outcomes
+
+**Files:**
+- Modify: `src/plugins/gridydotool/__init__.py`
+- Modify: `tests/unit/plugins/test_gridydotool.py`
+- Modify: `src/plugins/gridydotool/locale/{de,es,fr,it}/LC_MESSAGES/gridydotool.po`
+
+**Interfaces:**
+- Consumes: `move_to`, `click`, `double_click`, `_bounds`, `_last_bounds`, `_dismiss`, `_close_session`.
+- Produces: `_run_mode(core)`, `CLICK_WORDS`, `dismiss` behaviour, the last-cell bookkeeping that `again` reads.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+class TestModeDispatch:
+    def test_digits_subdivide_and_redraw(self, monkeypatch, core):
+        calls = []
+        monkeypatch.setattr(g, "_redraw", lambda bounds: calls.append(bounds))
+        g._bounds = (0, 0, 900, 600)
+        core.listen_modal = Mock(return_value=iter(["3 7 5"]))
+        g._run_mode(core)
+        # 3 -> (600, 0, 300, 200); 7 -> (600, 132, 100, 66); 5 -> (633, 154, 33, 22)
+        assert calls[-1] == (633, 154, 33, 22)
+
+    def test_click_moves_then_clicks_then_ends(self, monkeypatch, core):
+        seen = []
+        monkeypatch.setattr(g, "move_to", lambda x, y: seen.append(("move", x, y)))
+        monkeypatch.setattr(g, "click", lambda button="click": seen.append(("click", button)))
+        monkeypatch.setattr(g, "_dismiss", lambda: seen.append(("dismiss",)))
+        g._bounds = (0, 0, 900, 600)
+        core.listen_modal = Mock(return_value=iter(["click"]))
+        g._run_mode(core)
+        # Centre of the whole output: (450, 300), and the cell is remembered.
+        assert seen[-3:] == [("move", 450, 300), ("click", "click"), ("dismiss",)]
+        assert g._last_bounds == (0, 0, 900, 600)
+
+    def test_close_ends_the_mode_without_clicking(self, monkeypatch, core):
+        monkeypatch.setattr(g, "move_to", Mock())
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        core.listen_modal = Mock(return_value=iter(["close"]))
+        g._run_mode(core)
+        g.move_to.assert_not_called()
+        g._dismiss.assert_called_once()
+
+    def test_unrecognised_utterance_keeps_the_mode(self, monkeypatch, core):
+        monkeypatch.setattr(g, "move_to", Mock())
+        core.listen_modal = Mock(return_value=iter(["open firefox", "close"]))
+        g._run_mode(core)
+
+    def test_unknown_outcome_speaks_the_uncertain_line(self, monkeypatch, core):
+        monkeypatch.setattr(g, "move_to", lambda x, y: "unknown")
+        monkeypatch.setattr(g, "click", lambda button="click": "unknown")
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        g._bounds = (0, 0, 900, 600)
+        core.listen_modal = Mock(return_value=iter(["click"]))
+        g._run_mode(core)
+        assert core.speak.call_args_list[-1].args[0] == "I tried, but I'm not sure it worked."
+
+    def test_errored_outcome_speaks_the_definite_line(self, monkeypatch, core):
+        monkeypatch.setattr(g, "move_to", lambda x, y: "errored")
+        monkeypatch.setattr(g, "click", lambda button="click": "errored")
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        g._bounds = (0, 0, 900, 600)
+        core.listen_modal = Mock(return_value=iter(["click"]))
+        g._run_mode(core)
+        assert core.speak.call_args_list[-1].args[0] == "I couldn't move the pointer."
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `uv run --extra=unittest pytest tests/unit/plugins/test_gridydotool.py -k Mode -v`
+Expected: FAIL — `AttributeError: ... has no attribute '_run_mode'`
+
+- [ ] **Step 3: Implement the mode**
+
+Append:
+
+```python
+CLICK_VERBS = {
+    "double": "double",
+    "middle": "middle",
+    "right": "right",
+}
+
+
+def _redraw(bounds):
+    """Tell the helper to redraw the numbered grid over these bounds."""
+    _send({"cmd": "show", "bounds": list(bounds)})
+
+
+def _run_mode(core):
+    """Dispatch one utterance per round until the mode ends.
+
+    Core owns the loop (see listen_modal) so the tray stays live and an
+    unattended grid times out instead of holding the microphone for ever.
+    """
+    global _bounds, _last_bounds
+    for spoken in core.listen_modal(
+        "grid",
+        prompt="one two three four five six seven eight nine click double right close cancel",
+        timeout=10,
+        idle_timeout=30,
+    ):
+        text = spoken.lower()
+        words = set(text.split())
+
+        if words & DISMISS_WORDS:
+            _dismiss()
+            core.speak(_("Grid closed"))
+            return
+
+        if _click_kind(text, words):
+            _fire_click(_click_kind(text, words), core)
+            return
+
+        zones = parse_number_sequence(text)
+        if zones and _bounds:
+            for zone in zones:
+                _bounds = subdivide(_bounds, zone)
+            _redraw(_bounds)
+
+
+def _click_kind(text, words):
+    """Return the click flavour named by an utterance, or None."""
+    for marker, kind in CLICK_VERBS.items():
+        if marker in words:
+            return kind
+    if "click" in words or "lick" in words or "clique" in words:
+        return "click"
+    return None
+
+
+def _fire_click(kind, core):
+    """Move to the cell centre, click, remember the cell, and hide the grid.
+
+    The cell is remembered here rather than on every subdivision, mirroring
+    mousegrid: "again" means "back to where I last clicked", not "back to the
+    last cell I walked past".
+    """
+    global _last_bounds
+    if not _bounds:
+        return
+    x, y = center(_bounds)
+    _last_bounds = _bounds
+    outcome = move_to(x, y)
+    if outcome == "ran":
+        outcome = double_click() if kind == "double" else click(kind)
+    _dismiss()
+    if outcome == "errored":
+        core.speak(_("I couldn't move the pointer."))
+    elif outcome == "unknown":
+        core.speak(_("I tried, but I'm not sure it worked."))
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `uv run --extra=unittest pytest tests/unit/plugins/test_gridydotool.py -v`
+Expected: PASS.
+
+- [ ] **Step 5: Translate the two new strings**
+
+Run: `just translations de && just translations es && just translations fr && just translations it`
+
+Then fill `I couldn't move the pointer.` (copy mousegrid's translation of its own
+pointer-failure string where the wording matches, otherwise translate) and
+`I tried, but I'm not sure it worked.` with:
+
+| language | msgstr |
+|---|---|
+| de | `Ich habe es versucht, aber ich bin nicht sicher, ob es geklappt hat.` |
+| es | `Lo intenté, pero no estoy seguro de que haya funcionado.` |
+| fr | `J'ai essayé, mais je ne suis pas sûr que cela ait fonctionné.` |
+| it | `Ci ho provato, ma non sono sicuro che abbia funzionato.` |
+
+- [ ] **Step 6: Verify catalogs and commit**
+
+Run: `uv run --extra=unittest pytest tests/unit/core/test_i18n.py -v && just check-translations`
+Expected: PASS.
+
+```bash
+hug a src/plugins/gridydotool tests/unit/plugins/test_gridydotool.py
+hug c -F - <<'EOF'
+feat(gridydotool): the click path and what each outcome says
+
+A click is a move followed by a click, both through the bounded seam, and the
+outcome decides what the user hears: a definite failure when the tool refused,
+and a distinct line when the outcome is unknown, because a timeout leaves it
+genuinely unknown and claiming "it did not work" would invite a retry that may be
+a second click.
+
+The cell is remembered on click only, mirroring mousegrid, so "again" means back
+to where the user last clicked rather than back to the last cell walked past.
+
+Co-authored-by: CommandCodeBot <noreply@commandcode.ai>
+EOF
+```
+
+---
+
+### Task 4: The helper channel
+
+**Files:**
+- Modify: `src/plugins/gridydotool/__init__.py`
+- Modify: `tests/unit/plugins/test_gridydotool.py`
+- Modify: `src/plugins/gridydotool/locale/{de,es,fr,it}/LC_MESSAGES/gridydotool.po`
+
+**Interfaces:**
+- Consumes: `grid_python()`, `HELPER`, `PROBE_TIMEOUT`, `REAP_GRACE`, `_core`.
+- Produces: `_start_helper() -> (x, y, w, h) | None`, `read_until(stream, deadline) -> dict | None`, `stop_helper(reason)`, `_send(payload)`, `_close_session()`.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+class TestHelperChannel:
+    def _fake_helper(self, tmp_path, script):
+        path = tmp_path / "helper.py"
+        path.write_text(script, encoding="utf-8")
+        return str(path)
+
+    def test_ready_then_presented_are_logged_and_geometry_returned(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        helper = self._fake_helper(
+            tmp_path,
+            "import json, sys\n"
+            "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 1920, 1080],"
+            " 'scale': 1.0}), flush=True)\n"
+            "print(json.dumps({'event': 'presented'}), flush=True)\n"
+            "sys.stdin.readline()\n",
+        )
+        monkeypatch.setattr(g, "HELPER", helper)
+        monkeypatch.setattr(g, "grid_python", lambda: "python3")
+        with caplog.at_level("DEBUG"):
+            assert g._start_helper() == (0, 0, 1920, 1080)
+        g.stop_helper("test")
+        assert any("ready" in r.message and "1920" in r.message for r in caplog.records)
+
+    def test_a_silent_helper_hits_the_deadline_and_is_reaped(
+        self, monkeypatch, tmp_path
+    ):
+        helper = self._fake_helper(tmp_path, "import time\ntime.sleep(60)\n")
+        monkeypatch.setattr(g, "HELPER", helper)
+        monkeypatch.setattr(g, "grid_python", lambda: "python3")
+        monkeypatch.setattr(g, "PROBE_TIMEOUT", 0.5)
+        assert g._start_helper() is None
+        assert g._helper is None
+
+    def test_an_error_answer_ends_the_handshake_with_its_message(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        helper = self._fake_helper(
+            tmp_path,
+            "import json, sys, time\n"
+            "print(json.dumps({'event': 'error',"
+            " 'message': 'layer-shell unsupported'}), flush=True)\n"
+            "time.sleep(60)\n",
+        )
+        monkeypatch.setattr(g, "HELPER", helper)
+        monkeypatch.setattr(g, "grid_python", lambda: "python3")
+        with caplog.at_level("WARNING"):
+            assert g._start_helper() is None
+        assert any("layer-shell unsupported" in r.message for r in caplog.records)
+
+    def test_a_helper_that_dies_first_is_reaped(self, monkeypatch, tmp_path):
+        helper = self._fake_helper(tmp_path, "raise SystemExit(1)\n")
+        monkeypatch.setattr(g, "HELPER", helper)
+        monkeypatch.setattr(g, "grid_python", lambda: "python3")
+        assert g._start_helper() is None
+        assert g._helper is None
+
+    def test_a_bad_line_is_logged_and_ignored(self, monkeypatch, tmp_path):
+        helper = self._fake_helper(
+            tmp_path,
+            "import json, sys\n"
+            "print('not json at all', flush=True)\n"
+            "print(json.dumps({'event': 'ready', 'monitor': [1, 2, 3, 4]}), flush=True)\n"
+            "sys.stdin.readline()\n",
+        )
+        monkeypatch.setattr(g, "HELPER", helper)
+        monkeypatch.setattr(g, "grid_python", lambda: "python3")
+        assert g._start_helper() == (1, 2, 3, 4)
+        g.stop_helper("test")
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `uv run --extra=unittest pytest tests/unit/plugins/test_gridydotool.py -k Helper -v`
+Expected: FAIL — `AttributeError: ... has no attribute '_start_helper'`
+
+- [ ] **Step 3: Implement the channel**
+
+Append to the module:
+
+```python
+import json
+import select
+import time
+
+
+def _start_helper():
+    """Spawn the helper, take its geometry, and return it or None.
+
+    The helper is spawned with `Popen`, not `run`: `run` would only return once
+    the process exits, and this process must stay up and keep rendering. The
+    `ready` wait is a read on a live child's pipe, so it is bounded by a `select`
+    deadline rather than a subprocess timeout, which cannot reach a pipe read. A
+    helper that stays alive and writes nothing is the case that distinction
+    exists for.
+    """
+    global _helper
+    python = grid_python()
+    if python is None:
+        return None
+    try:
+        _helper = subprocess.Popen(
+            [python, HELPER],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as exc:
+        logger.warning("grid: the helper could not start: %s", exc)
+        _helper = None
+        return None
+
+    deadline = time.monotonic() + PROBE_TIMEOUT
+    while True:
+        message = read_until(_helper.stdout, deadline)
+        if message is None:
+            logger.warning("grid: the helper never reported ready (deadline)")
+            stop_helper("no ready inside PROBE_TIMEOUT")
+            return None
+        event = message.get("event")
+        if event == "ready":
+            logger.info("grid: ready on %s (scale %s)", message.get("monitor"),
+                        message.get("scale"))
+            break
+        if event == "error":
+            logger.warning("grid: helper refused: %s", message.get("message"))
+            stop_helper("helper error")
+            return None
+        logger.debug("grid: %s", event)
+
+    monitor = message.get("monitor")
+    if not monitor or len(monitor) != 4:
+        logger.warning("grid: the ready event carried no usable geometry")
+        stop_helper("bad geometry")
+        return None
+    return tuple(monitor)
+
+
+def read_until(stream, deadline):
+    """Read one JSON line from `stream`, or None when the deadline passes.
+
+    The bound is a mechanism here, not a property: `select` is what lets a
+    blocking read give up. Anything that does not parse is logged and skipped,
+    and EOF reads as None.
+    """
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            ready, _, _ = select.select([stream], [], [], remaining)
+        except (OSError, ValueError):
+            return None
+        if not ready:
+            return None
+        line = stream.readline()
+        if not line:
+            logger.warning("grid: the helper closed its output")
+            return None
+        try:
+            return json.loads(line)
+        except ValueError:
+            logger.warning("grid: ignoring unparsable protocol line: %r", line[:120])
+
+
+def _send(payload):
+    """Write one protocol line to the helper, if one is running."""
+    if _helper is None or _helper.stdin is None:
+        return False
+    try:
+        _helper.stdin.write(json.dumps(payload) + "\n")
+        _helper.stdin.flush()
+    except (BrokenPipeError, ValueError):
+        logger.warning("grid: the helper is gone; dropping %s", payload.get("cmd"))
+        return False
+    return True
+
+
+def stop_helper(reason):
+    """Stop and reap the helper, escalating when it will not go.
+
+    `terminate()`, a bounded wait, then `kill()`, logging which rung was needed:
+    an unbounded `wait()` would freeze the mode at exactly the point this
+    function exists to make safe, and a process that cannot be scheduled to
+    handle SIGTERM still takes a kill from the kernel.
+    """
+    global _helper
+    helper, _helper = _helper, None
+    if helper is None or helper.poll() is not None:
+        return
+    helper.terminate()
+    try:
+        helper.wait(timeout=REAP_GRACE)
+        logger.debug("grid: helper stopped (%s)", reason)
+    except subprocess.TimeoutExpired:
+        logger.warning("grid: helper ignored SIGTERM (%s); killing", reason)
+        helper.kill()
+        helper.wait(timeout=REAP_GRACE)
+
+
+def _close_session():
+    """Tear the surface down and reap the helper; safe to call twice."""
+    _send({"cmd": "hide"})
+    stop_helper("session closed")
+```
+
+- [ ] **Step 4: Add `_helper = None` to the module state**
+
+Next to the other globals, add:
+
+```python
+_helper = None
+```
+
+- [ ] **Step 5: Let the pre-ready path speak, and only once**
+
+Append to `_open_session` (replace the early return):
+
+```python
+    geometry = _start_helper()
+    if geometry is None:
+        core.speak(_("I couldn't show the grid."))
+        return None
+```
+
+- [ ] **Step 6: Run the tests to verify they pass**
+
+Run: `uv run --extra=unittest pytest tests/unit/plugins/test_gridydotool.py -v`
+Expected: PASS, including the silent-helper and error-answer cases.
+
+- [ ] **Step 7: Translate the fifth string**
+
+Run: `just translations de && just translations es && just translations fr && just translations it`
+
+Fill `I couldn't show the grid.` with:
+
+| language | msgstr |
+|---|---|
+| de | `Ich konnte das Raster nicht anzeigen.` |
+| es | `No pude mostrar la cuadrícula.` |
+| fr | `Je n'ai pas pu afficher la grille.` |
+| it | `Non sono riuscito a mostrare la griglia.` |
+
+- [ ] **Step 8: Verify and commit**
+
+Run: `uv run --extra=unittest pytest tests/unit/plugins/test_gridydotool.py tests/unit/core/test_i18n.py -v && just check-translations`
+Expected: PASS.
+
+```bash
+hug a src/plugins/gridydotool tests/unit/plugins/test_gridydotool.py
+hug c -F - <<'EOF'
+feat(gridydotool): the helper channel, bounded by a mechanism
+
+The helper is spawned with Popen and the ready wait is a select deadline on its
+stdout, because a subprocess timeout bounds a process and this wait is a pipe
+read on a live child: a helper that stays alive and writes nothing would sail
+past a bound written only as a property. Five cases are handled, including the
+error answer, which ends the handshake at that line instead of discarding the
+only component that knows why a surface was refused.
+
+stop_helper escalates terminate, a bounded grace, kill, and logs which rung was
+needed. Without that bound the reap becomes the next hang, on the path that
+exists to prevent one, and without the reap a helper that finished mapping after
+the deadline would leave an ownerless full-screen overlay.
+
+Co-authored-by: CommandCodeBot <noreply@commandcode.ai>
+EOF
+```
+
+---
+
+### Task 5: The overlay helper
+
+**Files:**
+- Create: `src/plugins/gridydotool/_overlay.py`
+- Modify: `tests/unit/plugins/test_gridydotool.py`
+
+**Interfaces:**
+- Consumes: nothing from the plugin module (it is a separate interpreter's program).
+- Produces: `cell_rects(bounds) -> list[tuple[int, int, int, int]]`, `parse_command(line) -> dict | None`, `main(argv) -> int` honouring `--probe`.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+import importlib.util
+from pathlib import Path
+
+
+def _overlay_module():
+    """Import the helper without importing gi: the module defers that import so
+    the daemon's venv can test its pure parts."""
+    path = Path(g.__file__).with_name("_overlay.py")
+    spec = importlib.util.spec_from_file_location("grid_overlay", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestOverlayPureParts:
+    def test_cell_rects_are_the_nine_thirds(self):
+        overlay = _overlay_module()
+        rects = overlay.cell_rects((0, 0, 900, 600))
+        assert rects[0] == (0, 0, 300, 200)
+        assert rects[8] == (600, 400, 300, 200)
+        assert len(rects) == 9
+
+    def test_parse_command_accepts_show_and_hide(self):
+        overlay = _overlay_module()
+        assert overlay.parse_command('{"cmd": "hide"}') == {"cmd": "hide"}
+        assert overlay.parse_command("") is None
+        assert overlay.parse_command("{oops") is None
+
+    def test_probe_mode_reports_unsupported_without_a_display(self):
+        overlay = _overlay_module()
+        assert overlay.main(["--probe"]) == 1
+
+    def test_the_module_imports_without_gi(self):
+        assert _overlay_module() is not None
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `uv run --extra=unittest pytest tests/unit/plugins/test_gridydotool.py -k Overlay -v`
+Expected: FAIL — the file does not exist.
+
+- [ ] **Step 3: Write the helper**
+
+Create `src/plugins/gridydotool/_overlay.py`:
+
+```python
+"""Standalone GTK4 layer-shell overlay for the gridydotool plugin.
+
+Runs as a script in an interpreter that has PyGObject and the gtk4-layer-shell
+typelib, both of which the daemon's venv lacks. It is a real module rather than
+an embedded `-c` string so Ruff lints it and the unit suite can exercise the pure
+parts (the `_atspi_insert.py` precedent), which is also why `gi` is imported
+inside functions: importing it at module scope would make the whole file
+unimportable from the venv.
+
+Protocol: newline-delimited JSON on stdin and stdout, diagnostics on stderr.
+
+    {"cmd": "show", "bounds": [x, y, w, h]}   draw a 3x3 grid over this rect
+    {"cmd": "hide"}                            tear the surface down
+    {"cmd": "quit"}                            exit
+
+    {"event": "ready", "monitor": [x, y, w, h], "scale": 1.0}
+    {"event": "presented"}
+    {"event": "error", "message": "..."}
+
+`--probe` answers whether this compositor supports layer-shell and exits 0 or 1
+without mapping anything.
+"""
+
+import json
+import sys
+
+DEFAULT_NAMESPACE = "gridydotool"
+
+
+def cell_rects(bounds):
+    """Return the nine cell rectangles of a 3x3 grid over `bounds`, row-major."""
+    x, y, w, h = bounds
+    cell_w, cell_h = w // 3, h // 3
+    return [
+        (x + col * cell_w, y + row * cell_h, cell_w, cell_h)
+        for row in range(3)
+        for col in range(3)
+    ]
+
+
+def parse_command(line):
+    """Return the command object on a protocol line, or None if there is none."""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        payload = json.loads(line)
+    except ValueError:
+        sys.stderr.write(f"grid-overlay: ignoring unparsable line: {line[:120]}\n")
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def emit(payload):
+    """Write one event to the parent."""
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+
+def load_layer_shell():
+    """Load gtk4-layer-shell and Gtk, or return (None, None).
+
+    The library must be loaded before Gtk's Wayland client is, which is what the
+    CDLL call buys: linking it later lets libwayland-client win the symbol
+    resolution and the layer surface silently comes up as an ordinary window.
+    """
+    from ctypes import CDLL
+
+    try:
+        CDLL("libgtk4-layer-shell.so")
+    except OSError as exc:
+        sys.stderr.write(f"grid-overlay: libgtk4-layer-shell.so not found: {exc}\n")
+        return None, None
+    import gi
+
+    try:
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Gtk4LayerShell", "1.0")
+        from gi.repository import Gtk, Gtk4LayerShell
+    except (ValueError, ImportError) as exc:
+        sys.stderr.write(f"grid-overlay: cannot load Gtk4LayerShell: {exc}\n")
+        return None, None
+    return Gtk, Gtk4LayerShell
+
+
+def is_supported():
+    """True when this compositor speaks wlr-layer-shell."""
+    _, layer_shell = load_layer_shell()
+    if layer_shell is None:
+        return False
+    return bool(layer_shell.is_supported())
+
+
+class Overlay:
+    """The layer surface, its nine cells, and the redraws they ask for."""
+
+    def __init__(self, Gtk, layer_shell):
+        self.Gtk = Gtk
+        self.layer_shell = layer_shell
+        self.window = Gtk.Window()
+        self.area = Gtk.DrawingArea()
+        self.bounds = None
+        self.origin = (0, 0)
+        self.window.set_child(self.area)
+        self.area.set_draw_func(self._draw)
+        layer_shell.init_for_window(self.window)
+        for edge in (
+            layer_shell.Edge.LEFT,
+            layer_shell.Edge.RIGHT,
+            layer_shell.Edge.TOP,
+            layer_shell.Edge.BOTTOM,
+        ):
+            layer_shell.set_anchor(self.window, edge, True)
+        layer_shell.set_layer(self.window, layer_shell.Layer.OVERLAY)
+        # Never take focus, and let the injected click pass through to whatever
+        # is underneath: a grid that swallows its own click is useless.
+        layer_shell.set_keyboard_mode(self.window, layer_shell.KeyboardMode.NONE)
+        self.window.set_can_target(False)
+
+    def _draw(self, area, cr, width, height, _data):
+        """Paint the nine cells with their digits."""
+        Gtk = self.Gtk
+        if not self.bounds:
+            return
+        origin_x, origin_y = self.origin
+        cr.set_source_rgba(0.05, 0.05, 0.08, 0.55)
+        cr.paint()
+        cr.set_source_rgba(0.95, 0.95, 0.95, 0.95)
+        for index, (x, y, w, h) in enumerate(cell_rects(self.bounds), start=1):
+            left, top = x - origin_x, y - origin_y
+            cr.rectangle(left, top, w, h)
+            cr.stroke()
+            cr.move_to(left + w / 2 - 8, top + h / 2 + 8)
+            cr.set_font_size(28)
+            cr.show_text(str(index))
+        del area, width, height
+
+    def show(self, bounds):
+        self.bounds = tuple(bounds)
+        self.window.present()
+
+    def hide(self):
+        self.window.set_visible(False)
+
+
+def report_monitor(overlay, Gtk, layer_shell):
+    """Emit the ready event once the surface is configured.
+
+    The monitor geometry comes from the surface, not from an assumption: the
+    compositor chooses the output (the helper makes no set_monitor call), and
+    this report is the plugin's only source of screen size.
+    """
+    surface = overlay.window.get_surface()
+    display = surface.get_display()
+    monitor = display.get_monitor_at_surface(surface)
+    geometry = monitor.get_geometry()
+    overlay.origin = (geometry.x, geometry.y)
+    emit(
+        {
+            "event": "ready",
+            "monitor": [geometry.x, geometry.y, geometry.width, geometry.height],
+            "scale": monitor.get_scale_factor(),
+        }
+    )
+
+
+def run(Gtk, layer_shell):
+    """Wire the protocol to the surface and pump the GTK loop."""
+    import gi
+
+    GLib = gi.repository.GLib
+
+    overlay = Overlay(Gtk, layer_shell)
+    app = Gtk.Application(application_id="dev.easyspeak.gridydotool.overlay")
+
+    def on_activate(_app):
+        overlay.window.present()
+
+    def emit_ready_when_mapped():
+        """Report geometry only once the surface exists, then stop polling.
+
+        `ready` is what the plugin waits for before it can compute a single
+        coordinate, so it must be sent after GTK has a surface to ask, not from
+        the constructor where there is none yet.
+        """
+        if overlay.window.get_surface() is None:
+            return True
+        report_monitor(overlay, Gtk, layer_shell)
+        return False
+
+    app.connect("activate", on_activate)
+    GLib.idle_add(emit_ready_when_mapped)
+
+    def on_stdin_ready(_source, _condition):
+        line = sys.stdin.readline()
+        if not line:  # the plugin is gone; never outlive it
+            app.quit()
+            return False
+        command = parse_command(line)
+        if command is None:
+            return True
+        name = command.get("cmd")
+        if name == "show":
+            overlay.show(command["bounds"])
+        elif name == "hide":
+            overlay.hide()
+        elif name == "quit":
+            app.quit()
+            return False
+        return True
+
+    GLib.io_add_watch(
+        sys.stdin.fileno(), GLib.IO_IN | GLib.IO_HUP, on_stdin_ready
+    )
+    app.run([])
+    return 0
+
+
+def main(argv=None):
+    """Entry point: `--probe` one-shots the support question, otherwise serve."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--probe" in argv:
+        supported = is_supported()
+        sys.stdout.write("supported\n" if supported else "unsupported\n")
+        return 0 if supported else 1
+    Gtk, layer_shell = load_layer_shell()
+    if Gtk is None:
+        emit({"event": "error", "message": "PyGObject or the layer-shell typelib is missing"})
+        return 1
+    if not layer_shell.is_supported():
+        # Refuse rather than degrade: an ordinary window would look like a
+        # rendering bug while the injections kept working.
+        emit({"event": "error", "message": "layer-shell unsupported"})
+        return 1
+    return run(Gtk, layer_shell)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+- [ ] **Step 4: Run the unit tests**
+
+Run: `uv run --extra=unittest pytest tests/unit/plugins/test_gridydotool.py -v`
+Expected: PASS. The pure parts are exercised in the venv; the GTK wiring is exercised by the harness in Task 6.
+
+- [ ] **Step 5: Lint and type-check the helper**
+
+Run: `just format && just lint && just types`
+Expected: PASS (Ruff `select = ["ALL"]` applies; the helper uses `sys.stdout.write` rather than `print` for exactly that reason).
+
+- [ ] **Step 6: Commit**
+
+```bash
+hug a src/plugins/gridydotool/_overlay.py tests/unit/plugins/test_gridydotool.py
+hug c -F - <<'EOF'
+feat(gridydotool): the GTK4 layer-shell overlay helper
+
+The renderer that makes this backend compositor-agnostic: a layer surface on the
+overlay layer, anchored to every edge, with keyboard mode NONE and an empty input
+region so the click it is aiming passes through it.
+
+gi is imported inside functions, which is what keeps the module importable from
+the daemon's venv so its pure parts (the nine cell rectangles and the protocol
+parser) are unit-tested rather than eyeballed. The library is loaded with CDLL
+before Gtk so libwayland-client cannot win the symbol resolution and turn the
+layer surface into an ordinary window.
+
+show refuses when the compositor has no layer-shell: degrading would look like a
+rendering bug while the injections kept working, and the refusal is what the
+plugin's handshake surfaces as an error.
+
+Co-authored-by: CommandCodeBot <noreply@commandcode.ai>
+EOF
+```
+
+---
+
+### Task 6: The integration harness
+
+**Files:**
+- Create: `tests/integration/test_gridydotool_harness.py`
+- Create: `tests/integration/grid_probe_window.py`
+- Modify: `tests/integration/README.md`
+
+**Interfaces:**
+- Consumes: `gridydotool.setup/handle/active`, `_overlay.py` (both arms), `sway`, `ydotool`, `grim`.
+- Produces: `test_gate_is_inert_without_a_daemon`, `test_overlay_and_argv_under_a_forced_backend`, `test_live_click_lands_in_the_expected_cell`.
+
+- [ ] **Step 1: Write the probe window**
+
+Create `tests/integration/grid_probe_window.py`:
+
+```python
+"""Fullscreen GTK4 probe that reports what the pointer does.
+
+Prints one JSON object per line: motion, press and release, with surface-local
+coordinates. In the harness's single-output session that is also the absolute
+position, which is what turns "the pointer landed in the cell" into an assertion
+instead of an eyeball.
+"""
+
+import json
+import sys
+
+
+def main():
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import Gtk
+
+    def emit(**payload):
+        sys.stdout.write(json.dumps(payload) + "\n")
+        sys.stdout.flush()
+
+    def on_activate(app):
+        window = Gtk.Window(application=app)
+        area = Gtk.DrawingArea()
+        window.set_child(area)
+        window.fullscreen()
+
+        motion = Gtk.EventControllerMotion()
+        motion.connect(
+            "motion",
+            lambda _c, x, y: emit(event="motion", x=int(x), y=int(y)),
+        )
+        window.add_controller(motion)
+
+        click = Gtk.GestureClick()
+        click.connect(
+            "pressed",
+            lambda _g, _n, x, y: emit(event="press", button=1, x=int(x), y=int(y)),
+        )
+        window.add_controller(click)
+        window.present()
+
+    app = Gtk.Application(application_id="dev.easyspeak.gridydotool.probe")
+    app.connect("activate", on_activate)
+    return app.run([])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+- [ ] **Step 2: Write the harness**
+
+Create `tests/integration/test_gridydotool_harness.py`:
+
+```python
+"""The gridydotool end-to-end loop, in a headless sway session.
+
+Three checks: the gate stays inert when there is no daemon (no privileges
+needed), the overlay renders and the argv is exact under a forced backend (the
+dry-run arm, which is the arm CI can run), and, only when EASYSPEAK_GRID_LIVE is
+set, that a click lands where the grid aimed it.
+
+The literal in the live arm is hand-computed. Deriving it with the same algorithm
+the plugin uses would make the assertion agree with any shared off-by-one, so the
+premise (a pinned 1920x1080 output) is asserted first and the algorithmic
+prediction is kept only as a cross-check.
+
+Injection is kernel-global: even inside this session, arm B moves the real
+cursor and clicks wherever it aims on the live desktop. That is why it is opt-in.
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+import pytest
+
+from easyspeak.plugins import gridydotool
+
+SWAY_CONFIG = """\
+output HEADLESS-1 mode 1920x1080
+input * {
+    accel_profile flat
+}
+"""
+
+# For 1920x1080 and the sequence 3 7 5: zone 3 -> (1280, 0, 640, 360),
+# zone 7 -> (1280, 240, 213, 120), zone 5 -> (1351, 280, 71, 40).
+EXPECTED_CELL = (1351, 280, 71, 40)
+EXPECTED_TOLERANCE = 10  # a quarter of the cell's smaller dimension, 40
+
+
+def _binaries_present():
+    return all(shutil.which(name) for name in ("sway", "ydotool", "grim"))
+
+
+@pytest.fixture
+def session(tmp_path):
+    """A headless sway session with the plugin's helper reachable inside it."""
+    if not _binaries_present():
+        pytest.skip("sway, ydotool and grim are needed for the harness")
+    config = tmp_path / "sway.conf"
+    config.write_text(SWAY_CONFIG, encoding="utf-8")
+    env = dict(os.environ, WLR_BACKENDS="headless", WLR_LIBINPUT_NO_DEVICES="1",
+               XDG_RUNTIME_DIR=str(tmp_path))
+    sway = subprocess.Popen(
+        ["sway", "-c", str(config)], env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(2.0)  # sway needs a moment to bind its socket and map the output
+    yield env
+    sway.terminate()
+    sway.wait(timeout=5)
+
+
+def _grim(env, path):
+    subprocess.run(["grim", str(path)], env=env, check=False, timeout=10)
+
+
+class TestGateWithoutADaemon:
+    def test_the_plugin_stays_inert(self, monkeypatch):
+        """A box with no ydotoold must keep mousegrid in charge: this is the
+        gate assertion that needs no privileges at all."""
+        monkeypatch.delenv("EASYSPEAK_GRID_BACKEND", raising=False)
+        monkeypatch.setattr(gridydotool, "_probe_overlay", lambda: True)
+        monkeypatch.setattr(gridydotool, "_probe_injector", lambda: False)
+        gridydotool.setup(core=None)
+        assert gridydotool.active() is False
+        assert gridydotool.handle("grid", core=None) is None
+
+
+class TestForcedBackendArm:
+    def test_reads_the_geometry_and_records_the_argv(self, session, tmp_path,
+                                                     monkeypatch, caplog):
+        """Arm A: the backend is forced, so no daemon is needed, and the overlay
+        is observed through the plugin's own log records (its stdout belongs to
+        the plugin, so the harness cannot read that stream itself)."""
+        monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "uinput")
+        monkeypatch.setenv("EASYSPEAK_GRID_DRY_RUN", "1")
+
+        commands = ["grid", "3 7 5", "click"]
+
+        class FakeCore:
+            def __init__(self):
+                self.said = []
+
+            def speak(self, text):
+                self.said.append(text)
+
+            def listen_modal(self, *_a, **_k):
+                return iter(commands[1:])
+
+        with caplog.at_level("INFO"):
+            gridydotool.setup(FakeCore())
+            assert gridydotool.active() is True
+            gridydotool.handle(commands[0], gridydotool._core)
+
+        ready = [r for r in caplog.records if "ready on" in r.message]
+        assert ready, "the helper never reported ready"
+        assert "1920" in ready[0].message and "1080" in ready[0].message
+        dry = [r for r in caplog.records if "dry run:" in r.message]
+        assert any("mousemove" in r.message for r in dry)
+        assert any("click 1" in r.message for r in dry)
+        assert gridydotool._helper is None
+
+
+@pytest.mark.skipif(
+    os.environ.get("EASYSPEAK_GRID_LIVE") != "click",
+    reason="live injection is opt-in: set EASYSPEAK_GRID_LIVE=click",
+)
+class TestLiveArm:
+    def test_the_click_lands_in_the_expected_cell(self, session, tmp_path,
+                                                  monkeypatch):
+        monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "uinput")
+        repo_root = Path(gridydotool.__file__).parents[3]
+        probe = subprocess.Popen(
+            [str(repo_root / "tests" / "integration" / "grid_probe_window.py")],
+            env=session, stdout=subprocess.PIPE, text=True,
+        )
+        time.sleep(1.5)
+        before = tmp_path / "before.png"
+        _grim(session, before)
+
+        monkeypatch.setattr(gridydotool, "PROBE_TIMEOUT", 8.0)
+        gridydotool.setup(core=None)
+        assert gridydotool._start_helper() == (0, 0, 1920, 1080)
+        gridydotool._bounds = (0, 0, 1920, 1080)
+        for zone in (3, 7, 5):
+            gridydotool._bounds = gridydotool.subdivide(gridydotool._bounds, zone)
+            gridydotool._redraw(gridydotool._bounds)
+        time.sleep(0.5)
+        assert gridydotool._bounds == EXPECTED_CELL
+
+        after = tmp_path / "after.png"
+        _grim(session, after)
+        assert before.read_bytes() != after.read_bytes(), "the overlay did not render"
+
+        x, y = gridydotool.center(EXPECTED_CELL)
+        print(f"about to click at {x},{y}")
+        gridydotool.move_to(x, y)
+        gridydotool.click("click")
+        time.sleep(0.5)
+
+        events = []
+        probe.terminate()
+        out, _ = probe.communicate(timeout=5)
+        for line in (out or "").splitlines():
+            events.append(json.loads(line))
+        presses = [e for e in events if e["event"] == "press"]
+        assert presses, f"the probe window saw no click: {events}"
+        left, top, width, height = EXPECTED_CELL
+        px, py = presses[-1]["x"], presses[-1]["y"]
+        assert left - EXPECTED_TOLERANCE <= px <= left + width + EXPECTED_TOLERANCE
+        assert top - EXPECTED_TOLERANCE <= py <= top + height + EXPECTED_TOLERANCE
+```
+
+- [ ] **Step 3: Run the harness without the live arm**
+
+Run: `just integration -k gridydotool -v`
+Expected: PASS for the gate and forced-backend classes; the live class SKIPS with its reason. On a machine without sway/ydotool/grim the whole file skips.
+
+- [ ] **Step 4: Run the live arm once, deliberately**
+
+Run: `EASYSPEAK_GRID_LIVE=click just integration -k LiveArm -v -s`
+Expected: PASS, and the printed coordinates are the ones about to be clicked at. This is the only check that touches real input; on a laptop dock, expect the cursor to move.
+
+- [ ] **Step 5: Document the harness**
+
+In `tests/integration/README.md`, extend the layout listing with both new files and add a short section naming the prerequisites in one place (sway, ydotool, grim, the layer-shell build, and a `ydotoold` for the live arm only) plus the two environment variables the harness reads: `EASYSPEAK_GRID_LIVE` and `EASYSPEAK_GRID_BACKEND`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+hug a tests/integration
+hug c -F - <<'EOF'
+test(gridydotool): the headless-sway harness, in two shapes and two arms
+
+The gate is asserted where it needs no privileges: with no daemon the plugin must
+stay inert and leave the words to mousegrid. The overlay and the exact argv are
+asserted under a forced backend, which is what keeps this arm runnable in CI
+without /dev/uinput, and they are observed through the plugin's own log records
+because the helper's stdout belongs to the plugin.
+
+The live arm is opt-in and hand-computes its expectation: for a pinned 1920x1080
+output the sequence 3 7 5 must land in (1351, 280, 71, 40), and the premise is
+asserted before the arithmetic so a config drift fails loudly instead of reading
+as a coordinate mystery. The tolerance is bounded to a quarter of the cell's
+smaller dimension, so widening it can never be the reason the assertion passes.
+
+Injection is kernel-global, so even in this session the live arm moves the real
+cursor; that is why it prints its target before it clicks.
+
+Co-authored-by: CommandCodeBot <noreply@commandcode.ai>
+EOF
+```
+
+---
+
+### Task 7: Docs
+
+**Files:**
+- Modify: `docs/reference/plugins.md`, `docs/how-it-works.md`, `docs/commands.md`, `docs/troubleshooting.md`, `docs/compatibility.md`, `docs/usage.md`, `docs/index.md`, `README.md`
+- Modify: `tests/packaging/test_python_wheel.sh`
+
+**Interfaces:** consumes the finished plugin; produces no code.
+
+- [ ] **Step 1: Add the reference entry**
+
+In `docs/reference/plugins.md`, add the entry alongside the others:
+
+```markdown
+## gridydotool
+
+::: plugins.gridydotool
+```
+
+- [ ] **Step 2: Update the plugin tree**
+
+In `docs/how-it-works.md`, add the package to the tree next to `mousegrid/`:
+
+```text
+│       ├── gridydotool/        # Grid overlay + kernel-level injection (layer-shell + ydotool)
+```
+
+- [ ] **Step 3: Mark the verbs this backend cannot honour**
+
+In `docs/commands.md`, under the grid verb table, add a note so the table stops promising every verb on every backend:
+
+```markdown
+On a compositor where EasySpeak's Shell extension cannot run (COSMIC, wlroots, KDE),
+the grid is served by the `gridydotool` backend instead. It understands the
+navigation, click and close verbs above; `nudge`, `scroll` and `mark`/`drag` are
+not available there yet.
+```
+
+- [ ] **Step 4: Say what a missing stack looks like**
+
+In `docs/troubleshooting.md`, add a section after the existing grid one:
+
+```markdown
+## Mouse grid: the grid never appears on a non-GNOME desktop
+
+The grid needs either the Shell extension (GNOME 47+) or the `gridydotool`
+backend, which needs three things: `ydotool` installed, a running `ydotoold`
+(a user service: `systemctl --user enable --now ydotoold`), and a compositor with
+layer-shell support (COSMIC, wlroots, KDE). `ydotoold` also needs write access to
+`/dev/uinput`.
+
+If any of them is missing the daemon logs `grid backend inert` at startup with the
+reason, says nothing out loud, and `mousegrid` keeps the words.
+```
+
+- [ ] **Step 5: Document the requirements and the risk**
+
+In `docs/compatibility.md`, extend the mouse-grid row's note to name the second backend and its requirements, and in `docs/usage.md` add the two user-facing knobs to the environment-variable section:
+
+```markdown
+| `EASYSPEAK_GRID_BACKEND` | `uinput` or `gnome`: force one grid backend instead of probing. `uinput` skips the probes entirely. |
+| `EASYSPEAK_GRID_PYTHON` | Path to an interpreter with PyGObject and the gtk4-layer-shell typelib, if the probe cannot find one. |
+```
+
+Also state the security note where the requirements are described: installing
+`ydotoold` and granting it `/dev/uinput` is input-injection grade access, the same
+class as the `input` group that hold-to-dictate needs.
+
+- [ ] **Step 6: Fix the feature lines**
+
+In `docs/index.md` and `README.md`, adjust the mouse-grid line so it does not imply the Shell extension is the only route (for example: "Mouse grid (Shell extension on GNOME 47+, or the layer-shell + ydotool backend elsewhere)").
+
+- [ ] **Step 7: Add the wheel-test member**
+
+In `tests/packaging/test_python_wheel.sh`, next to the existing locale assertion:
+
+```bash
+has locale/de/LC_MESSAGES/gridydotool.po
+```
+
+- [ ] **Step 8: Run the docs checks**
+
+Run: `just check-docs`
+Expected: PASS (docstring linting, markdown linting, link checking).
+
+- [ ] **Step 9: Commit**
+
+```bash
+hug a docs tests/packaging/test_python_wheel.sh
+hug c -F - <<'EOF'
+docs(gridydotool): reference, requirements, verb caveats and troubleshooting
+
+The doc perimeter a plugin addition touches, in one pass: the reference entry,
+the plugin tree in how-it-works, the grid verb table's caveat for the verbs this
+backend cannot honour (scroll is not expressible in ydotool 0.1.8 at all), the
+troubleshooting section for a missing stack on a non-GNOME desktop, the
+compatibility and usage pages, the feature lines that implied the Shell extension
+was the only route, and the wheel test's member list.
+
+The requirements section carries the security note as well: ydotoold plus
+/dev/uinput access is input-injection grade, the same class as the input group
+hold-to-dictate needs.
+
+Co-authored-by: CommandCodeBot <noreply@commandcode.ai>
+EOF
+```
+
+---
+
+### Task 8: Delivery checks and the upstream report
+
+**Files:**
+- Modify: `docs/superpowers/specs/2026-10-14-prototype-compositor-agnostic-easyspeak-backend-layer-shell-overlay-ydotool-design.md` (only to tick anything the implementation settles)
+
+**Interfaces:** consumes everything; produces the delivery evidence.
+
+- [ ] **Step 1: Run the full gate set**
+
+Run: `just format && just lint && just types && just pytest && just check-translations && just check-python-packages && just test-js`
+Expected: PASS. Coverage stays at or above the repo's 99% floor; the plugin's modules are its own lines.
+
+- [ ] **Step 2: Prove the core is untouched**
+
+Run: `git diff origin/main -- src/core`
+Expected: empty output.
+
+- [ ] **Step 3: Smoke the daemon with the plugin present**
+
+Run: `uv run easyspeak --help` and then, in a foreground session, watch the startup log for:
+
+```text
+  ✓ Loaded: GridYdotool
+grid backend inert
+```
+
+On this workstation the second line is correct: GNOME 42 has no layer-shell and there is no `ydotoold` yet, so the plugin must be inert and `mousegrid` must keep the words. Then say "grid" and confirm the answer comes from the extension backend's failure path, unchanged.
+
+- [ ] **Step 4: Install the runtime pieces and re-check the gate**
+
+Run (each with `sudo` where needed):
+
+```bash
+sudo apt install sway ydotool just
+systemctl --user start ydotoold   # after the unit exists; see the docs task
+```
+
+Then re-run Step 3 and confirm the log now reads `grid backend active` **only** on a compositor with layer-shell — which on this box means after the COSMIC migration, not now. On GNOME 42 the overlay probe still fails, which is the gate's designed answer here.
+
+- [ ] **Step 5: Record what the probes settled**
+
+For each open item in the spec that the implementation answered (the click-through mechanism, the measured double-click gap, the acceleration tolerance, whether headless sway picks up a late uinput device), edit that item to state the measured result instead of the question.
+
+- [ ] **Step 6: Draft the upstream issue**
+
+Write the issue body to `docs/upstream-issue-draft.md` with: the ydotool 0.1.8 semantics table (argc exit codes, clamp-then-relative `mousemove`, the 0600 hardcoded socket, no wheel verb), the layer-shell-on-Smithay-but-not-GNOME boundary as the natural gate, the packaging friction a plugin addition carries (roster test, packages list, four catalogs, wheel test), and the security note's wording. Do not file anything at gtk4-layer-shell: its repository forbids AI-written production code and mostly-AI issue text.
+
+- [ ] **Step 7: Commit**
+
+```bash
+hug a docs tests pyproject.toml src
+hug c -F - <<'EOF'
+chore(gridydotool): gate results, settled probes and the upstream draft
+
+The full gate set passes, src/core is untouched by diff, the daemon smoke shows
+the plugin loaded and inert on this box (GNOME 42 has no layer-shell and no
+ydotoold yet, which is exactly what the gate is for), and each open item the
+implementation answered now records its measured result rather than the question.
+
+The upstream issue draft carries the four findings worth reporting: ydotool
+0.1.8's argc exit codes and clamp-then-relative mousemove, the socket's hardcoded
+path and permissions, the layer-shell support boundary, and the packaging work a
+plugin addition needs.
+
+Co-authored-by: CommandCodeBot <noreply@commandcode.ai>
+EOF
+```
+
+---
+
+## Self-review notes
+
+- **Spec coverage:** gate (Task 2), zone math and parity (Task 1), routing and the
+  `handle` contract (Tasks 2-3), injection outcomes and `--delay 0` (Tasks 2-3),
+  helper channel and its five cases (Task 4), overlay rendering and click-through
+  (Task 5), harness in two shapes and two arms with the literal and the premise
+  (Task 6), catalogs (Tasks 2, 3 and 4), doc perimeter (Task 7, plus the harness
+  README in Task 6), delivery and upstream report (Task 8).
+- **Placeholders:** none — every code step carries the code, every command step the
+  command and its expected result.
+- **Type consistency:** `_run_bounded(args, timeout=INJECT_TIMEOUT)` returns
+  `"ran" | "errored" | "unknown"` everywhere it is used; `grid_python()` returns a
+  path or None; `_start_helper()` returns `(x, y, w, h)` or None; `_bounds` is
+  always a 4-tuple in monitor-local coordinates; `stop_helper(reason)` is the only
+  path that reaps the helper.
+- **Known red window:** between Task 2 and Task 4 the catalogs grow as strings
+  appear, and each task regenerates them, so no commit leaves `check-translations`
+  failing.
