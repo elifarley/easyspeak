@@ -732,10 +732,12 @@ def _dismiss():
     _bounds = None
 
 
-def _open_session(core):
+def _open_session(core, bounds=None):
     """Open the overlay, take its geometry, and drive the mode until it ends.
 
-    Returns the mode's exit reason so the caller can decide what to say.
+    `bounds` is the cell to reopen at (the "again" path) and defaults to the
+    whole output. Returns the mode's exit reason so the caller can decide what
+    to say.
     """
     global _monitor, _monitor_origin, _bounds, _grid_open
     geometry = _start_helper()          # Task 4 fills this in
@@ -743,7 +745,10 @@ def _open_session(core):
         return None
     _monitor = geometry
     _monitor_origin = (geometry[0], geometry[1])
-    _bounds = (0, 0, geometry[2], geometry[3])
+    _bounds = tuple(bounds) if bounds else (0, 0, geometry[2], geometry[3])
+    _redraw(_bounds)                    # Task 3 fills this in: without a show the
+                                        # grid is never drawn and the session
+                                        # looks like a dead daemon
     _grid_open = True
     core.speak(_("Grid"))
     try:
@@ -769,8 +774,10 @@ def handle(cmd, core):
         return None
 
     if any(word in words for word in AGAIN_WORDS) and _last_bounds:
-        _bounds = _last_bounds
-        _open_session(core)
+        # Reopen on the remembered cell. It is passed in rather than assigned to
+        # the global first: _open_session overwrites the bounds with the whole
+        # output otherwise, which is what a fresh open wants and a reopen does not.
+        _open_session(core, bounds=_last_bounds)
         return True
 
     if any(word in words for word in GRID_TRIGGERS) and not (
@@ -1491,10 +1498,13 @@ def is_supported():
 class Overlay:
     """The layer surface, its nine cells, and the redraws they ask for."""
 
-    def __init__(self, Gtk, layer_shell):
+    def __init__(self, Gtk, layer_shell, app):
         self.Gtk = Gtk
         self.layer_shell = layer_shell
-        self.window = Gtk.Window()
+        # Associate the window with the application: an app-managed window is what
+        # the application's lifecycle (activate, quit, and the stdin watch that
+        # ends the process) is written for.
+        self.window = Gtk.Window(application=app)
         self.area = Gtk.DrawingArea()
         self.bounds = None
         self.origin = (0, 0)
@@ -1535,6 +1545,7 @@ class Overlay:
     def show(self, bounds):
         self.bounds = tuple(bounds)
         self.window.present()
+        self.area.queue_draw()  # the bounds changed: repaint, mapped or not
 
     def hide(self):
         self.window.set_visible(False)
@@ -1567,8 +1578,8 @@ def run(Gtk, layer_shell):
 
     GLib = gi.repository.GLib
 
-    overlay = Overlay(Gtk, layer_shell)
     app = Gtk.Application(application_id="dev.easyspeak.gridydotool.overlay")
+    overlay = Overlay(Gtk, layer_shell, app)
 
     def on_activate(_app):
         overlay.window.present()
@@ -1791,20 +1802,46 @@ def _binaries_present():
 
 
 @pytest.fixture
-def session(tmp_path):
-    """A headless sway session with the plugin's helper reachable inside it."""
+def session(tmp_path, monkeypatch):
+    """A headless sway session, exported to every client the harness spawns.
+
+    The environment is set through monkeypatch rather than handed only to sway,
+    because the plugin spawns its own helper and the probe window is spawned by
+    the test itself: sway names its socket inside XDG_RUNTIME_DIR, and only its
+    own children inherit WAYLAND_DISPLAY. The socket is discovered rather than
+    assumed, so a client that never learns it fails loudly here instead of
+    quietly talking to the wrong compositor.
+    """
     if not _binaries_present():
         pytest.skip("sway, ydotool and grim are needed for the harness")
     config = tmp_path / "sway.conf"
     config.write_text(SWAY_CONFIG, encoding="utf-8")
-    env = dict(os.environ, WLR_BACKENDS="headless", WLR_LIBINPUT_NO_DEVICES="1",
-               XDG_RUNTIME_DIR=str(tmp_path))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("WLR_BACKENDS", "headless")
+    monkeypatch.setenv("WLR_LIBINPUT_NO_DEVICES", "1")
     sway = subprocess.Popen(
-        ["sway", "-c", str(config)], env=env,
+        ["sway", "-c", str(config)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    time.sleep(2.0)  # sway needs a moment to bind its socket and map the output
-    yield env
+    deadline = time.monotonic() + 10
+    display = None
+    while time.monotonic() < deadline:
+        sockets = sorted(
+            path.name
+            for path in tmp_path.glob("wayland-*")
+            if not path.name.endswith(".lock")
+        )
+        if sockets:
+            display = sockets[0]
+            break
+        if sway.poll() is not None:
+            pytest.skip("sway exited before it bound a socket")
+        time.sleep(0.2)
+    if display is None:
+        sway.terminate()
+        pytest.skip("sway never created a Wayland socket")
+    monkeypatch.setenv("WAYLAND_DISPLAY", display)
+    yield os.environ
     sway.terminate()
     sway.wait(timeout=5)
 
