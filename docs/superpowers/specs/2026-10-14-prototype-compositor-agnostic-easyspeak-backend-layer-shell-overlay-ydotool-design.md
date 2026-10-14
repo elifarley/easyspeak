@@ -561,8 +561,9 @@ and its conftest's heavy-dependency stubs so no mic or model is needed. It:
    zone 5 gives `(1351, 280, 71, 40)` — so the click must land inside `x` in
    `[1351, 1422)` and `y` in `[280, 320)`, centre `(1386, 300)`, with a tolerance
    that is **bounded rather than left to the measurement**: inside that rect
-   expanded by at most a quarter of the cell's smaller dimension (17 px here), so
-   that widening the tolerance can never be the reason the assertion passes.
+   expanded by at most a quarter of the cell's smaller dimension — 10 px here,
+   the cell being 71 by 40 — so that widening the tolerance can never be the
+   reason the assertion passes.
    Deriving the rect with the same algorithm the plugin uses would make the
    assertion agree with any shared off-by-one; the algorithmic prediction stays
    only as a cross-check, with that reason written down next to it.
