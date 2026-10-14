@@ -797,7 +797,25 @@ def handle(cmd, core):
 
 - [ ] **Step 6: Update the two core assertions**
 
-In `tests/unit/core/test_main.py`, add `"gridydotool"` to the set in
+Both these tests call `load_plugins()`, which calls each plugin's `setup()` for
+real, so they get the probe patch as well. Without it a unit run spawns
+interpreters and the helper, and on a configured box injects a no-op move through
+the kernel; the gate's probes belong to the plugin's own matrix, which exercises
+them directly.
+
+In `tests/unit/core/test_main.py`, import the module and patch the overlay probe
+before loading (add `monkeypatch` to each test's signature):
+
+```python
+from easyspeak.plugins import gridydotool
+...
+        # setup() runs for real here: the patch keeps a loader test from spawning
+        # probes and injecting anything.
+        monkeypatch.setattr(gridydotool, "_probe_overlay", lambda: False)
+        easy.load_plugins()
+```
+
+Then add `"gridydotool"` to the set in
 `test_load_plugins_loads_all_shipped_plugins`, and change the ordering assertion in
 `test_load_plugins_routes_by_priority` to:
 
@@ -1798,12 +1816,36 @@ EXPECTED_TOLERANCE = 10  # a quarter of the cell's smaller dimension, 40
 
 
 def _binaries_present():
-    return all(shutil.which(name) for name in ("sway", "ydotool", "grim"))
+    """True when the harness can run at all: three binaries plus a usable typelib.
+
+    The typelib is the prerequisite that is easy to forget and expensive to
+    misread. gtk4-layer-shell is not packaged on every distro, so the reference
+    setup is an uninstalled build tree, and a helper that cannot load the typelib
+    fails its handshake as a GI error rather than as "the build path is missing".
+    """
+    if not all(shutil.which(name) for name in ("sway", "ydotool", "grim")):
+        return False
+    if os.environ.get("EASYSPEAK_GRID_TYPELIB"):
+        return True
+    probe = subprocess.run(
+        [
+            "python3", "-c",
+            "import gi; gi.require_version('Gtk4LayerShell', '1.0'); "
+            "from gi.repository import Gtk4LayerShell",
+        ],
+        capture_output=True, check=False, timeout=10,
+    )
+    return probe.returncode == 0
 
 
 @pytest.fixture
 def session(tmp_path, monkeypatch):
     """A headless sway session, exported to every client the harness spawns.
+
+    The layer-shell build tree is exported too when one is named: an uninstalled
+    build is the supported way to run this library where it is not packaged, and
+    the helper finds its typelib through `GI_TYPELIB_PATH`. Both paths are
+    prepended to whatever is already set rather than replacing it.
 
     The environment is set through monkeypatch rather than handed only to sway,
     because the plugin spawns its own helper and the probe window is spawned by
@@ -1813,12 +1855,22 @@ def session(tmp_path, monkeypatch):
     quietly talking to the wrong compositor.
     """
     if not _binaries_present():
-        pytest.skip("sway, ydotool and grim are needed for the harness")
+        pytest.skip(
+            "sway, ydotool, grim and a layer-shell typelib are needed "
+            "(set EASYSPEAK_GRID_TYPELIB to the build tree's src directory)"
+        )
     config = tmp_path / "sway.conf"
     config.write_text(SWAY_CONFIG, encoding="utf-8")
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     monkeypatch.setenv("WLR_BACKENDS", "headless")
     monkeypatch.setenv("WLR_LIBINPUT_NO_DEVICES", "1")
+    build = os.environ.get("EASYSPEAK_GRID_TYPELIB")
+    if build:
+        for name in ("GI_TYPELIB_PATH", "LD_LIBRARY_PATH"):
+            existing = os.environ.get(name, "")
+            monkeypatch.setenv(
+                name, f"{build}{os.pathsep}{existing}" if existing else build
+            )
     sway = subprocess.Popen(
         ["sway", "-c", str(config)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -2030,18 +2082,38 @@ not available there yet.
 
 In `docs/troubleshooting.md`, add a section after the existing grid one:
 
-```markdown
+````markdown
 ## Mouse grid: the grid never appears on a non-GNOME desktop
 
 The grid needs either the Shell extension (GNOME 47+) or the `gridydotool`
-backend, which needs three things: `ydotool` installed, a running `ydotoold`
-(a user service: `systemctl --user enable --now ydotoold`), and a compositor with
-layer-shell support (COSMIC, wlroots, KDE). `ydotoold` also needs write access to
-`/dev/uinput`.
+backend, which needs three things: `ydotool` installed, a running `ydotoold`, and a
+compositor with layer-shell support (COSMIC, wlroots, KDE). `ydotoold` also needs
+write access to `/dev/uinput`.
+
+Not every distro ships a user unit for the daemon. If `systemctl --user enable
+--now ydotoold` answers "Unit ydotoold.service not found", install this as
+`~/.config/systemd/user/ydotoold.service`:
+
+```ini
+[Unit]
+Description=ydotoold - persistent uinput device for ydotool
+
+[Service]
+ExecStart=/usr/bin/ydotoold --socket-path=/tmp/.ydotool_socket --socket-perm=0600
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+Then `systemctl --user daemon-reload` once, and `systemctl --user enable --now
+ydotoold`. The socket path and its 0600 mode are what the daemon hardcodes in this
+version, which is also why the daemon has to run as your user rather than as root:
+a root daemon's socket is unreachable by your client.
 
 If any of them is missing the daemon logs `grid backend inert` at startup with the
 reason, says nothing out loud, and `mousegrid` keeps the words.
-```
+````
 
 - [ ] **Step 5: Document the requirements and the risk**
 
@@ -2131,7 +2203,7 @@ Run (each with `sudo` where needed):
 
 ```bash
 sudo apt install sway ydotool just
-systemctl --user start ydotoold   # after the unit exists; see the docs task
+systemctl --user start ydotoold   # the unit Task 7 ships when the distro has none
 ```
 
 Then re-run Step 3 and confirm the log now reads `grid backend active` **only** on a compositor with layer-shell — which on this box means after the COSMIC migration, not now. On GNOME 42 the overlay probe still fails, which is the gate's designed answer here.
