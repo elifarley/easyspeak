@@ -1,0 +1,40 @@
+# French translations for EasySpeak.
+# Copyright (C) 2026 EasySpeak contributors
+# This file is distributed under the same license as the EasySpeak project.
+msgid ""
+msgstr ""
+"Project-Id-Version: EasySpeak\n"
+"Report-Msgid-Bugs-To: https://github.com/ctsdownloads/easyspeak/issues\n"
+"POT-Creation-Date: 2026-10-14 17:50-0300\n"
+"PO-Revision-Date: 2026-10-14 17:50-0300\n"
+"Last-Translator: EasySpeak contributors\n"
+"Language: fr\n"
+"Language-Team: French\n"
+"Plural-Forms: nplurals=2; plural=(n > 1);\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "1-9 or chains like '3 7 5' - zoom to zone(s)"
+msgstr "1-9 ou des suites comme '3 7 5' - zoomer sur la zone"
+
+msgid "Grid"
+msgstr "Grille"
+
+msgid "Grid closed"
+msgstr "Grille fermée"
+
+msgid "again - reopen at the last spot"
+msgstr "again - rouvrir au dernier endroit"
+
+msgid "click - left click"
+msgstr "click - clic gauche"
+
+msgid "close/cancel - hide the grid"
+msgstr "close/cancel - masquer la grille"
+
+msgid "grid/mouse/pointer/cursor - show mouse grid"
+msgstr "grid/mouse/pointer/cursor - afficher la grille de la souris"
+
+msgid "right click / double click / middle click"
+msgstr "right click / double click / middle click - clic droit, double, du milieu"

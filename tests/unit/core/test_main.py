@@ -9,6 +9,7 @@ import pytest
 from easyspeak.core.config import MISUNDERSTAND_GRACE
 from easyspeak.core.main import EasySpeak
 from easyspeak.core.tray import STATE_MUTED, TrayAction
+from easyspeak.plugins import gridydotool
 
 
 class TestEasySpeakInit:
@@ -275,10 +276,13 @@ class TestEasySpeakPlugins:
         assert easy.plugins == []
         assert "Failed to load TestPlugin: no display" in readlog().out
 
-    def test_load_plugins_loads_all_shipped_plugins(self):
+    def test_load_plugins_loads_all_shipped_plugins(self, monkeypatch):
         """All shipped plugins are discovered against the real filesystem layout."""
         easy = EasySpeak()
 
+        # setup() runs for real here: the patch keeps a loader test from spawning
+        # probes and injecting anything.
+        monkeypatch.setattr(gridydotool, "_probe_overlay", lambda: False)
         easy.load_plugins()
         loaded = {module.__name__.rsplit(".", 1)[-1] for module in easy.plugins}
 
@@ -288,6 +292,7 @@ class TestEasySpeakPlugins:
             "browser",
             "dictation",
             "files",
+            "gridydotool",
             "headtrack",
             "media",
             "mousegrid",
@@ -295,16 +300,21 @@ class TestEasySpeakPlugins:
             "system",
         }
 
-    def test_load_plugins_routes_by_priority(self):
+    def test_load_plugins_routes_by_priority(self, monkeypatch):
         """Commands reach the modes first and the help/exit catch-all last."""
         easy = EasySpeak()
 
+        # setup() runs for real here: the patch keeps a loader test from spawning
+        # probes and injecting anything.
+        monkeypatch.setattr(gridydotool, "_probe_overlay", lambda: False)
         easy.load_plugins()
         names = [module.NAME for module in easy.plugins]
 
-        assert names[:2] == ["headtrack", "mousegrid"]
+        # The grid backend loads ahead of mousegrid: it shadows the same words,
+        # and the loader's order is what decides who is offered them first.
+        assert names[:3] == ["gridydotool", "headtrack", "mousegrid"]
         assert names[-1] == "base"
-        assert names[2:-1] == sorted(names[2:-1])
+        assert names[3:-1] == sorted(names[3:-1])
 
     @patch("importlib.import_module")
     @patch("sys.path")
