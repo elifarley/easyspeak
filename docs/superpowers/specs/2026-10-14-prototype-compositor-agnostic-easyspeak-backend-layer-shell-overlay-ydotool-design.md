@@ -256,6 +256,7 @@ forced = EASYSPEAK_GRID_BACKEND
 overlay_ready  = grid_python() is not None
                  AND helper --probe exits 0 within PROBE_TIMEOUT
 injector_ready = shutil.which("ydotool")
+                 AND the ydotoold socket accepts a connection
                  AND a no-op mousemove_relative 0 0 reports outcome `ran`
                      (success code 3, no error signature) within PROBE_TIMEOUT
 ```
@@ -285,6 +286,18 @@ anything, which would activate a dead injector and then silently swallow every
 click (see the outcome table below). `ran` is what the gate requires, and its
 success code is unambiguous because the probe's argv is chosen for that property.
 A `--probe` that exits 0 inside the timeout is the only other way in.
+
+**The daemon is required for the click path, and that is what makes `ran` mean
+anything.** Without `ydotoold`, the client creates a uinput device per invocation
+and upstream documents the consequence: a freshly created device needs time for the
+graphical environment to recognise and enable it, and the events emitted before
+that are lost. A click through such a device exits cleanly and lands nowhere, so
+the seam would report `ran` for a click that never happened — a silent no-op
+wearing a success signal, in the one configuration that makes it silent. So the
+socket is part of `injector_ready`: a host without the daemon stays inert (and says
+why in the log at INFO), rather than half-working in a way the user cannot see. The
+socket check is a bare `connect()` on `/tmp/.ydotool_socket` — no injection, no
+side effect.
 
 ### Routing
 
@@ -355,7 +368,7 @@ of exactly three outcomes.
 
 | Outcome | Detected by | What it means |
 |---|---|---|
-| `ran` | returncode equals the invocation's own success code, and stderr carries no error signature | the tool did what was asked |
+| `ran` | returncode equals the invocation's own success code, and stderr carries no error signature | the tool emitted the events through the daemon's already-recognised device and exited cleanly. **Emission, not proof of application**: what the compositor did with them is observed in exactly one place, the harness's arm B |
 | `errored` | an error signature on stderr, or a usage/parse returncode | the tool refused; nothing was clicked |
 | `unknown` | `TimeoutExpired`, a negative returncode (killed by a signal), or `OSError` from the spawn | **the click may or may not have landed** |
 
@@ -364,14 +377,22 @@ than a boolean: a timeout is not a failure, and it is certainly not a success. I
 is logged at WARNING with the captured stderr and spoken as its own string (D8),
 and **no path retries it** — a repeated click is a second click, so the user's own
 utterance is the only retry this design allows. A `notice: … backend unavailable`
-line is not an error either: it is `ran` plus a latency warning, logged as such.
+line on stderr is the one signal that must not be filed as `ran`: it means the
+client fell back to a device created for this invocation, which is exactly the case
+the `ran` row excludes — so it classifies as `unknown`, with the stderr captured
+and the unknown-outcome string spoken. The gate required the socket, so seeing this
+line at all means the daemon died between setup and the click, and the log says so.
 
-`INJECT_TIMEOUT = 2.0` bounds each injection (the tool's own pre-action delay is
-100 ms, so this is generous by an order of magnitude), which is what keeps a wedged
-`ydotoold` from freezing the modal loop with the overlay up — the loop exists so
-the tray stays live and an unattended mode ends itself, and a blocking call
-defeats both. Moves and clicks are sequential calls, which is what makes the
-ordering (move, then click) deterministic.
+`INJECT_TIMEOUT = 2.0` bounds each injection, and every invocation passes
+**`--delay 0`**: the delay exists upstream to give a fresh device time to be
+recognised, and the daemon the gate requires already holds a recognised one, so
+here it would buy nothing but latency. That is also what keeps a double-click pair
+tight — two invocations with the default 100 ms sleep each would spend most of the
+desktop's double-click window in sleeps (see open item 4). The timeout is what
+keeps a wedged `ydotoold` from freezing the modal loop with the overlay up: the
+loop exists so the tray stays live and an unattended mode ends itself, and a
+blocking call defeats both. Moves and clicks are sequential calls, which is what
+makes the ordering (move, then click) deterministic.
 
 ### Session lifecycle and failure handling
 
@@ -436,9 +457,11 @@ ordering (move, then click) deterministic.
   double-click issues two calls in order; the outcome matrix — `ran` for the
   invocation's own success code with clean stderr, `errored` for an error signature
   or a usage returncode, `unknown` for a timeout, a negative returncode or a spawn
-  failure; `notice:` lines are `ran` with a latency warning, never failures; an
+  failure; a `notice:` line means the client fell back to a per-invocation device
+  and classifies as `unknown`, never as `ran`; an
   `unknown` outcome is logged and spoken but never counted as a success; dry-run
-  records without executing; nothing retries a click.
+  records without executing; nothing retries a click; the socket check is part of
+  the gate matrix (a host with the binary but no daemon stays inert).
 - **Bounded waits**: every probe and every injection is exercised against a stub
   that never returns, asserting that the timeout fires, that the gate then reports
   not-ready (so `mousegrid` keeps the words), and that the mode still ends with the
@@ -508,8 +531,11 @@ worth doing rather than a nice-to-have.
 
 - **`ydotoold` runs as the user** (systemd `--user`), because 0.1.8 hardcodes
   `/tmp/.ydotool_socket` at `0600`; a system-level daemon would be unreachable by
-  the client. Injection also works with no daemon at all, which is why it is not a
-  gate.
+  the client. It is also part of the gate, not an optional extra: upstream
+  documents that a device created per invocation may not be recognised in time, so
+  without the daemon a click can be emitted and lost (see the `ran` row). A host
+  without it keeps `mousegrid` and reads the reason in the log, which is a better
+  outcome than a grid whose clicks quietly do nothing.
 - **One daemon owner stays the rule.** The install doc records this as a
   hit-live trap, and this plugin sharpens the consequence: two daemons mean two
   helpers, two stacked overlays and two injections per utterance — one command,
@@ -552,8 +578,11 @@ worth doing rather than a nice-to-have.
 3. **Click-through**: whether `window.set_can_target(False)` yields an empty input
    region on a layer surface in GTK4, or whether a `GdkSurface` input region is
    needed. The harness settles it behaviourally (the probe must receive the click).
-4. **Is a double-click (two invocations, ~200 ms apart) inside the desktop's
-   window?** Measure on the real session; adjust with `--delay` if not.
+4. **How tight is the double-click pair in practice?** With `--delay 0` the gap is
+   process spawn plus connect, so measure the observed inter-click delta rather
+   than assuming it — the default 100 ms sleeps are gone, and a delta beyond the
+   desktop's double-click window turns the pair into two single clicks. Log the
+   measured gap when it exceeds the window, and record the number.
 5. **How large is the acceleration bias?** Measured in the harness with a flat
    profile; the assertion tolerance is set from the measurement, and the numbers
    are recorded in the docs.
