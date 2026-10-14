@@ -263,9 +263,13 @@ class TestModeDispatch:
 
     def test_click_moves_then_clicks_then_ends(self, monkeypatch, core):
         seen = []
-        monkeypatch.setattr(g, "move_to", lambda x, y: seen.append(("move", x, y)))
+        # The fakes answer in the seam's own vocabulary — a move and a click
+        # that both `ran` — which is the scenario this test exercises.
         monkeypatch.setattr(
-            g, "click", lambda button="click": seen.append(("click", button))
+            g, "move_to", lambda x, y: seen.append(("move", x, y)) or "ran"
+        )
+        monkeypatch.setattr(
+            g, "click", lambda button="click": seen.append(("click", button)) or "ran"
         )
         monkeypatch.setattr(g, "_dismiss", lambda: seen.append(("dismiss",)))
         g._bounds = (0, 0, 900, 600)
@@ -311,3 +315,95 @@ class TestModeDispatch:
         core.listen_modal = Mock(return_value=iter(["click"]))
         g._run_mode(core)
         assert core.speak.call_args_list[-1].args[0] == "I couldn't move the pointer."
+
+    def test_unknown_move_never_clicks(self, monkeypatch, core):
+        """An unproven move must not click: a click is not idempotent and lands
+        at whatever position the pointer happened to be left at."""
+        monkeypatch.setattr(g, "move_to", Mock(return_value="unknown"))
+        monkeypatch.setattr(g, "click", Mock(return_value="ran"))
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        g._bounds = (0, 0, 900, 600)
+        core.listen_modal = Mock(return_value=iter(["click"]))
+        g._run_mode(core)
+        g.click.assert_not_called()
+        assert (
+            core.speak.call_args_list[-1].args[0]
+            == "I tried, but I'm not sure it worked."
+        )
+
+    def test_click_outcome_replaces_a_successful_move_outcome(self, monkeypatch, core):
+        """The move ran, so the click's own outcome is what the user hears."""
+        monkeypatch.setattr(g, "move_to", Mock(return_value="ran"))
+        monkeypatch.setattr(g, "click", Mock(return_value="unknown"))
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        g._bounds = (0, 0, 900, 600)
+        core.listen_modal = Mock(return_value=iter(["click"]))
+        g._run_mode(core)
+        g.click.assert_called_once_with("click")
+        assert (
+            core.speak.call_args_list[-1].args[0]
+            == "I tried, but I'm not sure it worked."
+        )
+
+    def test_right_click_fires_the_right_button(self, monkeypatch, core):
+        seen = []
+        monkeypatch.setattr(
+            g, "move_to", lambda x, y: seen.append(("move", x, y)) or "ran"
+        )
+        monkeypatch.setattr(
+            g, "click", lambda button="click": seen.append(("click", button)) or "ran"
+        )
+        monkeypatch.setattr(g, "_dismiss", lambda: seen.append(("dismiss",)))
+        g._bounds = (0, 0, 900, 600)
+        core.listen_modal = Mock(return_value=iter(["right click"]))
+        g._run_mode(core)
+        assert seen == [("move", 450, 300), ("click", "right"), ("dismiss",)]
+
+    def test_double_click_utterance_calls_double_click(self, monkeypatch, core):
+        seen = []
+        monkeypatch.setattr(
+            g, "move_to", lambda x, y: seen.append(("move", x, y)) or "ran"
+        )
+        monkeypatch.setattr(
+            g, "double_click", lambda: seen.append(("double_click",)) or "ran"
+        )
+        monkeypatch.setattr(g, "_dismiss", lambda: seen.append(("dismiss",)))
+        g._bounds = (0, 0, 900, 600)
+        core.listen_modal = Mock(return_value=iter(["double click"]))
+        g._run_mode(core)
+        assert seen == [("move", 450, 300), ("double_click",), ("dismiss",)]
+
+    def test_click_without_bounds_does_nothing(self, monkeypatch, core):
+        monkeypatch.setattr(g, "move_to", Mock())
+        monkeypatch.setattr(g, "click", Mock())
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        g._bounds = None
+        g._fire_click("click", core)
+        g.move_to.assert_not_called()
+        g.click.assert_not_called()
+        g._dismiss.assert_not_called()
+
+
+class TestClickKind:
+    def test_each_utterance_maps_to_its_flavour(self):
+        flavours = {
+            "click": "click",
+            "lick": "click",
+            "clique": "click",
+            "double click": "double",
+            "middle click": "middle",
+            "right click": "right",
+            "open firefox": None,
+        }
+        for text, want in flavours.items():
+            assert g._click_kind(text, set(text.split())) == want, text
+
+
+class TestRedraw:
+    def test_sends_the_show_command(self, monkeypatch):
+        sent = []
+        # `_send` is Task 4's seam and is not defined at this commit; the stub
+        # is injected anyway because the show payload is this test's subject.
+        monkeypatch.setattr(g, "_send", sent.append, raising=False)
+        g._redraw((0, 0, 900, 600))
+        assert sent == [{"cmd": "show", "bounds": [0, 0, 900, 600]}]

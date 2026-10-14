@@ -519,15 +519,12 @@ def _fire_click(kind, core):
     x, y = center(_bounds)
     _last_bounds = _bounds
     outcome = move_to(x, y)
-    if outcome != "errored":
-        # Only a refused move stops the click: the tool rejected that very
-        # invocation, so the pointer's position is unproven. An `unknown`
-        # move is not a refusal — the click is still attempted — and the
-        # move's own outcome stands for what is spoken, because an injection
-        # that timed out is never answered with silence.
-        clicked = double_click() if kind == "double" else click(kind)
-        if outcome == "ran":
-            outcome = clicked
+    if outcome == "ran":
+        # `ran` is the only positive signal the seam can produce: the move was
+        # emitted through an already-recognised device. A move left `unknown`
+        # leaves the pointer's position no more proven than a refusal, and a
+        # click lands wherever the pointer happens to be — so it is not fired.
+        outcome = double_click() if kind == "double" else click(kind)
     _dismiss()
     if outcome == "errored":
         core.speak(_("I couldn't move the pointer."))
