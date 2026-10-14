@@ -357,13 +357,25 @@ change to the subdivision (a different divisor, a non-zero origin) must be check
 against:
 
 ```python
-ZONE_MAP = {1:(0,0), 2:(1,0), 3:(2,0), 4:(0,1), 5:(1,1), 6:(2,1), 7:(0,2), 8:(1,2), 9:(2,2)}
+ZONE_MAP = {
+    1: (0, 0),
+    2: (1, 0),
+    3: (2, 0),
+    4: (0, 1),
+    5: (1, 1),
+    6: (2, 1),
+    7: (0, 2),
+    8: (1, 2),
+    9: (2, 2),
+}
+
 
 def subdivide(bounds, zone):
     x, y, w, h = bounds
     zone_w, zone_h = w // 3, h // 3
     col, row = ZONE_MAP[zone]
     return (x + col * zone_w, y + row * zone_h, zone_w, zone_h)
+
 
 def center(bounds):
     x, y, w, h = bounds

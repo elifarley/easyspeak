@@ -195,27 +195,64 @@ COMMANDS = [
 # backend tunes a whole set, and a backend that hears fewer words than the one
 # it shadows is a regression in the user's eyes, not a simplification.
 GRID_TRIGGERS = {
-    "grid", "grit", "grip", "great", "greed", "grade", "grad", "grill",
-    "guild", "greet", "grin", "green", "grey", "gray", "grab", "grand",
-    "greek", "grew", "mouse", "pointer", "cursor", "crosshair",
+    "grid",
+    "grit",
+    "grip",
+    "great",
+    "greed",
+    "grade",
+    "grad",
+    "grill",
+    "guild",
+    "greet",
+    "grin",
+    "green",
+    "grey",
+    "gray",
+    "grab",
+    "grand",
+    "greek",
+    "grew",
+    "mouse",
+    "pointer",
+    "cursor",
+    "crosshair",
 }
 
 WORD_TO_NUM = {
-    "one": 1, "won": 1, "wan": 1,
-    "two": 2, "to": 2, "too": 2, "tu": 2,
-    "three": 3, "tree": 3, "free": 3,
-    "four": 4, "for": 4, "fore": 4,
+    "one": 1,
+    "won": 1,
+    "wan": 1,
+    "two": 2,
+    "to": 2,
+    "too": 2,
+    "tu": 2,
+    "three": 3,
+    "tree": 3,
+    "free": 3,
+    "four": 4,
+    "for": 4,
+    "fore": 4,
     "five": 5,
-    "six": 6, "sex": 6,
+    "six": 6,
+    "sex": 6,
     "seven": 7,
-    "eight": 8, "ate": 8,
-    "nine": 9, "nein": 9,
+    "eight": 8,
+    "ate": 8,
+    "nine": 9,
+    "nein": 9,
 }
 
 ZONE_MAP = {
-    1: (0, 0), 2: (1, 0), 3: (2, 0),
-    4: (0, 1), 5: (1, 1), 6: (2, 1),
-    7: (0, 2), 8: (1, 2), 9: (2, 2),
+    1: (0, 0),
+    2: (1, 0),
+    3: (2, 0),
+    4: (0, 1),
+    5: (1, 1),
+    6: (2, 1),
+    7: (0, 2),
+    8: (1, 2),
+    9: (2, 2),
 }
 
 
@@ -386,14 +423,18 @@ class TestOutcomeClassification:
 class TestAdapterArgv:
     def test_move_applies_the_monitor_origin(self, monkeypatch):
         seen = []
-        monkeypatch.setattr(g, "_run_bounded", lambda args, **k: seen.append(args) or "ran")
+        monkeypatch.setattr(
+            g, "_run_bounded", lambda args, **k: seen.append(args) or "ran"
+        )
         g._monitor_origin = (1920, 0)
         g.move_to(1351, 280)
         assert seen == [["ydotool", "mousemove", "3271", "280", "--delay", "0"]]
 
     def test_click_buttons(self, monkeypatch):
         seen = []
-        monkeypatch.setattr(g, "_run_bounded", lambda args, **k: seen.append(args) or "ran")
+        monkeypatch.setattr(
+            g, "_run_bounded", lambda args, **k: seen.append(args) or "ran"
+        )
         g.click("click")
         g.click("right")
         g.click("middle")
@@ -405,7 +446,9 @@ class TestAdapterArgv:
 
     def test_double_click_is_two_calls_in_order(self, monkeypatch):
         seen = []
-        monkeypatch.setattr(g, "_run_bounded", lambda args, **k: seen.append(args) or "ran")
+        monkeypatch.setattr(
+            g, "_run_bounded", lambda args, **k: seen.append(args) or "ran"
+        )
         g.double_click()
         assert [a[2] for a in seen] == ["1", "1"]
 
@@ -575,9 +618,12 @@ def move_to(x, y):
     works in."""
     return run_ydotool(
         [
-            "ydotool", "mousemove",
-            str(_monitor_origin[0] + x), str(_monitor_origin[1] + y),
-            "--delay", "0",
+            "ydotool",
+            "mousemove",
+            str(_monitor_origin[0] + x),
+            str(_monitor_origin[1] + y),
+            "--delay",
+            "0",
         ]
     )
 
@@ -626,7 +672,9 @@ def grid_python():
         try:
             probe = subprocess.run(
                 [candidate, "-c", HELPER_PROBE],
-                capture_output=True, check=False, timeout=PROBE_TIMEOUT,
+                capture_output=True,
+                check=False,
+                timeout=PROBE_TIMEOUT,
             )
         except (OSError, subprocess.TimeoutExpired):
             continue
@@ -645,7 +693,9 @@ def _probe_overlay():
     try:
         probe = subprocess.run(
             [python, HELPER, "--probe"],
-            capture_output=True, check=False, timeout=PROBE_TIMEOUT,
+            capture_output=True,
+            check=False,
+            timeout=PROBE_TIMEOUT,
         )
     except (OSError, subprocess.TimeoutExpired):
         logger.info("grid: the helper probe did not answer in time")
@@ -683,11 +733,11 @@ def _probe_injector():
         logger.info("grid: ydotool is not installed")
         return False
     if not _socket_accepts():
-        logger.info("grid: no ydotoold on %s (clicks would be lost silently)", YDTOOL_SOCKET)
+        logger.info(
+            "grid: no ydotoold on %s (clicks would be lost silently)", YDTOOL_SOCKET
+        )
         return False
-    outcome = _run_bounded(
-        ["ydotool", "mousemove_relative", "0", "0", "--delay", "0"]
-    )
+    outcome = _run_bounded(["ydotool", "mousemove_relative", "0", "0", "--delay", "0"])
     if outcome != "ran":
         logger.info("grid: the injector probe reported %s", outcome)
         return False
@@ -740,15 +790,15 @@ def _open_session(core, bounds=None):
     to say.
     """
     global _monitor, _monitor_origin, _bounds, _grid_open
-    geometry = _start_helper()          # Task 4 fills this in
+    geometry = _start_helper()  # Task 4 fills this in
     if geometry is None:
         return None
     _monitor = geometry
     _monitor_origin = (geometry[0], geometry[1])
     _bounds = tuple(bounds) if bounds else (0, 0, geometry[2], geometry[3])
-    _redraw(_bounds)                    # Task 3 fills this in: without a show the
-                                        # grid is never drawn and the session
-                                        # looks like a dead daemon
+    _redraw(_bounds)  # Task 3 fills this in: without a show the
+    # grid is never drawn and the session
+    # looks like a dead daemon
     _grid_open = True
     core.speak(_("Grid"))
     try:
@@ -903,7 +953,9 @@ class TestModeDispatch:
     def test_click_moves_then_clicks_then_ends(self, monkeypatch, core):
         seen = []
         monkeypatch.setattr(g, "move_to", lambda x, y: seen.append(("move", x, y)))
-        monkeypatch.setattr(g, "click", lambda button="click": seen.append(("click", button)))
+        monkeypatch.setattr(
+            g, "click", lambda button="click": seen.append(("click", button))
+        )
         monkeypatch.setattr(g, "_dismiss", lambda: seen.append(("dismiss",)))
         g._bounds = (0, 0, 900, 600)
         core.listen_modal = Mock(return_value=iter(["click"]))
@@ -932,7 +984,10 @@ class TestModeDispatch:
         g._bounds = (0, 0, 900, 600)
         core.listen_modal = Mock(return_value=iter(["click"]))
         g._run_mode(core)
-        assert core.speak.call_args_list[-1].args[0] == "I tried, but I'm not sure it worked."
+        assert (
+            core.speak.call_args_list[-1].args[0]
+            == "I tried, but I'm not sure it worked."
+        )
 
     def test_errored_outcome_speaks_the_definite_line(self, monkeypatch, core):
         monkeypatch.setattr(g, "move_to", lambda x, y: "errored")
@@ -1211,8 +1266,11 @@ def _start_helper():
             return None
         event = message.get("event")
         if event == "ready":
-            logger.info("grid: ready on %s (scale %s)", message.get("monitor"),
-                        message.get("scale"))
+            logger.info(
+                "grid: ready on %s (scale %s)",
+                message.get("monitor"),
+                message.get("scale"),
+            )
             break
         if event == "error":
             logger.warning("grid: helper refused: %s", message.get("message"))
@@ -1635,9 +1693,7 @@ def run(Gtk, layer_shell):
             return False
         return True
 
-    GLib.io_add_watch(
-        sys.stdin.fileno(), GLib.IO_IN | GLib.IO_HUP, on_stdin_ready
-    )
+    GLib.io_add_watch(sys.stdin.fileno(), GLib.IO_IN | GLib.IO_HUP, on_stdin_ready)
     app.run([])
     return 0
 
@@ -1651,7 +1707,12 @@ def main(argv=None):
         return 0 if supported else 1
     Gtk, layer_shell = load_layer_shell()
     if Gtk is None:
-        emit({"event": "error", "message": "PyGObject or the layer-shell typelib is missing"})
+        emit(
+            {
+                "event": "error",
+                "message": "PyGObject or the layer-shell typelib is missing",
+            }
+        )
         return 1
     if not layer_shell.is_supported():
         # Refuse rather than degrade: an ordinary window would look like a
@@ -1829,11 +1890,14 @@ def _binaries_present():
         return True
     probe = subprocess.run(
         [
-            "python3", "-c",
+            "python3",
+            "-c",
             "import gi; gi.require_version('Gtk4LayerShell', '1.0'); "
             "from gi.repository import Gtk4LayerShell",
         ],
-        capture_output=True, check=False, timeout=10,
+        capture_output=True,
+        check=False,
+        timeout=10,
     )
     return probe.returncode == 0
 
@@ -1873,7 +1937,8 @@ def session(tmp_path, monkeypatch):
             )
     sway = subprocess.Popen(
         ["sway", "-c", str(config)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     deadline = time.monotonic() + 10
     display = None
@@ -1915,8 +1980,9 @@ class TestGateWithoutADaemon:
 
 
 class TestForcedBackendArm:
-    def test_reads_the_geometry_and_records_the_argv(self, session, tmp_path,
-                                                     monkeypatch, caplog):
+    def test_reads_the_geometry_and_records_the_argv(
+        self, session, tmp_path, monkeypatch, caplog
+    ):
         """Arm A: the backend is forced, so no daemon is needed, and the overlay
         is observed through the plugin's own log records (its stdout belongs to
         the plugin, so the harness cannot read that stream itself)."""
@@ -1954,13 +2020,14 @@ class TestForcedBackendArm:
     reason="live injection is opt-in: set EASYSPEAK_GRID_LIVE=click",
 )
 class TestLiveArm:
-    def test_the_click_lands_in_the_expected_cell(self, session, tmp_path,
-                                                  monkeypatch):
+    def test_the_click_lands_in_the_expected_cell(self, session, tmp_path, monkeypatch):
         monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "uinput")
         repo_root = Path(gridydotool.__file__).parents[3]
         probe = subprocess.Popen(
             [str(repo_root / "tests" / "integration" / "grid_probe_window.py")],
-            env=session, stdout=subprocess.PIPE, text=True,
+            env=session,
+            stdout=subprocess.PIPE,
+            text=True,
         )
         time.sleep(1.5)
         before = tmp_path / "before.png"
