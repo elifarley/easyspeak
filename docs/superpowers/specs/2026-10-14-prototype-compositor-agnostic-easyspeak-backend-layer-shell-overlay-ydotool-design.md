@@ -45,7 +45,7 @@ constraints), and one was confirmed independently:
 | Behaviour | Verified detail | Consequence for the plugin |
 |---|---|---|
 | Exit code | `MouseMove::Exec` and `Click::Exec` both `return argc` | `ydotool click 1` **exits 2 on success**; the code carries no failure meaning on its own |
-| Success code per invocation | `argc` of the argv the tool itself sees: `mousemove_relative 0 0` returns **3**, `click 1` returns **2** — which collides with the parse-error return of the move tools | the gate's probe uses the unambiguous form (`mousemove_relative 0 0`, success 3) and never `click`, whose success code is indistinguishable from an error |
+| Success code per invocation | `argc` of the argv the tool itself sees, so it depends on the invocation: `mousemove_relative 0 0` returns **3**, and the same probe with `--delay 0` appended returns **5**; `click 1` returns **2**, which collides with the parse-error return of the move tools | the seam derives the expected code from the argv it built (`len(args) - 1`) rather than pinning a number, and the gate's probe stays on `mousemove_relative`, never `click`, whose success code is indistinguishable from an error |
 | Absolute move | `mousemove <x> <y>` — first emits `RelativeMove({-INT32_MAX, -INT32_MAX})` (clamps at the desktop origin), then the relative delta | "absolute" is an approximation; pointer acceleration can bias it |
 | Move syntax | positional `x y` (1.0.x's `--absolute -x -y` does not exist here) | argv is `["mousemove", str(x), str(y)]` |
 | Click buttons | `1` left, `2` right, `3` middle; press+release in one call, no `--repeat` | double-click = two sequential invocations |
@@ -287,7 +287,7 @@ overlay_ready  = grid_python() is not None
 injector_ready = shutil.which("ydotool")
                  AND the ydotoold socket accepts a connection
                  AND a no-op mousemove_relative 0 0 reports outcome `ran`
-                     (success code 3, no error signature) within PROBE_TIMEOUT
+                     (the invocation's own argc, no error signature) within PROBE_TIMEOUT
 ```
 
 `grid_python()` mirrors dictation's probe: `EASYSPEAK_GRID_PYTHON` override, then
