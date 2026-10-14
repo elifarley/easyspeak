@@ -131,17 +131,20 @@ constraints), and one was confirmed independently:
   not a surprise.
 - **D8 — Ship complete reply catalogs (agent decision).** The completeness test
   forbids empty/fuzzy entries and `check-translations` would create stub catalogs
-  for any package with translatable strings, so the plugin ships **four** strings
+  for any package with translatable strings, so the plugin ships **five** strings
   per language in de/es/fr/it, drafted by the agent and flagged for human review:
   the open acknowledgement (`Grid`), the dismissal (`Grid closed.`), the definite
-  injection failure (`I couldn't move the pointer.`) and the unknown outcome
-  (`I tried, but I'm not sure it worked.`). The fourth string exists because a
-  timeout leaves the outcome genuinely unknown, so "it didn't work" would be a
-  claim the plugin cannot make — and the user acts differently on the two: one
-  invites a retry, the other warns that the retry may be a second click.
+  injection failure (`I couldn't move the pointer.`), the unknown outcome
+  (`I tried, but I'm not sure it worked.`) and the grid that could not be shown
+  (`I couldn't show the grid.`). The fourth string exists because a timeout leaves
+  the outcome genuinely unknown, so "it didn't work" would be a claim the plugin
+  cannot make — and the user acts differently on the two: one invites a retry, the
+  other warns that the retry may be a second click. The fifth exists because the
+  bounded handshake can fail before any overlay is mapped, and silence there would
+  look like a dead daemon rather than a failed overlay.
   Rejected: silence (no `_()` calls) — a voice-driven UI with no spoken
-  acknowledgement of a click, and no audible signal when injection fails, would be
-  a worse prototype than `mousegrid`.
+  acknowledgement of a click, and no audible signal when injection fails or the
+  overlay cannot be drawn, would be a worse prototype than `mousegrid`.
 - **D9 — A dry-run seam, because uinput is kernel-global (agent decision).**
   Injected events reach *every* compositor on the machine, including the user's
   live session, even when the harness runs its own headless `sway`. Real injection
@@ -172,13 +175,31 @@ protocol only; diagnostics go to stderr, which the plugin logs.
 |---|---|---|
 | → helper | `{"cmd":"show","bounds":[x,y,w,h]}` | draw the 3×3 grid over this monitor-local rect |
 | → helper | `{"cmd":"hide"}` / `{"cmd":"quit"}` | tear the surface down / exit |
-| ← helper | `{"event":"ready","monitor":[x,y,w,h]}` | surface configured; monitor geometry — **the geometry authority** |
+| ← helper | `{"event":"ready","monitor":[x,y,w,h],"scale":1.0}` | surface configured; monitor geometry — **the geometry authority** |
 | ← helper | `{"event":"presented"}` | first frame drawn (the harness asserts on this) |
 | ← helper | `{"event":"error","message":"…"}` | a failure the plugin should surface |
 
 The helper exits on stdin EOF, so a daemon death can never leave an orphan
 overlay; `--probe` is a one-shot mode that prints `supported` / `unsupported`
 (off `is_supported()`), exits 0/1, and never maps a surface.
+
+Geometry is in the compositor's **logical** coordinate space — the same space
+layer-shell anchors in and that `ydotool`'s relative motion lands in — and the
+scale factor rides along on the `ready` event so a fractional-scale session is
+diagnosable from the log rather than from a mis-aimed click.
+
+**The geometry handshake is bounded, and it is the only read the plugin waits
+on.** `show` is not fire-and-forget: it completes when `ready` arrives or after
+`PROBE_TIMEOUT`, and the bounds are computed *only* from that report — never from
+an assumed output size, and never from a previous session's geometry. Three cases
+are specified rather than left to the implementer: `ready` arrives (the mode
+starts); the helper dies or the wait times out (the mode never starts, a WARNING
+names the reason, and the grid-unavailable string is spoken — the overlay was
+never mapped, so there is nothing to dismiss and nothing to aim at); a command
+arrives before `ready` (it cannot be honoured, because a subdivision without
+geometry has no coordinates — the mode has not started, so this is unreachable
+rather than queued, which is what keeps a user's utterance order from being
+silently reordered).
 
 ### Overlay rendering
 
@@ -317,8 +338,10 @@ ordering (move, then click) deterministic.
 | Condition | Behaviour |
 |---|---|
 | Gate failed at setup | every `handle` returns `None`; `mousegrid` answers as today; INFO log names the reason |
-| Helper says `unsupported` | same as above (probe result, not a runtime surprise) |
+| Helper never reports `ready` inside `PROBE_TIMEOUT`, or dies first | mode never starts; WARNING names the reason; the overlay was never mapped; the grid-unavailable string is spoken |
 | Helper dies with the grid open | logged; mode ends; no orphan surface; the daemon keeps running |
+| The helper's output disappears mid-mode (monitor unplugged, compositor restarted) | the surface is gone, so the mode ends and the bounds are discarded — a click is never injected against geometry that no longer exists |
+| A protocol line does not parse | WARNING naming the line, and it is ignored: the plugin never raises on a bad line and never treats one as an event |
 | `ydotool` reports `errored` | WARNING with the captured stderr; overlay hidden anyway (never leave a stuck overlay); the definite-failure string |
 | `ydotool` reports `unknown` (timeout, killed, spawn failure) | WARNING with the captured stderr; overlay hidden anyway; the unknown-outcome string — never silence, and never a claim about which way it went |
 | Mode ends by idle timeout, `close`, or a completed click | the same `finally` path hides the surface and reaps the helper |
@@ -331,7 +354,7 @@ ordering (move, then click) deterministic.
 |---|---|
 | `src/plugins/gridydotool/__init__.py` | routing, zone math, gating, injection adapter, session lifecycle, `_ = translator(__file__)` |
 | `src/plugins/gridydotool/_overlay.py` | GTK4 + gtk4-layer-shell renderer; `--probe`; JSON IPC; `CDLL` before `gi` |
-| `src/plugins/gridydotool/locale/{de,es,fr,it}/LC_MESSAGES/gridydotool.po` | complete catalogs — the 4 strings named in D8, agent-drafted, flagged for review |
+| `src/plugins/gridydotool/locale/{de,es,fr,it}/LC_MESSAGES/gridydotool.po` | complete catalogs — the 5 strings named in D8, agent-drafted, flagged for review |
 | `tests/unit/plugins/test_gridydotool.py` | unit matrix, gate matrix, parity/drift tests |
 | `tests/integration/test_gridydotool_harness.py` | headless-sway loop; opt-in; skips when binaries are absent |
 | `tests/integration/grid_probe_window.py` | fullscreen GTK4 probe reporting pointer motion and button events as JSON |
@@ -418,6 +441,13 @@ worth doing rather than a nice-to-have.
   `/tmp/.ydotool_socket` at `0600`; a system-level daemon would be unreachable by
   the client. Injection also works with no daemon at all, which is why it is not a
   gate.
+- **One daemon owner stays the rule.** The install doc records this as a
+  hit-live trap, and this plugin sharpens the consequence: two daemons mean two
+  helpers, two stacked overlays and two injections per utterance — one command,
+  two clicks. The deployment note names it so the failure is diagnosed as a
+  duplicate owner rather than as a plugin bug; the plugin itself does no
+  cross-process locking (that is the operator's rule, enforced by having a single
+  autostart unit).
 - **`/dev/uinput` on this box already grants `ecc` rw via a POSIX ACL**
   (`user:ecc:rw-`; `ecc` is not in the `input` group), so this prototype needs **no
   new privilege here**. A bare `setfacl` does not survive a reboot, so making it
