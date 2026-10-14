@@ -115,7 +115,12 @@ constraints), and one was confirmed independently:
   tables are mirrored, and tests assert equality against `mousegrid`'s — test-only
   coupling, no production import, because the plugin loader has no shared-library
   convention and the precedent is one plugin per concern. Without the drift tests
-  the two backends would diverge silently and the invariant would rot.
+  the two backends would diverge silently and the invariant would rot. What the
+  tests prove is *math and vocabulary* parity given equal inputs; that the two
+  backends are handed the same output geometry (the extension reports its own
+  size, this one takes GTK's monitor geometry) is a separate premise, asserted
+  once on a real session rather than assumed here — the same place the
+  multi-output question is settled.
 - **D6 — Monitor-local coordinates (agent decision).** Bounds stay local to the
   monitor the overlay is on; the monitor's compositor-global origin is added only
   when injecting. This makes the math *identical* to `mousegrid`'s (so parity is
@@ -131,8 +136,9 @@ constraints), and one was confirmed independently:
   not a surprise.
 - **D8 — Ship complete reply catalogs (agent decision).** The completeness test
   forbids empty/fuzzy entries and `check-translations` would create stub catalogs
-  for any package with translatable strings, so the plugin ships **five** strings
-  per language in de/es/fr/it, drafted by the agent and flagged for human review:
+  for any package with translatable strings, so the plugin ships **five reply
+  strings** plus its `DESCRIPTION` and `COMMANDS` help entries per language in
+  de/es/fr/it, drafted by the agent and flagged for human review:
   the open acknowledgement (`Grid`), the dismissal (`Grid closed.`), the definite
   injection failure (`I couldn't move the pointer.`), the unknown outcome
   (`I tried, but I'm not sure it worked.`) and the grid that could not be shown
@@ -167,6 +173,14 @@ state beyond "what is currently drawn"; it is a real module rather than an
 embedded `-c` string so Ruff lints it and unit tests can import it (the
 `_atspi_insert.py` precedent), and its leading underscore keeps it out of plugin
 discovery.
+
+Its module surface follows the plugin contract: `NAME`, `PRIORITY`, `handle` and
+`setup` as specified above, plus `DESCRIPTION` and a `COMMANDS` list, because the
+help output is the discovery path for a voice UI — a user who never learns the
+grid exists will never say "grid". That list names only what this backend
+implements (`scroll`, `mark` and `drag` are absent rather than listed and broken),
+and its entries are translated like every other plugin's, so they belong to the
+catalogs D8 sizes.
 
 **IPC** — newline-delimited JSON, one object per line, stdin/stdout. stdout is
 protocol only; diagnostics go to stderr, which the plugin logs.
@@ -259,11 +273,11 @@ A `--probe` that exits 0 inside the timeout is the only other way in.
 
 | Utterance (lowercased, wake-stripped by core) | Action |
 |---|---|
-| `grid` / `mouse` / `pointer` / `cursor` (+ `mousegrid`'s mishearing set) | open the overlay on the **default monitor** (the one GTK reports first); choosing a monitor by pointer position or by name is deferred with multi-output (open item 7) |
+| `grid` / `mouse` / `pointer` / `cursor` (+ `mousegrid`'s mishearing set) | open the overlay on the output the compositor chooses (no `set_monitor` call is made), and take the geometry from the helper's `ready` report — never an assumed default size; choosing an output by name is deferred with multi-output (open item 7) |
 | `1`–`9`, chained (`3 7 5`, `three seven five`) | subdivide the current bounds, redraw |
 | `click` / `right` / `double` / `middle click` | move to the cell centre, click, hide |
 | `close` / `cancel` / `stop` / `hide` | hide, stay in command mode |
-| `again` / `repeat` / `reopen` (with a remembered cell) | reopen at the last cell |
+| `again` / `repeat` / `reopen` (only when a cell is remembered) | reopen at the last cell. The cell is recorded when a click is dispatched, mirroring `mousegrid` (its click path sets `last_bounds`, subdivision alone does not), so a subdivide-only session leaves `again` with nothing to reopen and the word falls through to the other plugins |
 
 Matching mirrors `mousegrid`'s: split on whitespace and test whole tokens, so
 "greatest" matches nothing; a bare trigger followed by `close`/`hide` is a
@@ -273,28 +287,33 @@ the session.
 
 ### Zone math
 
-Mirrored from `mousegrid.update_grid` line for line, including the integer
-truncation and the safety clamp:
+Mirrored from `mousegrid.update_grid` **except** for one thing: its safety clamp is
+dropped, because it cannot fire in either implementation. Bounds always start as
+the full monitor rect and each step adds at most two integer-thirds to a cell of
+integer thirds, so `x + w` stays inside the monitor and every term is
+non-negative — `max(new_x, 0)` and the two off-monitor branches are unreachable in
+`mousegrid` as well, and the drift test proves the two still agree without them.
+The invariant they appeared to guard is stated instead, which is what a future
+change to the subdivision (a different divisor, a non-zero origin) must be checked
+against:
 
 ```python
 ZONE_MAP = {1:(0,0), 2:(1,0), 3:(2,0), 4:(0,1), 5:(1,1), 6:(2,1), 7:(0,2), 8:(1,2), 9:(2,2)}
 
-def subdivide(bounds, zone, monitor):
+def subdivide(bounds, zone):
     x, y, w, h = bounds
     zone_w, zone_h = w // 3, h // 3
     col, row = ZONE_MAP[zone]
-    new_x, new_y = x + col * zone_w, y + row * zone_h
-    # safety net, as in mousegrid: never leave the monitor
-    new_x = max(new_x, 0)
-    new_y = max(new_y, 0)
-    if new_x + zone_w > monitor[2]: new_x = monitor[2] - zone_w
-    if new_y + zone_h > monitor[3]: new_y = monitor[3] - zone_h
-    return (new_x, new_y, zone_w, zone_h)
+    return (x + col * zone_w, y + row * zone_h, zone_w, zone_h)
 
 def center(bounds):
     x, y, w, h = bounds
     return (x + w // 2, y + h // 2)
 ```
+
+**Containment invariant** — `x + w` and `y + h` never exceed the monitor's width
+and height, for every sequence of zones; it holds inductively from the first
+full-rect bounds, and it is the property the deleted clamp was reaching for.
 
 ### Injection adapter
 
@@ -305,6 +324,10 @@ move_to(x, y)      -> ["ydotool", "mousemove",   str(monitor_x + x), str(monitor
 click(button)      -> ["ydotool", "click",       str(BUTTONS[button])]
 double_click()     -> two sequential ["ydotool", "click", "1"] calls
 ```
+
+`monitor_x` and `monitor_y` are the `x` and `y` of the `ready` event's `monitor`
+field — the same report the bounds are computed from, so the offset and the
+geometry cannot disagree and there is no second source of truth for either.
 
 Every external process — the gate's probes, the helper, and the injections — goes
 through one module-level seam, `_run_bounded(args, timeout)`, which unit tests
@@ -354,7 +377,7 @@ ordering (move, then click) deterministic.
 |---|---|
 | `src/plugins/gridydotool/__init__.py` | routing, zone math, gating, injection adapter, session lifecycle, `_ = translator(__file__)` |
 | `src/plugins/gridydotool/_overlay.py` | GTK4 + gtk4-layer-shell renderer; `--probe`; JSON IPC; `CDLL` before `gi` |
-| `src/plugins/gridydotool/locale/{de,es,fr,it}/LC_MESSAGES/gridydotool.po` | complete catalogs — the 5 strings named in D8, agent-drafted, flagged for review |
+| `src/plugins/gridydotool/locale/{de,es,fr,it}/LC_MESSAGES/gridydotool.po` | complete catalogs — the reply strings and help entries named in D8, agent-drafted, flagged for review |
 | `tests/unit/plugins/test_gridydotool.py` | unit matrix, gate matrix, parity/drift tests |
 | `tests/integration/test_gridydotool_harness.py` | headless-sway loop; opt-in; skips when binaries are absent |
 | `tests/integration/grid_probe_window.py` | fullscreen GTK4 probe reporting pointer motion and button events as JSON |
@@ -363,6 +386,10 @@ ordering (move, then click) deterministic.
 | `pyproject.toml` | `easyspeak.plugins.gridydotool` in `[tool.setuptools] packages` |
 | `docs/reference/plugins.md` | `::: plugins.gridydotool` entry |
 | `docs/compatibility.md`, `docs/usage.md` | layer-shell/ydotoold requirements and the uinput risk wording; `EASYSPEAK_GRID_BACKEND` and `EASYSPEAK_GRID_PYTHON` |
+| `docs/how-it-works.md` | the plugin tree (`:48-59`) enumerates every package, so it goes stale the moment one is added |
+| `docs/commands.md` | the grid verb table (`:36-53`): mark the verbs this backend cannot honour — `scroll` (`:48-49`) is not expressible in ydotool 0.1.8 at all, and `mark`/`drag` (`:50-51`) are deferred — so the table stops promising them uniformly across backends |
+| `docs/troubleshooting.md` | its grid section (`:3`) explains only the extension path; add what a missing layer-shell/ydotoold stack looks like on this backend |
+| `docs/index.md`, `README.md` | the feature lines (`index.md:33`, `README.md:25`) name the mouse grid without saying the extension is one of two ways to reach it |
 | `tests/integration/README.md` | the harness's layout entry and `EASYSPEAK_GRID_LIVE` (test-only, so it is documented with the harness, not with user settings) |
 | `mgmt/ADL/<date>.adl.md` (in **system-priv**) | the agent's autonomous choices (D5, D6, D8, D9) — placed there, not here, so this fork's diff against upstream stays about the plugin, and because system-priv owns the `mgmt/` convention and the decision context for the issue |
 
@@ -376,12 +403,17 @@ ordering (move, then click) deterministic.
 - **Routing**: every verb; word-boundary negatives ("greatest"); `close`/`hide`
   after a trigger is a dismissal; unknown input returns `None` so other plugins
   still see it; `True`/`None` return contract (never `False` — that exits).
-- **Zone math**: table-driven subdivision; center computation; clamp behaviour.
+- **Zone math**: table-driven subdivision; center computation; the containment
+  invariant as a property over sequences — the clamp that used to look like its
+  guard is gone, so the property is what a change to the divisor must be checked
+  against.
 - **Parity (drift)**: for all 1-, 2- and 3-digit sequences (819 cases), drive
   `mousegrid.update_grid` with `mousegrid.dbus_call` patched and its globals reset,
-  and assert our bounds/centres equal its `grid_bounds`. Also assert our
-  `GRID_TRIGGERS`, `WORD_TO_NUM` and parser behaviour match `mousegrid`'s over a
-  shared sample.
+  and assert our bounds/centres equal its `grid_bounds`. The tables are asserted
+  by **exact equality** (`GRID_TRIGGERS` as sets, `WORD_TO_NUM` as dicts), not by
+  sample: they are small, and a sampled comparison is how a drifted entry slips
+  through. The parser is compared over a shared utterance sample, since a function
+  cannot be enumerated — and what the whole test proves is scoped in D5.
 - **Injection**: exact argv per verb; monitor offset applied to moves only;
   double-click issues two calls in order; the outcome matrix — `ran` for the
   invocation's own success code with clean stderr, `errored` for an error signature
