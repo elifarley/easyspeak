@@ -569,7 +569,11 @@ worth doing rather than a nice-to-have.
 ## Delivery
 
 1. Branch pushed to the fork (`hug bpush`), CI green: `just format`, `lint`,
-   `types`, `pytest`, `check-translations`, `check-python-packages`.
+   `types`, `pytest`, `check-translations`, `check-python-packages` — and
+   `just integration` wherever sway, ydotool and the layer-shell build exist, since
+   that run is where arm A's assertions live. The folder's convention is to skip
+   gracefully when those binaries are absent, so a green run that skipped them says
+   so rather than being read as a pass.
 2. Upstream issue on `ctsdownloads/easyspeak` carrying the findings: the ydotool
    0.1.8 semantics table (exit codes, `mousemove`, the 0600 socket), the
    layer-shell-on-Smithay-but-not-GNOME boundary as the natural gate, the
@@ -600,11 +604,13 @@ worth doing rather than a nice-to-have.
    into a formality.
 6. **Does headless `sway` pick up a uinput device that appears after startup?**
    (wlroots monitors udev; if not, the device is created before sway starts.)
-7. **Multi-output**: the grid opens on the default monitor today, and D6's single
-   addition (the monitor origin at injection time) is what a non-primary monitor
-   needs. Whether ydotool's clamp-to-origin trick then lands where the offset
-   predicts — the desktop's global origin is assumed to be its top-left — is
-   deferred with the VM, where a second virtual output is easy to add.
+7. **Multi-output**: the grid opens on whichever output the compositor chooses
+   today (the plugin makes no `set_monitor` call), and D6's single addition (the
+   monitor origin at injection time) is what a non-primary monitor needs. Whether
+   ydotool's clamp-to-origin trick then lands where the offset predicts — the
+   desktop's global origin is assumed to be its top-left, and the remembered cell
+   is not invalidated when an output changes size — is deferred with the VM, where
+   a second virtual output is easy to add.
 
 ## Acceptance criteria
 
