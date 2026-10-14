@@ -202,18 +202,35 @@ layer-shell anchors in and that `ydotool`'s relative motion lands in — and the
 scale factor rides along on the `ready` event so a fractional-scale session is
 diagnosable from the log rather than from a mis-aimed click.
 
-**The geometry handshake is bounded, and it is the only read the plugin waits
-on.** `show` is not fire-and-forget: it completes when `ready` arrives or after
-`PROBE_TIMEOUT`, and the bounds are computed *only* from that report — never from
-an assumed output size, and never from a previous session's geometry. Three cases
-are specified rather than left to the implementer: `ready` arrives (the mode
-starts); the helper dies or the wait times out (the mode never starts, a WARNING
-names the reason, and the grid-unavailable string is spoken — the overlay was
-never mapped, so there is nothing to dismiss and nothing to aim at); a command
-arrives before `ready` (it cannot be honoured, because a subdivision without
-geometry has no coordinates — the mode has not started, so this is unreachable
-rather than queued, which is what keeps a user's utterance order from being
-silently reordered).
+**The geometry handshake is bounded, and the bound is a mechanism, not a hope.**
+`show` is not fire-and-forget: the helper is spawned with `Popen(stdin=PIPE,
+stdout=PIPE)` — not `subprocess.run`, which would only return once the helper
+exits — and `show` completes when `ready` arrives or when `read_until(deadline)`
+gives up at `PROBE_TIMEOUT`. That helper is one function: `select.select()` on the
+helper's stdout with the remaining time, then read one line if it is ready.
+
+Why the mechanism has to be named: a `subprocess` timeout bounds a *process*, and
+this wait is not a process — it is a read on a live child's pipe, where a blocking
+`readline()` has no timeout at all. A helper that stays alive and writes nothing
+would sail past a bound written only as a property, which is the shape this design
+must not have (and the shape a prior capture records: OB `a5e9d0fc`, a documented
+client timeout defeated by a peer that held the connection open and idle).
+
+Four cases, all specified rather than left to the implementer:
+
+- `ready` arrives — the mode starts.
+- the helper dies — the read returns EOF immediately; **kill and reap the helper
+  first**, then WARNING, then the grid-unavailable string.
+- the helper stays alive and silent — the deadline fires, and this path does the
+  same thing: **kill and reap, then speak**. Without that reap a helper that
+  finished mapping just after the deadline would leave an ownerless full-screen
+  overlay, which is the design's own named worst outcome; the stdin-EOF rule only
+  covers the case where something closes the pipe, and closing it is exactly what
+  the reap does.
+- a command arrives before `ready` — it cannot be honoured, because a subdivision
+  without geometry has no coordinates. The mode has not started, so this is
+  unreachable rather than queued, which is what keeps a user's utterance order
+  from being silently reordered.
 
 ### Overlay rendering
 
@@ -361,7 +378,8 @@ ordering (move, then click) deterministic.
 | Condition | Behaviour |
 |---|---|
 | Gate failed at setup | every `handle` returns `None`; `mousegrid` answers as today; INFO log names the reason |
-| Helper never reports `ready` inside `PROBE_TIMEOUT`, or dies first | mode never starts; WARNING names the reason; the overlay was never mapped; the grid-unavailable string is spoken |
+| Helper never reports `ready` inside `PROBE_TIMEOUT`, or dies first | helper killed and reaped **before** anything is spoken (a helper that mapped after the deadline must not be left ownerless); WARNING names the reason; the overlay was never wanted, so nothing is dismissed and nothing is aimed at |
+| Helper stays alive and silent (the case a blocking read cannot escape) | same as above — that is what the `select` deadline is for, and why the bound is not a `subprocess` timeout |
 | Helper dies with the grid open | logged; mode ends; no orphan surface; the daemon keeps running |
 | The helper's output disappears mid-mode (monitor unplugged, compositor restarted) | the surface is gone, so the mode ends and the bounds are discarded — a click is never injected against geometry that no longer exists |
 | A protocol line does not parse | WARNING naming the line, and it is ignored: the plugin never raises on a bad line and never treats one as an event |
@@ -424,7 +442,11 @@ ordering (move, then click) deterministic.
 - **Bounded waits**: every probe and every injection is exercised against a stub
   that never returns, asserting that the timeout fires, that the gate then reports
   not-ready (so `mousegrid` keeps the words), and that the mode still ends with the
-  overlay hidden.
+  overlay hidden. The handshake gets its own pair of cases, because its bound is a
+  different mechanism: a stub helper that maps nothing and **writes nothing**
+  (asserting the deadline fires and the helper is reaped), and a stub that maps a
+  surface *after* the deadline (asserting no `_overlay.py` process and no mapped
+  surface survive).
 - **Lifecycle**: helper spawn/hide/reap on click, close, idle-exit and exception;
   helper death mid-mode ends the mode; no orphan process is left.
 
