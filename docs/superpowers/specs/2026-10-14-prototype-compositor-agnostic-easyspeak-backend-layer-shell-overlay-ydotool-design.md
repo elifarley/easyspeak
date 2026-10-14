@@ -246,6 +246,21 @@ Five cases, all specified rather than left to the implementer:
   unreachable rather than queued, which is what keeps a user's utterance order
   from being silently reordered.
 
+**Stopping the helper is bounded too, or the reap becomes the next hang.**
+`stop_helper(reason)` is `terminate()`, then `wait(timeout=REAP_GRACE)` (a second
+or two), then `kill()` — logging which rung was needed, since that is the only
+signal a misbehaving helper leaves. An unbounded `wait()` would freeze the mode at
+exactly the point these paths exist to make safe, and a process that cannot be
+scheduled to handle SIGTERM still takes a `kill` from the kernel: the same
+escalation a prior capture records for orphaned children (OB `27b7f9eb`). Every
+pre-ready path calls it before speaking.
+
+**`handle` returns `True` on every one of these paths**, failure included — the
+phrase was claimed and answered. Only the gate-inert case returns `None`, which is
+what lets `mousegrid` keep the word by design. Returning `None` here would hand the
+same utterance to the other backend *after* this one had already spoken, and the
+user would hear two answers to one word.
+
 ### Overlay rendering
 
 The surface is anchored to every edge, `keyboard_mode` is `NONE` (it must never
@@ -484,8 +499,12 @@ makes the ordering (move, then click) deterministic.
   (asserting the deadline fires and the helper is reaped), and a stub that maps a
   surface *after* the deadline (asserting no `_overlay.py` process and no mapped
   surface survive).
-- **Lifecycle**: helper spawn/hide/reap on click, close, idle-exit and exception;
-  helper death mid-mode ends the mode; no orphan process is left.
+- **Lifecycle**: helper spawn/hide/stop on click, close, idle-exit and exception;
+  helper death mid-mode ends the mode; no orphan process is left; `stop_helper`'s
+  escalation is exercised with a stub that ignores SIGTERM (the rung is logged and
+  the mode still ends), and the return contract is asserted on the failure paths —
+  `True` when the phrase was claimed and answered, `None` only when the gate is
+  inert.
 
 ### Integration harness (`just integration`, opt-in)
 
