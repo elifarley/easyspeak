@@ -410,23 +410,38 @@ and its conftest's heavy-dependency stubs so no mic or model is needed. It:
 3. calls `gridydotool.setup(fake_core)` for real (the gate is part of what is
    under test), then `handle("grid", fake_core)` with a fake `listen_modal` that
    replays `["3 7 5", "click"]`;
-4. asserts, in order:
-   - the helper reported `ready` with the headless output's geometry, then
-     `presented` — and a `grim` screenshot's sampled points inside the nine cells
-     differ from a pre-open screenshot of the same points (rendering, not just
-     "process alive");
-   - the probe window reported pointer coordinates inside the **predicted final
-     cell rect**, computed independently in the harness from the output geometry
-     and the digit sequence;
-   - the probe window reported a button-1 press at those coordinates (the click
-     arrived where it was aimed — and note that with layer-shell's empty input
-     region the click *must* pass through the overlay to reach it);
-   - no `_overlay.py` process survives the mode.
+4. asserts, in **two arms, and the separation is the point**:
 
-**Injection safety** (D9): the run is dry-run unless `EASYSPEAK_GRID_LIVE` is set.
-`=move` performs the real move (the live session's cursor moves too — harmless);
-`=click` also clicks, which is the only way to prove delivery end to end, and the
-harness prints the coordinates it is about to click on before doing it.
+   **Arm A — dry run (the default, and the arm CI can run).** The plugin logs each
+   helper event it consumes — `ready` with the geometry at INFO, `presented` at
+   DEBUG — so the harness asserts on captured log records: the helper's stdout
+   belongs to the plugin, and a test cannot claim to assert on a channel it does
+   not own. Alongside that: the nine cells' sampled `grim` points differ from a
+   pre-open screenshot of the same points (rendering, not "process alive"); the
+   exact `ydotool` argv for the whole transcript is recorded by the dry-run seam
+   and asserted against literals; no `_overlay.py` process survives the mode.
+
+   **Arm B — live injection, opened explicitly and never by default.** With
+   `EASYSPEAK_GRID_LIVE=click`, the probe window must report coordinates inside the
+   expected cell and a button-1 press there, and the expectation is a
+   **hand-computed literal** rather than a re-derivation: for a 1920×1080 output
+   and the sequence `3 7 5`, zone 3 gives `(1280, 0, 640, 360)`, zone 7 gives
+   `(1280, 240, 213, 120)`, and zone 5 gives `(1351, 280, 71, 40)` — so the click
+   landing inside `x` in `[1351, 1422)` and `y` in `[280, 320)`, centre
+   `(1386, 300)`, with whatever tolerance the acceleration measurement settles.
+   Deriving that rect with the same algorithm the plugin uses would make the
+   assertion agree with any shared off-by-one; the algorithmic prediction stays
+   only as a cross-check, with that reason written down next to it.
+
+**Injection safety, and why the unit is split** (D9): the run is dry-run unless
+`EASYSPEAK_GRID_LIVE` is set. `=move` performs the real move (the live session's
+cursor moves too — harmless); `=click` also clicks, which is the only way to prove
+delivery end to end, and the harness prints the coordinates it is about to click on
+before it does. Because uinput is kernel-global, arm B is the one act that reaches
+the user's live session: it is never the default, and the two arms are scored as
+two criteria rather than one, so that a cautious default cannot be made to look
+like a failing suite — which is exactly the trap a single "the coordinates must
+match" criterion creates.
 
 ### What this spec does not verify
 
@@ -503,12 +518,16 @@ Mapped to the issue's, with how each is discharged:
 1. **Plugin loads in the existing daemon, zero core edits** — the updated roster
    assertion proves discovery; a daemon startup smoke on this box shows
    `Loaded: GridYdotool`; `git diff origin/main -- src/core` is empty, mechanically.
-2. **Grid overlay renders as a layer surface in headless sway** — the harness's
-   `ready`+`presented` events and the `grim` pixel sampling.
+2. **Grid overlay renders as a layer surface in headless sway** — arm A: the
+   plugin's captured `ready`+`presented` log records, plus the `grim` pixel
+   sampling.
 3. **"grid" → "3 7 5" → "click" moves the pointer to the expected coordinates,
-   scripted** — the probe window's reported coordinates inside the predicted cell
-   rect, plus the button-1 press at that point (with the argv assertions in the
-   unit layer).
+   scripted** — scored as two criteria so the safety default cannot read as a
+   failure: **3a** (always runnable, the default) asserts the exact `ydotool` argv
+   per verb and the overlay lifecycle under dry run; **3b** (opened explicitly with
+   `EASYSPEAK_GRID_LIVE=click`, ideally in the isolated VM) asserts the probe
+   window's reported coordinates inside the hand-computed literal cell rect and the
+   button-1 press there.
 4. **Daemon-only stack shows no regression** — the full `just pytest` suite
    (including `mousegrid`'s own), `just integration`, and a live daemon smoke on
    this box: wake word, commands, dictation, TTS. The gate matrix proves the

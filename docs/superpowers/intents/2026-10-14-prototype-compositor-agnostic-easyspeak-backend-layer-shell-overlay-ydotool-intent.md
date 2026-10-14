@@ -48,10 +48,13 @@ geometry, replacing `mousegrid`'s `/sys/class/drm` guess.
   `click` + right/double/middle, `close`/`cancel`/`stop`, `again`. Nudge, scroll
   and mark/drag are explicitly deferred (scroll is not expressible in ydotool
   0.1.8 at all; drag needs its own timing design).
-- **Verification by assertion, not eyeball.** A scripted headless-sway loop:
+- **Verification by assertion, not eyeball.** ~~A scripted headless-sway loop:
   the helper reports the surface presented plus geometry, `grim` pixel-samples
   the rendered cells, and a fullscreen probe window reports the click arriving
-  at the predicted cell's coordinates.
+  at the predicted cell's coordinates.~~ Superseded by the amendment below: the
+  loop is scripted in two arms — a dry-run half that always runs (overlay
+  rendering, exact argv) and an explicitly opened live half that proves the
+  pointer coordinates and the click.
 - **Delivery.** Branch pushed to the fork; an upstream issue on
   ctsdownloads/easyspeak carrying the findings; a PR only if upstream wants one.
 
@@ -128,3 +131,16 @@ for real-COSMIC acceptance, and its source build of gtk4-layer-shell.
    compositor's global origin is the desktop's top-left; a grid opened on a
    non-primary output needs the monitor's global offset added to every cell
    centre. One output in the harness; deferred to the VM.
+
+## Amendment (2026-10-14, spec-roast reception round 3)
+
+The verification bullet above is superseded by the design spec's testing
+section. The roast's S3 pass showed that a single "the coordinates must match"
+criterion scores the *unsafe* arm better than the safe one: with injection
+dry-run by default (D9), the arm that skips the safety property is the only one
+that can pass. The loop is therefore scored as two criteria: 3a runs under the
+dry-run default and asserts the exact `ydotool` argv plus the overlay lifecycle,
+while 3b — pointer coordinates and click delivery — runs only with
+`EASYSPEAK_GRID_LIVE=click`, ideally inside the deferred VM where uinput
+injection is actually isolated rather than merely headless. The original wording
+is kept above, struck through, for the record.
