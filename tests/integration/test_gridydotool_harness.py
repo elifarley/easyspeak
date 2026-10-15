@@ -154,10 +154,11 @@ class TestGate:
         assert gridydotool.handle("grid", core=None) is None
 
     def test_the_injector_gate_passes_daemonless(self, monkeypatch, caplog):
-        """A stock Ubuntu box has no `ydotoold` at all, and the VM measured the
-        daemonless path working: the socket is a logged mode, not a condition.
-        This runs the real `ydotool help` and `type ""` probe, so it skips where
-        ydotool is absent or /dev/uinput is not reachable."""
+        """An Ubuntu box may have no `ydotoold` installed at all (the `ydotool`
+        package ships only the client), and the VM measured the daemonless path
+        working: the socket is a logged mode, not a condition. This runs the
+        real `ydotool help` and `type ""` probe, so it skips where ydotool is
+        absent or /dev/uinput is not reachable."""
         if shutil.which("ydotool") is None:
             pytest.skip("ydotool is not installed")
         if not os.access("/dev/uinput", os.W_OK):

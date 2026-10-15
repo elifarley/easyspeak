@@ -384,11 +384,12 @@ def _probe_injector():
     side-effect-free verb of the five, where `mousemove 0 0` would move the
     pointer and `click 0` is a real left click.
 
-    The daemon is not a gate. Ubuntu packages no `ydotoold` binary, and ydotool
-    works without one (the VM measured no-op invocations exiting 0; the client's
-    own `notice:` calls the fallback a latency caveat), so the socket decides
-    the mode this logs, not whether the plugin activates. The capability half
-    still fails closed: no binary, no verbs, or a probe that does not report
+    The daemon is not a gate. The VM image had no `ydotoold` installed (Ubuntu's
+    `ydotool` package ships only the client; a daemon comes from a separate
+    package), and ydotool works without one (no-op invocations exit 0 there; the
+    client's own `notice:` calls the fallback a latency caveat), so the socket
+    decides the mode this logs, not whether the plugin activates. The capability
+    half still fails closed: no binary, no verbs, or a probe that does not report
     `ran` leaves the words to `mousegrid`.
     """
     if shutil.which("ydotool") is None:
