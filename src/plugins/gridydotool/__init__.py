@@ -314,11 +314,22 @@ def _socket_owned(path):
     return True
 
 
-# The candidate that answered last time. Probing it first keeps the per-use
-# rediscovery honest (a daemon that stopped is not an injector any more) while
-# sparing the common path the full four-path, two-socket-type fan-out on every
-# injection.
+# The candidate that answered last time, under the resolution environment it
+# answered for. Probing it first keeps the per-use rediscovery honest (a daemon
+# that stopped is not an injector any more) while sparing the common path the
+# full four-path, two-socket-type fan-out on every injection — and keying the
+# entry to `YDOTOOL_SOCKET`/`XDG_RUNTIME_DIR` keeps an env repoint (a nested
+# compositor, the harness) in charge of priority: the override candidate is
+# probed before any still-alive default.
 _socket_last_good = None
+_socket_last_good_env = None
+
+
+def _socket_env_key():
+    return (
+        os.environ.get("YDOTOOL_SOCKET"),
+        os.environ.get("XDG_RUNTIME_DIR"),
+    )
 
 
 def injector_socket():
@@ -327,19 +338,25 @@ def injector_socket():
     Asked afresh before each use rather than cached blindly: a daemon that
     stopped is not an injector any more, and one that started is, and the answer
     is what decides both the gate's mode line and whether the gate opens at all
-    on a client that cannot inject without one. The last path that answered is
-    re-probed first, so the steady state costs one connect instead of the full
-    fan-out.
+    on a client that cannot inject without one. The last path that answered —
+    under the same resolution environment — is re-probed first, so the steady
+    state costs one connect instead of the full fan-out.
     """
-    global _socket_last_good
+    global _socket_last_good, _socket_last_good_env
     candidates = ydotool_socket_candidates()
-    if _socket_last_good and _socket_last_good in candidates:
+    env_key = _socket_env_key()
+    if (
+        _socket_last_good
+        and _socket_last_good_env == env_key
+        and _socket_last_good in candidates
+    ):
         if _socket_owned(_socket_last_good) and _socket_accepts(_socket_last_good):
             return _socket_last_good
         _socket_last_good = None
     for candidate in candidates:
         if _socket_owned(candidate) and _socket_accepts(candidate):
             _socket_last_good = candidate
+            _socket_last_good_env = env_key
             return candidate
     return None
 
@@ -535,12 +552,15 @@ def helper_env(base=None):
     return env
 
 
-# The interpreter the gate's probe found, and whether it found one. A `None`
-# answer is never cached: the probe costs a fresh interpreter import each call
-# (100-500 ms on the interactive open path), so a positive is remembered for the
-# daemon's lifetime, while a negative keeps re-probing in case the box grows a
-# working interpreter later.
+# The interpreter the gate's probe found, the override it was resolved under,
+# and whether one was found at all. A `None` answer is never cached: the probe
+# costs a fresh interpreter import each call (100-500 ms on the interactive
+# open path), so a positive is remembered for the daemon's lifetime, while a
+# negative keeps re-probing in case the box grows a working interpreter later.
+# The cached value is only valid for the override it was found under — an env
+# repoint invalidates it rather than silently answering with the old answer.
 _grid_python = None
+_grid_python_override = None
 _grid_python_found = False
 
 
@@ -553,13 +573,14 @@ def grid_python():
     `helper_env()`, so an interpreter that only finds the typelib through
     `EASYSPEAK_GRID_TYPELIB` counts. Bounded, because a startup hang is
     invisible in a way an exception is not. The first candidate that answers is
-    cached — the answer does not go stale the way a socket does, and every
-    grid open would otherwise pay the import probe again.
+    cached under the override that produced it — the answer does not go stale
+    the way a socket does, and every grid open would otherwise pay the import
+    probe again.
     """
-    global _grid_python, _grid_python_found
-    if _grid_python_found:
-        return _grid_python
+    global _grid_python, _grid_python_override, _grid_python_found
     override = os.environ.get("EASYSPEAK_GRID_PYTHON")
+    if _grid_python_found and _grid_python_override == override:
+        return _grid_python
     candidates = (override,) if override else GRID_PYTHON_CANDIDATES
     for candidate in candidates:
         try:
@@ -574,6 +595,7 @@ def grid_python():
             continue
         if probe.returncode == 0:
             _grid_python = candidate
+            _grid_python_override = override
             _grid_python_found = True
             return candidate
     return None
@@ -762,26 +784,46 @@ def setup(core):  # noqa: ARG001 — unused since the dead `_core` global went a
     else:
         # The two probes are independent until the conjunction, so they run
         # side by side: each is bounded individually, and a host where both
-        # would hang pays the bound once instead of twice at daemon startup.
-        # Both always run when nothing is forced — skipping the injector probe
-        # on an overlay failure would save one bounded connect and cost the
-        # concurrency.
+        # would hang pays its longest bound once instead of the serial sum at
+        # daemon startup. Both always run when nothing is forced — skipping
+        # the injector probe on an overlay failure would save one bounded
+        # connect and cost the concurrency.
+        #
+        # The join budget is each thread's own worst case (the overlay probe
+        # may try three interpreter candidates plus the helper probe; the
+        # injector probe asks for help, the dialect and one no-op), and past
+        # it the gate fails closed even though the probe would still answer.
+        # The threads are daemons so a wedged probe can never hold the daemon
+        # shut-down hostage; a late result lands in `outcome` unread.
         outcome = {}
 
         def _run(name, probe):
             outcome[name] = probe()
 
+        budgets = {
+            "overlay": (len(GRID_PYTHON_CANDIDATES) + 1) * PROBE_TIMEOUT,
+            "injector": 2 * PROBE_TIMEOUT + INJECT_TIMEOUT,
+        }
         threads = [
-            threading.Thread(target=_run, args=(name, probe), name=f"grid-probe-{name}")
+            (
+                name,
+                threading.Thread(
+                    target=_run,
+                    args=(name, probe),
+                    name=f"grid-probe-{name}",
+                    daemon=True,
+                ),
+                budgets[name],
+            )
             for name, probe in (
                 ("overlay", _probe_overlay),
                 ("injector", _probe_injector),
             )
         ]
-        for thread in threads:
+        for _, thread, _budget in threads:
             thread.start()
-        for thread in threads:
-            thread.join(PROBE_TIMEOUT + INJECT_TIMEOUT)
+        for _name, thread, budget in threads:
+            thread.join(budget)
         overlay = bool(outcome.get("overlay"))
         injector = bool(outcome.get("injector"))
         _active = overlay and injector
@@ -834,6 +876,17 @@ def _open_session(core, bounds=None):
     # The first show goes out before the mode starts listening: without it the
     # grid is never drawn and the session looks like a dead daemon.
     _redraw(_bounds)
+    # Consume the `presented` announcement so the protocol's promise is kept.
+    # It can only arrive HERE: `_draw` announces the first frame once it has
+    # bounds to draw, and bounds exist only after the show above — waiting in
+    # the ready handshake would expire every time and stall each open by the
+    # full bound. A compositor that never frames costs the bound once here and
+    # only lowers the log's confidence.
+    announcement = read_until(_helper.stdout, time.monotonic() + PRESENT_TIMEOUT)
+    if announcement and announcement.get("event") == "presented":
+        logger.info("grid: first frame on screen")
+    else:
+        logger.debug("grid: no presented announcement inside PRESENT_TIMEOUT")
     _grid_open = True
     core.speak(_("Grid"))
     try:
@@ -1038,16 +1091,6 @@ def _start_helper():
         logger.warning("grid: the ready event carried no usable geometry")
         stop_helper("bad geometry")
         return None
-    # Consume the `presented` announcement so the protocol's promise is kept:
-    # the helper says when its first real frame reached the glass, and the log
-    # is where that answer lands. A compositor that never frames (or a helper
-    # that died between ready and draw) must not stall the session open, so a
-    # missing announcement only lowers the log's confidence.
-    announcement = read_until(_helper.stdout, time.monotonic() + PRESENT_TIMEOUT)
-    if announcement and announcement.get("event") == "presented":
-        logger.info("grid: first frame on screen")
-    else:
-        logger.debug("grid: no presented announcement inside PRESENT_TIMEOUT")
     return tuple(monitor)
 
 

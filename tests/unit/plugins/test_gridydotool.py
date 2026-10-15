@@ -111,8 +111,10 @@ def _fresh_client_state(monkeypatch):
     monkeypatch.setattr(g, "_bounds", None)
     monkeypatch.setattr(g, "_last_bounds", None)
     monkeypatch.setattr(g, "_grid_python", None)
+    monkeypatch.setattr(g, "_grid_python_override", None)
     monkeypatch.setattr(g, "_grid_python_found", False)
     monkeypatch.setattr(g, "_socket_last_good", None)
+    monkeypatch.setattr(g, "_socket_last_good_env", None)
 
 
 class TestZoneMath:
@@ -462,7 +464,10 @@ class TestSocketDiscovery:
         monkeypatch.setenv("YDOTOOL_SOCKET", "/tmp/.ydotool_socket")
         foreign_mode = 0o140600  # S_IFSOCK | 0600, without importing stat
         foreign = Mock(st_mode=foreign_mode, st_uid=os.getuid() + 1)
-        monkeypatch.setattr(g.os, "stat", lambda _path, **_kwargs: foreign)
+        # Patch the method, not the os module attribute: Path().stat() binds
+        # through the os module differently across the supported Pythons, and
+        # the method patch behaves the same on every one of them.
+        monkeypatch.setattr(Path, "stat", lambda self, **_kwargs: foreign)
         asked = []
         monkeypatch.setattr(
             g, "_socket_accepts", lambda path: asked.append(path) or True
@@ -471,29 +476,42 @@ class TestSocketDiscovery:
         assert asked == []
 
     def test_the_last_good_socket_is_probed_first(self, monkeypatch):
-        """protects: the path that answered last time is re-validated first, so
-        the steady state costs one connect instead of the full four-path,
-        two-socket-type fan-out per injection — while a stale cache still
-        falls through to the full rediscovery.
+        """protects: the path that answered last time is re-validated before
+        the priority order is walked, so the steady state costs one connect
+        instead of the full four-path, two-socket-type fan-out per injection.
         fails_when: the cache short-circuits without re-validating (a stopped
-        daemon would stay "good"), or the fan-out is skipped when the cached
-        path dies.
+        daemon would stay "good"), or there is no cache at all (the second call
+        would walk the priority order from the top again — the shape this test
+        distinguishes by caching a NON-first candidate).
         no_claim: does not claim which path a real daemon binds; every probe
         answer is stubbed.
         seam: none
         """
         asked = []
         monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
-        monkeypatch.setenv("YDOTOOL_SOCKET", "/first")
+        monkeypatch.delenv("YDOTOOL_SOCKET", raising=False)
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/xdg")
+        order = [
+            "/xdg/.ydotool_socket",
+            f"/run/user/{os.getuid()}/.ydotool_socket",
+            "/tmp/.ydotool_socket",
+        ]
+        monkeypatch.setattr(g, "ydotool_socket_candidates", lambda: list(order))
+        # First call: the highest-priority candidate is dead, the second one
+        # answers — and becomes the cache.
         monkeypatch.setattr(
-            g, "_socket_accepts", lambda path: asked.append(path) or path == "/first"
+            g, "_socket_accepts", lambda path: asked.append(path) or path == order[1]
         )
-        assert g.injector_socket() == "/first"
-        assert g._socket_last_good == "/first"
-        assert asked == ["/first"]
+        assert g.injector_socket() == order[1]
+        assert asked == [order[0], order[1]]
 
-        assert g.injector_socket() == "/first"
-        assert asked == ["/first", "/first"]
+        # Second call: the cached candidate is probed FIRST — before the dead
+        # higher-priority head of the list. A no-cache implementation would
+        # walk the order from the top again and append order[0] here.
+        asked.clear()
+        assert g.injector_socket() == order[1]
+        assert asked == [order[1]]
+        assert g._socket_last_good == order[1]
 
     def test_repeated_paths_are_collapsed(self, monkeypatch):
         uid = os.getuid()
@@ -1579,16 +1597,18 @@ class TestHelperLifecycle:
 
     def _ready_script(self):
         """A helper that stays up for the session, like the real one does: it
-        announces `presented` once (the first frame is on the glass the moment
-        the fake surface maps) and then reads stdin until EOF, so the loop-top
-        liveness check sees it alive and the teardown paths are what end it."""
+        announces `presented` only once the first `show` has been drawn — not
+        at ready, because the real helper cannot know the frame reached the
+        glass before it has bounds — and then serves stdin until EOF, so the
+        loop-top liveness check sees it alive and the teardown paths are what
+        end it."""
         return (
             "import json, sys\n"
             "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 900, 600]}),"
             " flush=True)\n"
-            "print(json.dumps({'event': 'presented'}), flush=True)\n"
-            "for _ in sys.stdin:\n"
-            "    pass\n"
+            "for line in sys.stdin:\n"
+            "    if 'show' in line:\n"
+            "        print(json.dumps({'event': 'presented'}), flush=True)\n"
         )
 
     def test_a_real_session_that_ends_on_idle_still_closes(self, core, fake_helper):
