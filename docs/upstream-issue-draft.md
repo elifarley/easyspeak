@@ -89,7 +89,8 @@ A drop-in plugin is one directory and the loader picks it up
 
 1. `pyproject.toml`'s `[tool.setuptools] packages` list;
 2. two assertions in `tests/unit/core/test_main.py` — the exact roster set and
-   `names[:2] == ["headtrack", "mousegrid"]`;
+   `names[:3] == ["gridydotool", "headtrack", "mousegrid"]` (this draft
+   predated the plugin, whose insertion into the roster is the example);
 3. four complete `.po` catalogs (`src/plugins/<name>/locale/{de,es,fr,it}/…`):
    the completeness test forbids empty or fuzzy entries, and CI fails on any
    `*.po` diff `just translations` would produce;
