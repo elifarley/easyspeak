@@ -6,6 +6,7 @@ import ctypes.util
 import importlib.util
 import io
 import json
+import os
 import sys
 import time
 import types
@@ -30,6 +31,64 @@ UBUNTU_HELP = (
 )
 UBUNTU_VERBS = {"type", "recorder", "mousemove", "key", "click"}
 
+# What Ubuntu 26.04's ydotool 1.0.4 prints for `ydotool help`, read off that VM:
+# the same five verbs plus `debug` and `bakers`, and a trailing sentence *after*
+# the list that is not a verb. Only the indented lines are commands.
+RESOLUTE_HELP = (
+    "Usage: ydotool <cmd> <args>\n"
+    "Available commands:\n"
+    "  click\n"
+    "  mousemove\n"
+    "  type\n"
+    "  key\n"
+    "  debug\n"
+    "  bakers\n"
+    "Use environment variable YDOTOOL_SOCKET to specify daemon socket.\n"
+)
+RESOLUTE_VERBS = {"click", "mousemove", "type", "key", "debug", "bakers"}
+
+# The two dialects answer *this* question about themselves differently, which is
+# how the seam picks one: 1.0.4's move verb names `--absolute` in its own usage
+# line, 0.1.8's (whose move takes the position as positionals) does not.
+MODERN_MOVE_HELP = (
+    "Usage: mousemove [OPTION]... [-x <xpos> -y <ypos>] [-- <xpos> <ypos>]\n"
+    "Move mouse pointer or wheel.\n"
+    "\n"
+    "Options:\n"
+    "  -w, --wheel                Move mouse wheel relatively\n"
+    "  -a, --absolute             Use absolute position, not applicable to wheel\n"
+    "  -x, --xpos                 X position\n"
+    "  -y, --ypos                 Y position\n"
+    "  -h, --help                 Display this help and exit\n"
+)
+LEGACY_MOVE_HELP = (
+    "Usage: mousemove [OPTION]... <x> <y>\n"
+    "Options:\n"
+    "  -h, --help                 Display this help and exit\n"
+)
+
+
+def _help_result(text=UBUNTU_HELP):
+    """What `ydotool help` returns on Ubuntu: the list on stderr, exit 1."""
+    return Mock(returncode=1, stdout="", stderr=text)
+
+
+def _modern_help_result():
+    """What 1.0.4's `ydotool help` returns: the list on stdout, exit 0."""
+    return Mock(returncode=0, stdout=RESOLUTE_HELP, stderr="")
+
+
+def _modern_client(cmd, timeout):
+    """One 1.0.4 binary answering both questions the seam asks of it.
+
+    The tool list and the move verb's own help come from the same client, so a
+    stub that answers only one of them would let a test pass on a dialect the
+    real binary never reports.
+    """
+    if cmd[1] == "help":
+        return _modern_help_result()
+    return Mock(returncode=0, stdout=MODERN_MOVE_HELP, stderr="")
+
 
 @pytest.fixture(autouse=True)
 def _reap_leaked_helper():
@@ -37,6 +96,13 @@ def _reap_leaked_helper():
     yield
     if g._helper is not None:
         g.stop_helper("test cleanup")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_client_state(monkeypatch):
+    """The dialect is cached module state; every test resolves its own."""
+    monkeypatch.setattr(g, "_dialect", None)
+    monkeypatch.setattr(g, "_monitor_origin", (0, 0))
 
 
 class TestZoneMath:
@@ -194,6 +260,59 @@ class TestOutcomeClassification:
         monkeypatch.setattr(g, "_spawn", lambda *a, **k: self._result(7))
         assert g._run_bounded(["ydotool", "click", "1", "--delay", "0"]) == "errored"
 
+    def test_a_rejected_argv_that_exits_zero_is_errored(self, monkeypatch, caplog):
+        """1.0.4's measured answer to 0.1.8's argv: `click 1 --delay 0` prints
+        `click: unrecognized option '--delay'` on stderr, emits **nothing**, and
+        still exits 0. Reading the exit code alone would call that an emission,
+        and the seam's `ran` is the only positive signal the plugin has — so a
+        rejected argv is classified as the refusal it is."""
+        monkeypatch.setattr(
+            g,
+            "_spawn",
+            lambda *a, **k: self._result(
+                0, stderr="click: unrecognized option '--delay'\n"
+            ),
+        )
+        with caplog.at_level("WARNING"):
+            assert (
+                g._run_bounded(["ydotool", "click", "1", "--delay", "0"]) == "errored"
+            )
+        assert any("refused" in r.message for r in caplog.records)
+
+    def test_the_measured_modern_move_abort_is_errored(self, monkeypatch):
+        """The same argv on `mousemove` does not even exit cleanly: 1.0.4 aborts
+        with the option error plus `*** stack smashing detected ***` (134)."""
+        monkeypatch.setattr(
+            g,
+            "_spawn",
+            lambda *a, **k: self._result(
+                134,
+                stderr=(
+                    "mousemove: unrecognized option '--delay'\n"
+                    "*** stack smashing detected ***: terminated\n"
+                ),
+            ),
+        )
+        assert g._run_bounded(["ydotool", "mousemove", "0", "0", "--delay", "0"]) == (
+            "errored"
+        )
+
+    def test_the_modern_no_daemon_refusal_is_errored(self, monkeypatch):
+        """1.0.4 without a daemon: nothing is emitted and the client says so —
+        the "failed to" signature this module already treats as a refusal."""
+        monkeypatch.setattr(
+            g,
+            "_spawn",
+            lambda *a, **k: self._result(
+                2,
+                stderr=(
+                    "failed to connect socket `/run/user/1000/.ydotool_socket': "
+                    "No such file or directory\nPlease check if ydotoold is running.\n"
+                ),
+            ),
+        )
+        assert g._run_bounded(["ydotool", "click", "0xC0"]) == "errored"
+
     def test_dry_run_records_without_spawning(self, monkeypatch):
         spawn = Mock()
         monkeypatch.setattr(g, "_spawn", spawn)
@@ -202,12 +321,156 @@ class TestOutcomeClassification:
         spawn.assert_not_called()
 
 
+class TestDialect:
+    """The argv dialect is read from the binary, never assumed from a version.
+
+    0.1.8 and 1.0.x disagree about every part of the injection argv — delay flag,
+    position handling, button spelling — and the wrong one is not a style
+    problem: 1.0.4 rejects `--delay` (aborting on `move`), reads positional
+    coordinates as *relative*, and emits nothing for a bare button selector.
+    """
+
+    def test_the_modern_move_help_selects_the_modern_dialect(self, monkeypatch):
+        monkeypatch.setattr(
+            g,
+            "_spawn",
+            lambda cmd, timeout: Mock(returncode=0, stdout=MODERN_MOVE_HELP, stderr=""),
+        )
+        assert g._probe_dialect() == g.YDTOOL_DIALECT_MODERN
+
+    def test_a_help_without_the_absolute_option_is_the_legacy_dialect(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            g,
+            "_spawn",
+            lambda cmd, timeout: Mock(returncode=1, stdout=LEGACY_MOVE_HELP, stderr=""),
+        )
+        assert g._probe_dialect() == g.YDTOOL_DIALECT_LEGACY
+
+    def test_a_help_that_cannot_answer_keeps_the_legacy_dialect(self, monkeypatch):
+        """An unreadable help is not evidence of the modern argv: the legacy one
+        is what this plugin shipped first, and the functional probe still has to
+        report `ran` before the gate opens."""
+        import subprocess
+
+        def boom(cmd, timeout):
+            raise subprocess.TimeoutExpired(cmd="ydotool", timeout=5.0)
+
+        monkeypatch.setattr(g, "_spawn", boom)
+        assert g._probe_dialect() == g.YDTOOL_DIALECT_LEGACY
+
+    def test_a_missing_binary_keeps_the_legacy_dialect(self, monkeypatch):
+        monkeypatch.setattr(g, "_spawn", Mock(side_effect=FileNotFoundError("ydotool")))
+        assert g._probe_dialect() == g.YDTOOL_DIALECT_LEGACY
+
+    def test_the_dialect_is_resolved_once(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            g,
+            "_probe_dialect",
+            lambda: calls.append(1) or g.YDTOOL_DIALECT_MODERN,
+        )
+        assert g.dialect() == g.YDTOOL_DIALECT_MODERN
+        assert g.dialect() == g.YDTOOL_DIALECT_MODERN
+        assert calls == [1]
+
+    def test_the_noop_is_built_in_the_dialect(self, monkeypatch):
+        monkeypatch.setattr(g, "_dialect", g.YDTOOL_DIALECT_LEGACY)
+        assert g.noop_argv() == ("ydotool", "type", "", "--delay", "0")
+        monkeypatch.setattr(g, "_dialect", g.YDTOOL_DIALECT_MODERN)
+        assert g.noop_argv() == ("ydotool", "type", "")
+
+
+class TestSocketDiscovery:
+    """The daemon's socket path is build-dependent and not always the session's.
+
+    1.0.x defaults to `$XDG_RUNTIME_DIR/.ydotool_socket`; 0.1.8 hardcoded
+    `/tmp/.ydotool_socket`; the client's own `YDOTOOL_SOCKET` override wins. A
+    session that repoints `XDG_RUNTIME_DIR` — a nested compositor, this repo's own
+    harness — must still find the daemon that is running for this user, or every
+    injection on 1.0.x silently becomes a refusal.
+    """
+
+    def test_the_override_wins_and_the_login_session_is_always_considered(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("YDOTOOL_SOCKET", "/somewhere/else")
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/repointed")
+        assert g.ydotool_socket_candidates() == [
+            "/somewhere/else",
+            "/repointed/.ydotool_socket",
+            f"/run/user/{os.getuid()}/.ydotool_socket",
+            "/tmp/.ydotool_socket",
+        ]
+
+    def test_a_missing_runtime_dir_still_names_the_login_session(self, monkeypatch):
+        monkeypatch.delenv("YDOTOOL_SOCKET", raising=False)
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+        assert g.ydotool_socket_candidates() == [
+            f"/run/user/{os.getuid()}/.ydotool_socket",
+            "/tmp/.ydotool_socket",
+        ]
+
+    def test_repeated_paths_are_collapsed(self, monkeypatch):
+        uid = os.getuid()
+        monkeypatch.setenv("YDOTOOL_SOCKET", f"/run/user/{uid}/.ydotool_socket")
+        monkeypatch.setenv("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+        assert g.ydotool_socket_candidates() == [
+            f"/run/user/{uid}/.ydotool_socket",
+            "/tmp/.ydotool_socket",
+        ]
+
+    def test_the_first_socket_that_answers_is_the_one_used(self, monkeypatch):
+        monkeypatch.setattr(
+            g, "ydotool_socket_candidates", lambda: ["/dead", "/alive", "/tmp/.x"]
+        )
+        monkeypatch.setattr(g, "_socket_accepts", lambda path: path == "/alive")
+        assert g.injector_socket() == "/alive"
+
+    def test_no_answer_is_none_not_a_guess(self, monkeypatch):
+        monkeypatch.setattr(g, "ydotool_socket_candidates", lambda: ["/dead"])
+        monkeypatch.setattr(g, "_socket_accepts", lambda path: False)
+        assert g.injector_socket() is None
+
+
+class TestClientEnv:
+    """A spawned client is told which socket to use, when one answers."""
+
+    def test_a_found_socket_is_exported_to_the_client(self, monkeypatch):
+        monkeypatch.setattr(g, "injector_socket", lambda: "/alive.sock")
+        env = g._client_env()
+        assert env["YDOTOOL_SOCKET"] == "/alive.sock"
+        assert env["PATH"] == os.environ["PATH"]
+
+    def test_with_no_socket_the_environment_is_inherited(self, monkeypatch):
+        monkeypatch.setattr(g, "injector_socket", lambda: None)
+        assert g._client_env() is None
+
+    def test_the_spawn_is_the_thing_that_carries_it(self, monkeypatch):
+        """`_spawn` is the only place a client starts, so it is the only place
+        that needs to know: `_run_bounded` and the probe stay unchanged."""
+        monkeypatch.setattr(g, "injector_socket", lambda: "/alive.sock")
+        seen = {}
+        monkeypatch.setattr(
+            g.subprocess,
+            "run",
+            lambda cmd, **kwargs: (
+                seen.update(cmd=cmd, **kwargs)
+                or Mock(returncode=0, stdout="", stderr="")
+            ),
+        )
+        g._run_bounded(["ydotool", "click", "0xC0"])
+        assert seen["env"]["YDOTOOL_SOCKET"] == "/alive.sock"
+
+
 class TestAdapterArgv:
     def test_move_applies_the_monitor_origin(self, monkeypatch):
         seen = []
         monkeypatch.setattr(
             g, "_run_bounded", lambda args, **k: seen.append(args) or "ran"
         )
+        monkeypatch.setattr(g, "_dialect", g.YDTOOL_DIALECT_LEGACY)
         g._monitor_origin = (1920, 0)
         g.move_to(1351, 280)
         assert seen == [["ydotool", "mousemove", "3271", "280", "--delay", "0"]]
@@ -217,6 +480,7 @@ class TestAdapterArgv:
         monkeypatch.setattr(
             g, "_run_bounded", lambda args, **k: seen.append(args) or "ran"
         )
+        monkeypatch.setattr(g, "_dialect", g.YDTOOL_DIALECT_LEGACY)
         g.click("click")
         g.click("right")
         g.click("middle")
@@ -226,11 +490,45 @@ class TestAdapterArgv:
             ["ydotool", "click", "3", "--delay", "0"],
         ]
 
+    def test_the_modern_move_is_absolute_and_positional_is_not_used(self, monkeypatch):
+        """1.0.x reads `-x`/`-y` as a *relative* delta unless `--absolute` is
+        given, so the flag is the difference between "the cell's centre" and
+        "somewhere off the current pointer"."""
+        seen = []
+        monkeypatch.setattr(
+            g, "_run_bounded", lambda args, **k: seen.append(args) or "ran"
+        )
+        monkeypatch.setattr(g, "_dialect", g.YDTOOL_DIALECT_MODERN)
+        g._monitor_origin = (1920, 0)
+        g.move_to(1351, 280)
+        assert seen == [
+            ["ydotool", "mousemove", "--absolute", "-x", "3271", "-y", "280"]
+        ]
+
+    def test_the_modern_buttons_are_selector_plus_mask(self, monkeypatch):
+        """Measured against a GTK window in the VM: `0xC0` arrives as button 1,
+        `0xC1` as 3 (right) and `0xC2` as 2 (middle), where 0.1.8's own
+        `click 1` emits nothing at all on 1.0.x — it is a bare selector."""
+        seen = []
+        monkeypatch.setattr(
+            g, "_run_bounded", lambda args, **k: seen.append(args) or "ran"
+        )
+        monkeypatch.setattr(g, "_dialect", g.YDTOOL_DIALECT_MODERN)
+        g.click("click")
+        g.click("right")
+        g.click("middle")
+        assert seen == [
+            ["ydotool", "click", "0xC0"],
+            ["ydotool", "click", "0xC1"],
+            ["ydotool", "click", "0xC2"],
+        ]
+
     def test_double_click_is_two_calls_in_order(self, monkeypatch):
         seen = []
         monkeypatch.setattr(
             g, "_run_bounded", lambda args, **k: seen.append(args) or "ran"
         )
+        monkeypatch.setattr(g, "_dialect", g.YDTOOL_DIALECT_LEGACY)
         g.double_click()
         assert [a[2] for a in seen] == ["1", "1"]
 
@@ -247,7 +545,7 @@ class TestAdapterArgv:
             lambda cmd, timeout: Mock(returncode=1, stdout="", stderr=UBUNTU_HELP),
         )
         monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
-        monkeypatch.setattr(g, "_socket_accepts", lambda: False)
+        monkeypatch.setattr(g, "_socket_accepts", lambda path=None: False)
         g._monitor_origin = (0, 0)
         g.move_to(10, 20)
         g.click("right")
@@ -262,6 +560,32 @@ class TestAdapterArgv:
         ]
         assert all(argv[1] in UBUNTU_VERBS for argv in seen)
 
+    def test_the_modern_argv_stays_inside_the_modern_verb_list(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(
+            g, "_run_bounded", lambda args, **k: seen.append(list(args)) or "ran"
+        )
+        monkeypatch.setattr(
+            g, "injector_socket", lambda: "/run/user/1000/.ydotool_socket"
+        )
+        monkeypatch.setattr(g, "_spawn", _modern_client)
+        monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
+        g.move_to(10, 20)
+        g.click("right")
+        g.double_click()
+        assert g._probe_injector() is True
+        assert [argv[1] for argv in seen] == [
+            "mousemove",
+            "click",
+            "click",
+            "click",
+            "type",
+        ]
+        assert all(argv[1] in RESOLUTE_VERBS for argv in seen)
+        # No `--delay` anywhere: 1.0.x has no such option, and passing it turns
+        # the move into an abort and the click into a silently rejected argv.
+        assert all("--delay" not in argv for argv in seen)
+
 
 class TestToolListParsing:
     """Capability is read from the binary's own list, never assumed: Ubuntu's
@@ -270,6 +594,11 @@ class TestToolListParsing:
 
     def test_reads_the_five_verbs_the_vm_showed(self):
         assert g.parse_tool_list(UBUNTU_HELP) == UBUNTU_VERBS
+
+    def test_reads_the_seven_verbs_the_2604_vm_shows(self):
+        """1.0.4 adds `debug` and `bakers`, and closes its help with a sentence
+        *after* the list that is not a command — only the indented lines are."""
+        assert g.parse_tool_list(RESOLUTE_HELP) == RESOLUTE_VERBS
 
     def test_an_answer_without_the_header_yields_nothing(self):
         assert (
@@ -281,6 +610,10 @@ class TestToolListParsing:
             "Usage: ydotool <cmd> <args>\nAvailable commands:\n  mousemove\n\n  click\n"
         )
         assert g.parse_tool_list(text) == {"mousemove", "click"}
+
+    def test_a_trailing_sentence_is_not_a_verb(self):
+        text = "Available commands:\n  click\nUse YDOTOOL_SOCKET to pick a daemon.\n"
+        assert g.parse_tool_list(text) == {"click"}
 
     def test_the_probe_reads_the_list_from_stderr(self, monkeypatch):
         monkeypatch.setattr(
@@ -328,17 +661,48 @@ class TestGate:
         stub.connect.side_effect = OSError("connection refused")
         monkeypatch.setattr(g.socket, "socket", Mock(return_value=stub))
         assert g._socket_accepts() is False
-        stub.close.assert_called_once()
+        assert stub.close.call_count == len(g.YDTOOL_SOCKET_TYPES)
 
     def test_socket_check_reports_the_daemon_mode(self, monkeypatch):
         monkeypatch.setattr(g.socket, "socket", Mock(return_value=Mock()))
         assert g._socket_accepts() is True
 
+    def test_a_wrong_socket_type_is_not_the_same_as_no_daemon(self, monkeypatch):
+        """The 26.04 shape, measured in the VM: 1.0.4's ydotoold listens on a
+        datagram socket, so a stream connect fails with EPROTOTYPE ("Protocol
+        wrong type for socket") — and a probe that stops there reports "no
+        daemon" for a daemon that is running and answering clients."""
+        asked = []
+
+        def make(kind, stype):
+            asked.append(stype)
+            stub = Mock()
+            if stype == g.socket.SOCK_STREAM:
+                stub.connect.side_effect = OSError(91, "Protocol wrong type for socket")
+            return stub
+
+        monkeypatch.setattr(g.socket, "socket", make)
+        assert g._socket_accepts("/run/user/1000/.ydotool_socket") is True
+        assert asked == [g.socket.SOCK_STREAM, g.socket.SOCK_DGRAM]
+
+    def test_a_socket_that_refuses_both_types_is_not_a_daemon(self, monkeypatch):
+        asked = []
+
+        def make(kind, stype):
+            asked.append(stype)
+            stub = Mock()
+            stub.connect.side_effect = OSError(111, "Connection refused")
+            return stub
+
+        monkeypatch.setattr(g.socket, "socket", make)
+        assert g._socket_accepts("/tmp/.ydotool_socket") is False
+        assert asked == [g.socket.SOCK_STREAM, g.socket.SOCK_DGRAM]
+
     def test_injector_probe_is_portable_and_daemonless(self, monkeypatch, caplog):
-        """The VM shape: Ubuntu's five verbs, no ydotoold, a no-op that reports
-        `ran` — the socket is a logged mode, not a gate condition."""
+        """The 0.1.8 shape: Ubuntu's five verbs, no ydotoold, a no-op that reports
+        `ran` — there the socket is a logged mode, not a gate condition."""
         monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
-        monkeypatch.setattr(g, "_socket_accepts", lambda: False)
+        monkeypatch.setattr(g, "_socket_accepts", lambda path=None: False)
         monkeypatch.setattr(g, "_spawn", lambda cmd, timeout: self._help_result())
         seen = []
         monkeypatch.setattr(
@@ -353,11 +717,50 @@ class TestGate:
         self, monkeypatch, caplog
     ):
         monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
-        monkeypatch.setattr(g, "_socket_accepts", lambda: True)
+        monkeypatch.setattr(
+            g, "ydotool_socket_candidates", lambda: ["/run/user/1000/.ydotool_socket"]
+        )
+        monkeypatch.setattr(g, "_socket_accepts", lambda path=None: True)
         monkeypatch.setattr(g, "_spawn", lambda cmd, timeout: self._help_result())
         monkeypatch.setattr(g, "_run_bounded", lambda args, **k: "ran")
         with caplog.at_level("INFO"):
             assert g._probe_injector() is True
+        assert any("use the daemon" in r.message for r in caplog.records)
+        assert any(
+            "/run/user/1000/.ydotool_socket" in r.message for r in caplog.records
+        )
+
+    def test_the_modern_probe_fails_closed_without_a_socket(self, monkeypatch, caplog):
+        """1.0.4 has no per-invocation fallback: with no socket it exits 2 and
+        emits nothing, so "no daemon" is "no injector" and the words must stay
+        with `mousegrid`. The no-op is not even attempted — there is nothing it
+        could prove."""
+        monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(g, "_socket_accepts", lambda path=None: False)
+        monkeypatch.setattr(g, "_spawn", _modern_client)
+        monkeypatch.setattr(g, "_run_bounded", Mock(side_effect=AssertionError))
+        with caplog.at_level("INFO"):
+            assert g._probe_injector() is False
+        assert any("no injector here" in r.message for r in caplog.records)
+
+    def test_the_modern_probe_passes_with_a_socket_and_a_clean_noop(
+        self, monkeypatch, caplog
+    ):
+        """The 26.04 shape: 1.0.4's own verb list, a daemon answering, and the
+        modern no-op (`type ""`, no `--delay` to be rejected) reporting `ran`."""
+        monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(
+            g, "ydotool_socket_candidates", lambda: ["/run/user/1000/.ydotool_socket"]
+        )
+        monkeypatch.setattr(g, "_socket_accepts", lambda path=None: True)
+        monkeypatch.setattr(g, "_spawn", _modern_client)
+        seen = []
+        monkeypatch.setattr(
+            g, "_run_bounded", lambda args, **k: seen.append(list(args)) or "ran"
+        )
+        with caplog.at_level("INFO"):
+            assert g._probe_injector() is True
+        assert seen == [["ydotool", "type", ""]]
         assert any("use the daemon" in r.message for r in caplog.records)
 
     def test_injector_probe_fails_closed_without_a_verb_it_builds(self, monkeypatch):

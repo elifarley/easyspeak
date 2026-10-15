@@ -143,15 +143,56 @@ def parse_number_sequence(text):
 PROBE_TIMEOUT = 5.0
 INJECT_TIMEOUT = 2.0
 REAP_GRACE = 2.0
-YDTOOL_SOCKET = "/tmp/.ydotool_socket"  # noqa: S108 -- ydotoold's hardcoded path
-ERROR_SIGNATURES = ("error:", "Which coordinate", "Unknown tool", "failed to")
+YDTOOL_SOCKET = "/tmp/.ydotool_socket"  # noqa: S108 -- 0.1.8's hardcoded path
+YDTOOL_SOCKET_NAME = ".ydotool_socket"  # 1.0.x defaults to $XDG_RUNTIME_DIR/that
+# What the two daemons speak: 0.1.8's ydotoold listens on a stream socket, 1.0.x's
+# on a datagram one. Connecting with the wrong type answers EPROTOTYPE rather
+# than ECONNREFUSED, which would read as "no daemon" on a host that runs one.
+YDTOOL_SOCKET_TYPES = (socket.SOCK_STREAM, socket.SOCK_DGRAM)
+# `unrecognized option` is in here because a rejected argv is not an emission:
+# 1.0.x's client prints `click: unrecognized option '--delay'` and still exits 0,
+# which would otherwise be read as `ran` by a seam that trusts the exit code.
+# `mousemove` with the same argv aborts instead (SIGABRT after the same line).
+ERROR_SIGNATURES = (
+    "error:",
+    "Which coordinate",
+    "Unknown tool",
+    "failed to",
+    "unrecognized option",
+)
 FALLBACK_NOTICE = "backend unavailable"
 # The verbs the plugin's argv is allowed to use, read off the binary's own list:
 # `mousemove` and `click` are the injections, and `type` is the probe's no-op.
-# Ubuntu's 0.1.8 build offers exactly {type, recorder, mousemove, key, click} —
-# no `mousemove_relative` — so a hard-coded verb gates the plugin off there.
+# Ubuntu 25.10's 0.1.8 build offers exactly {type, recorder, mousemove, key,
+# click} — no `mousemove_relative` — so a hard-coded verb gates the plugin off
+# there; 26.04's 1.0.4 adds debug and bakers to the same five.
 YDTOOL_VERBS = ("mousemove", "click", "type")
-YDTOOL_NOOP = ("ydotool", "type", "", "--delay", "0")
+
+# The two argv dialects ydotool has shipped, and how each one is recognised.
+#
+# 0.1.8 (Ubuntu 25.10) reads the position as positional arguments and has its
+# own `--delay` flag: `mousemove 100 200 --delay 0`, `click 1` (1 = left, 2 =
+# right, 3 = middle). With no daemon answering it builds a device for that one
+# invocation and says so on stderr — a measured working path, hence a mode.
+#
+# 1.0.x (Ubuntu 26.04) dropped `--delay`, made the position explicit options
+# (`mousemove --absolute -x 100 -y 200`, where `-x`/`-y` alone are *relative*),
+# and spells buttons as hex selectors plus press/release mask bits: `0xC0` is a
+# left click, `0xC1` right, `0xC2` middle, and `click 1` — 0.1.8's left click —
+# is a right *selector* with no mask, which emits nothing at all. It also
+# removed the per-invocation fallback: with no daemon socket the client exits 2
+# with "failed to connect socket" and injects nothing, so on that dialect the
+# daemon is a capability, not a mode.
+#
+# The dialect is read from the binary: 1.0.x's own `mousemove --help` names
+# `--absolute`, and 0.1.8's offers no such option. Anything else — an unreadable
+# help, a build this plugin has never met — keeps the legacy argv, which is the
+# argv this plugin shipped first.
+YDTOOL_DIALECT_MODERN = "modern"
+YDTOOL_DIALECT_LEGACY = "legacy"
+YDTOOL_ABSOLUTE_FLAG = "--absolute"
+YDTOOL_NOOP_LEGACY = ("ydotool", "type", "", "--delay", "0")
+YDTOOL_NOOP_MODERN = ("ydotool", "type", "")
 
 _core = None
 _active = False
@@ -161,6 +202,7 @@ _monitor_origin = (0, 0)
 _grid_open = False
 _last_bounds = None
 _helper = None
+_dialect = None
 
 
 def active():
@@ -168,10 +210,99 @@ def active():
     return _active
 
 
+def _probe_dialect():
+    """Read the installed client's argv dialect from the client itself.
+
+    `ydotool mousemove --help` is the binary's own answer about the move verb:
+    1.0.x's usage line names `--absolute`, 0.1.8's has no such option. A build
+    that cannot answer at all keeps the legacy argv rather than guessing at the
+    modern one — the legacy argv is what this plugin shipped first, and the
+    functional half of the gate still has to report `ran` before the gate opens.
+    """
+    try:
+        result = _spawn(["ydotool", "mousemove", "--help"], PROBE_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.info("grid: `ydotool mousemove --help` did not answer: %s", exc)
+        return YDTOOL_DIALECT_LEGACY
+    if YDTOOL_ABSOLUTE_FLAG in result.stdout + result.stderr:
+        return YDTOOL_DIALECT_MODERN
+    return YDTOOL_DIALECT_LEGACY
+
+
+def dialect():
+    """Return the installed client's argv dialect, resolved once, on demand.
+
+    On demand rather than in `setup()` because the forced-backend path
+    (`EASYSPEAK_GRID_BACKEND=uinput`) short-circuits the probes, and the argv the
+    seam builds still has to match the client that will run it.
+    """
+    global _dialect
+    if _dialect is None:
+        _dialect = _probe_dialect()
+    return _dialect
+
+
+def ydotool_socket_candidates():
+    """Return the paths a ydotool client may find its daemon on, best first.
+
+    `YDOTOOL_SOCKET` is the client's own override and wins outright. Past that,
+    the daemon's default path is build-dependent (`$XDG_RUNTIME_DIR/.ydotool_socket`
+    for 1.0.x, `/tmp/.ydotool_socket` for 0.1.8) and `XDG_RUNTIME_DIR` is not
+    always the login session's: the grid runs inside whatever session started the
+    daemon, and a nested compositor or a test harness repoints it. The login
+    session's own `/run/user/<uid>` path is therefore always considered, with the
+    old hardcoded path last so a 0.1.8 daemon is still found.
+    """
+    candidates = []
+    override = os.environ.get("YDOTOOL_SOCKET")
+    if override:
+        candidates.append(override)
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        candidates.append(str(Path(runtime) / YDTOOL_SOCKET_NAME))
+    candidates.append(f"/run/user/{os.getuid()}/{YDTOOL_SOCKET_NAME}")
+    candidates.append(YDTOOL_SOCKET)
+    return list(dict.fromkeys(candidates))
+
+
+def injector_socket():
+    """Return the daemon socket that answers, or None when none does.
+
+    Asked afresh before each use rather than cached: a daemon that stopped is not
+    an injector any more, and one that started is, and the answer is what decides
+    both the gate's mode line and whether the gate opens at all on a client that
+    cannot inject without one.
+    """
+    for candidate in ydotool_socket_candidates():
+        if _socket_accepts(candidate):
+            return candidate
+    return None
+
+
+def _client_env():
+    """The environment a ydotool client needs to reach the injector it must use.
+
+    `None` inherits this process's environment, which is right while no socket
+    answers (0.1.8 then builds its own device, and 1.0.x refuses on its own). When
+    one does answer, the path is exported explicitly, because the client's own
+    discovery is relative to `XDG_RUNTIME_DIR` and this process may be looking at
+    a different one than the daemon's owner.
+    """
+    path = injector_socket()
+    if path is None:
+        return None
+    return {**os.environ, "YDOTOOL_SOCKET": path}
+
+
 def _spawn(cmd, timeout):
     """The only place a ydotool process is started; tests patch this."""
     return subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout, check=False
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+        env=_client_env(),
     )
 
 
@@ -184,6 +315,12 @@ def _run_bounded(args, timeout=INJECT_TIMEOUT):
     therefore reads a zero exit with a clean stderr as `ran`, and still accepts
     the argv-shaped code for a build that forwards Exec's return. The three
     outcomes are what the rest of the module reasons about.
+
+    "Clean stderr" is what makes that reading safe, which is why a rejected argv
+    is an error signature: 1.0.4 answers `click: unrecognized option '--delay'`
+    on stderr, emits nothing, and exits 0, so a seam reading only the code would
+    call a no-op `ran` — and the same argv on `mousemove` dies with SIGABRT (134)
+    instead. `--delay 0` was 0.1.8's flag; see the dialect block above.
 
     `timeout` bounds the process, which is what keeps a wedged ydotool (or
     ydotoold) from freezing the modal loop with the overlay on screen.
@@ -203,10 +340,11 @@ def _run_bounded(args, timeout=INJECT_TIMEOUT):
         logger.warning("ydotool refused: %s", result.stderr.strip())
         return "errored"
     if FALLBACK_NOTICE in result.stderr:
-        # No daemon: the client built a device for this invocation and said so.
-        # The VM measured that path working — the notice names a latency
-        # caveat, not a capability gap — so the invocation still counts, and
-        # this line states which mode was in use.
+        # 0.1.8 with no daemon: the client built a device for this invocation and
+        # said so. The VM measured that path working — the notice names a latency
+        # caveat, not a capability gap — so the invocation still counts, and this
+        # line states which mode was in use. 1.0.x has no such mode, and says so
+        # with "failed to connect socket" instead, which is an error signature.
         logger.info("grid: per-invocation device (ydotoold unavailable)")
     # The argv-shaped code (`["ydotool", "mousemove", "0", "0"]` → 3) is what
     # Exec returns and what a build forwarding it would report; the 0.1.8
@@ -228,35 +366,53 @@ def run_ydotool(args):
 
 
 BUTTONS = {"click": 1, "right": 2, "middle": 3}
+# 1.0.x button codes: the selector nibble picks the button (0x00 left, 0x01
+# right, 0x02 middle) and 0xC0 is both mask bits — press and release — where a
+# bare selector emits nothing at all. Measured in the VM against a GTK window:
+# 0xC0 arrives as button 1, 0xC1 as button 3, 0xC2 as button 2, and 0x01/1 as
+# no event whatsoever.
+MODERN_BUTTONS = {"click": "0xC0", "right": "0xC1", "middle": "0xC2"}
 
 
 def move_to(x, y):
     """Move the pointer to a monitor-local point.
 
-    The move is issued in the global space ydotool works in.
+    The move is issued in the global space ydotool works in, in whichever argv
+    the installed client understands: positional with `--delay 0` on 0.1.8,
+    `--absolute -x/-y` on 1.0.x, where bare `-x`/`-y` would move *relatively*
+    from wherever the pointer happens to be.
     """
+    global_x, global_y = _monitor_origin[0] + x, _monitor_origin[1] + y
+    if dialect() == YDTOOL_DIALECT_MODERN:
+        return run_ydotool(
+            [
+                "ydotool",
+                "mousemove",
+                YDTOOL_ABSOLUTE_FLAG,
+                "-x",
+                str(global_x),
+                "-y",
+                str(global_y),
+            ]
+        )
     return run_ydotool(
-        [
-            "ydotool",
-            "mousemove",
-            str(_monitor_origin[0] + x),
-            str(_monitor_origin[1] + y),
-            "--delay",
-            "0",
-        ]
+        ["ydotool", "mousemove", str(global_x), str(global_y), "--delay", "0"]
     )
 
 
 def click(button="click"):
     """Click a button at the current pointer position."""
+    if dialect() == YDTOOL_DIALECT_MODERN:
+        return run_ydotool(["ydotool", "click", MODERN_BUTTONS[button]])
     return run_ydotool(["ydotool", "click", str(BUTTONS[button]), "--delay", "0"])
 
 
 def double_click():
     """Two sequential left clicks, with no sleeps between them.
 
-    `--delay 0` is what keeps the pair inside the desktop's double-click window:
-    the tool's default 100 ms sleep per invocation would spend most of it.
+    Each click is one invocation, as on 0.1.8: the pair must stay inside the
+    desktop's double-click window, and `--delay 0` — or 1.0.x's argv, which has
+    no delay to spend — is what keeps it there.
     """
     first = click("click")
     second = click("click")
@@ -323,31 +479,42 @@ def _probe_overlay():
 
 
 def _socket_accepts(sock_path=YDTOOL_SOCKET):
-    """True when the ydotoold socket takes a connection.
+    """True when the ydotoold socket at `sock_path` takes a connection.
 
-    No injection, no side effect; the answer only decides which mode the gate
-    logs. The daemon holds an already-recognised device, so injections through
-    it carry no per-invocation latency caveat — which is the whole difference.
+    Both socket types are tried, in this order: 1.0.x's daemon speaks
+    `SOCK_DGRAM` while 0.1.8's speaks `SOCK_STREAM`, and connecting with the
+    other type fails with `EPROTOTYPE` ("Protocol wrong type for socket") — a
+    reading that would say "no daemon" on a box where one is running. On 1.0.x
+    that reading decides whether the gate opens at all, so it has to be a real
+    one. A stale path cannot hide behind the datagram half: the daemon is only
+    trusted once the functional probe has also reported `ran` through it.
+
+    No injection, no side effect. The daemon holds an already-recognised device,
+    so injections through it carry no per-invocation latency caveat — which is
+    the whole difference on 0.1.8, and the only working path on 1.0.x.
     """
-    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        conn.settimeout(PROBE_TIMEOUT)
-        conn.connect(sock_path)
-    except OSError:
-        return False
-    finally:
-        conn.close()
-    return True
+    for sock_type in YDTOOL_SOCKET_TYPES:
+        conn = socket.socket(socket.AF_UNIX, sock_type)
+        try:
+            conn.settimeout(PROBE_TIMEOUT)
+            conn.connect(sock_path)
+        except OSError:
+            continue
+        finally:
+            conn.close()
+        return True
+    return False
 
 
 def parse_tool_list(text):
     """Return the verbs named by a `ydotool help` output.
 
-    The list is the lines after the "Available commands:" header, one verb per
-    line; the usage line before it is not a verb. Capability is read from this
-    list because the verb set is build-dependent: Ubuntu's ydotool 0.1.8 offers
-    `type`, `recorder`, `mousemove`, `key` and `click` — and no
-    `mousemove_relative` at all.
+    The list is the indented lines after the "Available commands:" header, one
+    verb per line; the usage line before it is not a verb, and neither is the
+    trailing sentence 1.0.4 prints after the list ("Use environment variable
+    YDOTOOL_SOCKET ..."). Capability is read from this list because the verb set
+    is build-dependent: Ubuntu 25.10's ydotool 0.1.8 offers `type`, `recorder`,
+    `mousemove`, `key` and `click` — and no `mousemove_relative` at all.
     """
     lines = text.splitlines()
     start = None
@@ -357,7 +524,11 @@ def parse_tool_list(text):
             break
     if start is None:
         return set()
-    return {line.strip() for line in lines[start + 1 :] if line.strip()}
+    return {
+        line.strip()
+        for line in lines[start + 1 :]
+        if line.strip() and line[:1] in (" ", "\t")
+    }
 
 
 def _probe_tools():
@@ -378,19 +549,22 @@ def _probe_tools():
 def _probe_injector():
     """True when ydotool offers the plugin's verbs and a no-op reports `ran`.
 
-    Capability is read from the binary's own tool list, never assumed: Ubuntu's
-    ydotool 0.1.8 has no `mousemove_relative`, so a probe built on that verb
-    could never pass there. The functional half is `type ""` — the only
+    Capability is read from the binary's own tool list, never assumed: Ubuntu
+    25.10's ydotool 0.1.8 has no `mousemove_relative`, so a probe built on that
+    verb could never pass there. The functional half is `type ""` — the only
     side-effect-free verb of the five, where `mousemove 0 0` would move the
-    pointer and `click 0` is a real left click.
+    pointer and `click 0` is a real left click — built in the dialect the same
+    binary reported for itself, so what the probe exercises is exactly the argv
+    the seam will later emit.
 
-    The daemon is not a gate. The VM image had no `ydotoold` installed (Ubuntu's
-    `ydotool` package ships only the client; a daemon comes from a separate
-    package), and ydotool works without one (no-op invocations exit 0 there; the
-    client's own `notice:` calls the fallback a latency caveat), so the socket
-    decides the mode this logs, not whether the plugin activates. The capability
-    half still fails closed: no binary, no verbs, or a probe that does not report
-    `ran` leaves the words to `mousegrid`.
+    The daemon decides on 1.0.x what it only described on 0.1.8. 0.1.8 falls back
+    to a per-invocation uinput device and calls that a latency caveat, so there
+    the socket is the mode this line logs, not a condition. 1.0.x removed the
+    fallback: with no socket it exits 2 with "failed to connect socket" and emits
+    nothing at all, so on that dialect "no daemon answering" means "no injector",
+    and the probe fails closed — the words go back to `mousegrid` rather than a
+    grid that cannot click. Every other half still fails closed the same way: no
+    binary, no verbs, or a probe that does not report `ran`.
     """
     if shutil.which("ydotool") is None:
         logger.info("grid: ydotool is not installed")
@@ -406,21 +580,39 @@ def _probe_injector():
             ", ".join(sorted(tools)) or "nothing",
         )
         return False
-    if _socket_accepts():
+    path = injector_socket()
+    if path is not None:
+        logger.info("grid: ydotoold answers on %s; injections use the daemon", path)
+    elif dialect() == YDTOOL_DIALECT_MODERN:
         logger.info(
-            "grid: ydotoold answers on %s; injections use the daemon", YDTOOL_SOCKET
+            "grid: no ydotoold on any of %s and this ydotool (%s) builds no device "
+            "without one, so there is no injector here",
+            ", ".join(ydotool_socket_candidates()),
+            YDTOOL_DIALECT_MODERN,
         )
+        return False
     else:
         logger.info(
             "grid: no ydotoold on %s; injections build a per-invocation device "
             "(latency caveat, not a capability gap)",
             YDTOOL_SOCKET,
         )
-    outcome = _run_bounded(YDTOOL_NOOP)
+    outcome = _run_bounded(noop_argv())
     if outcome != "ran":
         logger.info("grid: the injector probe reported %s", outcome)
         return False
     return True
+
+
+def noop_argv():
+    """Return the probe's no-op invocation in the installed client's dialect.
+
+    `type ""` types nothing, which is why it is the probe's verb; 0.1.8 spells
+    its delay flag out on the argv and 1.0.x has no such flag at all.
+    """
+    if dialect() == YDTOOL_DIALECT_MODERN:
+        return YDTOOL_NOOP_MODERN
+    return YDTOOL_NOOP_LEGACY
 
 
 def setup(core):

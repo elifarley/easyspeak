@@ -100,23 +100,38 @@ def session(tmp_path, monkeypatch):
     config = tmp_path / "sway.conf"
     config.write_text(SWAY_CONFIG, encoding="utf-8")
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    monkeypatch.setenv("WLR_BACKENDS", "headless")
-    # `WLR_LIBINPUT_NO_DEVICES=1` asks wlroots for a libinput backend with no
-    # devices at all: right for the arms that only look at pixels, whose
-    # session nothing real should be able to perturb, and fatal for the one
-    # arm whose click must be routed through the compositor's seat. So the
-    # flag is set only when the live opt-in is absent; a value inherited from
-    # the caller is dropped for the live arm rather than trusted, so its seat
-    # exists by the harness's own construction.
-    if os.environ.get("EASYSPEAK_GRID_LIVE") == "click":
+    # `WLR_BACKENDS` is a *backend list*, not a mode: with only `headless` in it
+    # wlroots creates no libinput backend at all, and the compositor then has no
+    # seat whatever the kernel holds — `swaymsg -t get_inputs` answers `[]` even
+    # while /proc/bus/input/devices lists a device, and an injected click can
+    # never be routed. That is right for the arms that only look at pixels, whose
+    # session nothing real should be able to perturb, and fatal for the one arm
+    # whose click must reach a window: that arm asks for `libinput` too. wlroots
+    # keeps a libinput backend's devices only inside an *active* session, so the
+    # live arm needs a seat manager (seatd) or an enabled VT behind it; without
+    # one sway exits before binding a socket and the fixture skips, naming that.
+    live = os.environ.get("EASYSPEAK_GRID_LIVE") == "click"
+    monkeypatch.setenv("WLR_BACKENDS", "headless,libinput" if live else "headless")
+    # `WLR_LIBINPUT_NO_DEVICES=1` asks the libinput backend for no devices at all:
+    # the same isolation as above, said once more for the case where a caller's
+    # environment already names that backend. A value inherited from the caller is
+    # dropped for the live arm rather than trusted, so its seat is the harness's
+    # own doing.
+    if live:
         monkeypatch.delenv("WLR_LIBINPUT_NO_DEVICES", raising=False)
     else:
         monkeypatch.setenv("WLR_LIBINPUT_NO_DEVICES", "1")
-    sway = subprocess.Popen(
-        ["sway", "-c", str(config)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    # sway's own words are kept: the one failure that is not the harness's own —
+    # a session that never becomes active, so no socket is bound — is only
+    # legible in them. The child holds its own copy of the descriptor, so closing
+    # this one is safe.
+    log = tmp_path / "sway.log"
+    with log.open("w", encoding="utf-8") as handle:
+        sway = subprocess.Popen(
+            ["sway", "-c", str(config)],
+            stdout=subprocess.DEVNULL,
+            stderr=handle,
+        )
     deadline = time.monotonic() + 10
     display = None
     while time.monotonic() < deadline:
@@ -129,11 +144,27 @@ def session(tmp_path, monkeypatch):
             display = sockets[0]
             break
         if sway.poll() is not None:
-            pytest.skip("sway exited before it bound a socket")
+            # The live arm's session asks for a libinput backend, which wlroots
+            # only keeps inside an active session; a compositor that refuses to
+            # start there is reporting the missing seat rather than a bug in the
+            # harness, so the skip names the prerequisite and carries sway's own
+            # words for it. `seatd` hands a seat to one client at a time, so a
+            # stray compositor left running by an earlier experiment looks the
+            # same way and is named by the same log tail.
+            pytest.skip(
+                "sway exited before it bound a socket (the live arm needs an "
+                "active session for its libinput backend: a running seatd with a "
+                "free seat, or a VT-enabled login session): " + _sway_log_tail(log)
+                if live
+                else "sway exited before it bound a socket: " + _sway_log_tail(log)
+            )
         time.sleep(0.2)
     if display is None:
         sway.terminate()
-        pytest.skip("sway never created a Wayland socket")
+        pytest.skip(
+            "sway never created a Wayland socket (it stayed up without becoming "
+            "active): " + _sway_log_tail(log)
+        )
     monkeypatch.setenv("WAYLAND_DISPLAY", display)
     yield os.environ
     sway.terminate()
@@ -142,6 +173,24 @@ def session(tmp_path, monkeypatch):
 
 def _grim(env, path):
     subprocess.run(["grim", str(path)], env=env, check=False, timeout=10)
+
+
+def _sway_log_tail(log, lines=3):
+    """The last few things sway said, for a skip that would otherwise be bare.
+
+    sway's stderr is captured to a file by the fixture because the one failure
+    that is not the harness's own — a session that never becomes active, so the
+    compositor never binds a socket — is only legible in sway's own words
+    ("failed to add backend 'libinput'", "Timeout waiting session to become
+    active"). Best-effort: an empty or unreadable log answers with a dash rather
+    than raising in the middle of a skip.
+    """
+    try:
+        text = Path(log).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "-"
+    said = [line.strip() for line in text.splitlines() if line.strip()]
+    return " | ".join(said[-lines:]) or "-"
 
 
 def _kernel_input_names():
@@ -162,57 +211,64 @@ def _kernel_input_names():
     ]
 
 
-def _input_report(env):
-    """What input the session had, one line of diagnosis for a lost click.
+def _sway_inputs(env):
+    """What `swaymsg -t get_inputs` lists, or None when it cannot answer.
 
-    The compositor is asked first: `swaymsg -t get_inputs` is its own list, and
-    the one that decides whether an injected click has a route, because with
-    `WLR_LIBINPUT_NO_DEVICES=1` it is empty while `/proc/bus/input/devices`
-    still lists the kernel's devices. That gap is the "no seat" reading this
-    report exists to expose; the kernel list is the named fallback, and both
-    failures are tolerated because this runs to explain a failed assertion and
-    must not raise an error of its own.
-
-    Sway's IPC socket is named inside `XDG_RUNTIME_DIR` but is never exported
-    to us (only sway's own children inherit `SWAYSOCK`), so it is discovered
-    here the same way the session fixture discovers the Wayland socket. The
-    answer is a snapshot: a daemonless ydotool destroys its per-invocation
-    device when its client exits, so "no devices" can also mean "the device
-    came and went", which is why the line names its source rather than
-    judging.
+    The compositor is asked first because its list is the one that decides
+    whether an injected click has a route: with `WLR_BACKENDS=headless` — no
+    libinput backend — it is empty while `/proc/bus/input/devices` still lists
+    the kernel's devices. Sway's IPC socket is named inside `XDG_RUNTIME_DIR` but
+    is never exported to us (only sway's own children inherit `SWAYSOCK`), so it
+    is discovered here the same way the session fixture discovers the Wayland
+    socket. Returns None for every failure — a missing `swaymsg`, no socket, a
+    refused ask, unparsable JSON — because this runs to explain a failed
+    assertion and must not raise one of its own.
     """
     runtime = env.get("XDG_RUNTIME_DIR")
     sockets = sorted(Path(runtime).glob("sway-ipc.*.sock")) if runtime else []
-    ask = None
-    if sockets and shutil.which("swaymsg", path=env.get("PATH")):
-        try:
-            ask = subprocess.run(
-                ["swaymsg", "-t", "get_inputs"],
-                env={**env, "SWAYSOCK": str(sockets[0])},
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=10,
-            )
-        except (OSError, subprocess.SubprocessError):
-            ask = None
-    if ask is not None and ask.returncode == 0:
-        try:
-            devices = [
-                device.get("identifier", "?") for device in json.loads(ask.stdout)
-            ]
-        except (ValueError, AttributeError):
-            devices = None
-        if devices is not None:
-            if devices:
-                return (
-                    f"the compositor sees {len(devices)} input device(s) "
-                    f"({', '.join(devices)}), so the injected click had a seat"
-                )
+    if not sockets or not shutil.which("swaymsg", path=env.get("PATH")):
+        return None
+    try:
+        ask = subprocess.run(
+            ["swaymsg", "-t", "get_inputs"],
+            env={**env, "SWAYSOCK": str(sockets[0])},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if ask.returncode != 0:
+        return None
+    try:
+        return [device.get("identifier", "?") for device in json.loads(ask.stdout)]
+    except (ValueError, AttributeError):
+        return None
+
+
+def _input_report(env):
+    """What input the session had, one line of diagnosis for a lost click.
+
+    The compositor's own answer is the first word, in the identifiers it uses;
+    the kernel list is the named fallback, and both failures are tolerated. The
+    answer is a snapshot taken after the click: on 0.1.8 a daemonless ydotool
+    destroys its per-invocation device when its client exits, so "no devices" can
+    also mean "the device came and went", which is why the line names its source
+    rather than judging. On 1.0.x there is no daemonless mode at all, and the
+    daemon's device is persistent, so there the reading is unambiguous.
+    """
+    devices = _sway_inputs(env)
+    if devices is not None:
+        if devices:
             return (
-                "the compositor sees no input device (swaymsg -t get_inputs "
-                "returned []), so the injected click had no seat"
+                f"the compositor sees {len(devices)} input device(s) "
+                f"({', '.join(devices)}), so the injected click had a seat"
             )
+        return (
+            "the compositor sees no input device (swaymsg -t get_inputs "
+            "returned []), so the injected click had no seat"
+        )
     names = _kernel_input_names()
     if names:
         return (
@@ -246,16 +302,28 @@ class TestGate:
         assert gridydotool.active() is False
         assert gridydotool.handle("grid", core=None) is None
 
-    def test_the_injector_gate_passes_daemonless(self, monkeypatch, caplog):
-        """An Ubuntu box may have no `ydotoold` installed at all (the `ydotool`
-        package ships only the client), and the VM measured the daemonless path
-        working: the socket is a logged mode, not a condition. This runs the
-        real `ydotool help` and `type ""` probe, so it skips where ydotool is
-        absent or /dev/uinput is not reachable."""
+    def test_the_injector_gate_passes_with_an_injector_to_reach(
+        self, monkeypatch, caplog
+    ):
+        """The gate's passing case on a real ydotool: the client's own verb list,
+        the no-op built in the dialect that client reports, and a daemon socket
+        to emit through. This runs the real `ydotool help` and the real no-op, so
+        it skips where ydotool is absent, or where nothing answers a socket.
+
+        The daemon is a precondition here, not a mode: Ubuntu 26.04 ships ydotool
+        1.0.4, whose client has no per-invocation fallback (0.1.8, on 25.10, had
+        one), so with no socket it exits 2 with "failed to connect socket" and
+        emits nothing. The socket is found by the plugin's own resolver, whose
+        candidates include the login session's path even when `XDG_RUNTIME_DIR`
+        has been repointed.
+        """
         if shutil.which("ydotool") is None:
             pytest.skip("ydotool is not installed")
-        if not os.access("/dev/uinput", os.W_OK):
-            pytest.skip("no /dev/uinput access for the daemonless probe")
+        if gridydotool.injector_socket() is None:
+            pytest.skip(
+                "no ydotoold socket answers (Ubuntu packages one as a user unit); "
+                "without a daemon a 1.0.x client has nothing to inject through"
+            )
         monkeypatch.delenv("EASYSPEAK_GRID_BACKEND", raising=False)
         with caplog.at_level("INFO"):
             assert gridydotool._probe_injector() is True
@@ -264,6 +332,28 @@ class TestGate:
         gridydotool.setup(core=None)
         assert gridydotool.active() is True
 
+    def test_the_injector_gate_fails_closed_without_a_socket(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """The other half of the gate against the same binary: pointed at a socket
+        that cannot answer, the real client refuses to emit at all, and a gate
+        that opened here would take the grid words for an injector that cannot
+        inject. 0.1.8 emits without a daemon, so there is nothing to fail closed
+        on there and the case skips by name."""
+        if shutil.which("ydotool") is None:
+            pytest.skip("ydotool is not installed")
+        if gridydotool.dialect() != gridydotool.YDTOOL_DIALECT_MODERN:
+            pytest.skip(
+                "0.1.8's client emits without a daemon; nothing to fail closed on"
+            )
+        dead = tmp_path / ".ydotool_socket"
+        monkeypatch.setattr(
+            gridydotool, "ydotool_socket_candidates", lambda: [str(dead)]
+        )
+        with caplog.at_level("INFO"):
+            assert gridydotool._probe_injector() is False
+        assert any("no injector here" in r.message for r in caplog.records)
+
 
 class TestForcedBackendArm:
     def test_reads_the_geometry_and_records_the_argv(
@@ -271,9 +361,22 @@ class TestForcedBackendArm:
     ):
         """Arm A: the backend is forced, so no daemon is needed, and the overlay
         is observed through the plugin's own log records (its stdout belongs to
-        the plugin, so the harness cannot read that stream itself)."""
+        the plugin, so the harness cannot read that stream itself).
+
+        The argv is spelled out per dialect and the dialect is the one the
+        installed client reports for itself, so on 26.04's ydotool 1.0.4 this
+        pins `--absolute -x/-y` and the `0xC0` left click, and on 0.1.8 the
+        positional move and `click 1`. Both are the *exact* strings the seam
+        emits — a token the client would reject (`--delay`, a bare selector)
+        fails here rather than at the pointer.
+        """
         monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "uinput")
         monkeypatch.setenv("EASYSPEAK_GRID_DRY_RUN", "1")
+        modern = gridydotool.dialect() == gridydotool.YDTOOL_DIALECT_MODERN
+        expected_move = (
+            "mousemove --absolute -x 1386 -y 300" if modern else "mousemove 1386 300"
+        )
+        expected_click = "click 0xC0" if modern else "click 1"
 
         commands = ["grid", "3 7 5", "click"]
 
@@ -296,8 +399,8 @@ class TestForcedBackendArm:
         assert ready, "the helper never reported ready"
         assert "1920" in ready[0].message and "1080" in ready[0].message
         dry = [r for r in caplog.records if "dry run:" in r.message]
-        assert any("mousemove" in r.message for r in dry)
-        assert any("click 1" in r.message for r in dry)
+        assert any(expected_move in r.message for r in dry), [r.message for r in dry]
+        assert any(expected_click in r.message for r in dry), [r.message for r in dry]
         assert gridydotool._helper is None
 
 
@@ -357,6 +460,21 @@ class TestLiveArm:
         _grim(session, after)
         assert before.read_bytes() != after.read_bytes(), "the overlay did not render"
 
+        # The seat is asserted before anything is injected, and separately from
+        # the click it has to route: with no input device in the compositor's own
+        # list there is no route for an injected event to take, so a lost click
+        # would be indistinguishable from a session that could never have
+        # delivered one. `libinput` in `WLR_BACKENDS` inside an active session is
+        # what puts devices here; the failure names that prerequisite instead of
+        # leaving the reader to infer it from an empty press list later.
+        seat = _sway_inputs(session)
+        assert seat, (
+            "the session has no input device, so no injected click can have a "
+            "seat: sway needs its libinput backend (`WLR_BACKENDS="
+            "headless,libinput`) inside an active session — a running seatd or a "
+            "VT-enabled login session"
+        )
+
         # The hide -> show lifecycle: hiding unmaps the surface and showing it
         # again remaps it, the case the helper's per-show region check exists
         # for. The fresh surface must still be click-through, and the injected
@@ -388,14 +506,14 @@ class TestLiveArm:
         out, _ = probe.communicate(timeout=5)
         events = [json.loads(line) for line in (out or "").splitlines()]
         presses = [e for e in events if e["event"] == "press"]
-        # With the probe window proven on screen, an empty press list has two
-        # readings left and this report tells them apart: a compositor that saw
-        # no input device had no seat to route the click through, while one
-        # that saw a device means the click had a real route and was swallowed
-        # before the probe observed it - the reading that points at the
-        # overlay's input region. The report names its source, because a
-        # daemonless ydotool destroys its per-invocation device when its client
-        # exits and the snapshot can then read as empty for that reason too.
+        # With the probe window proven on screen and the seat proven before the
+        # injection, an empty press list has one reading left: a click that had a
+        # real route and was swallowed before the probe observed it — the reading
+        # that points at the overlay's input region. The report still names where
+        # its input answer came from, because a session whose devices came and
+        # went (0.1.8's daemonless mode destroys the device with the client) can
+        # read as empty after the fact; on 1.0.x the daemon's device persists, so
+        # that ambiguity is not in play.
         session_input = _input_report(session)
         assert presses, (
             f"the probe window saw no click: {events}; "
