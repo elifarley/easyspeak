@@ -1,11 +1,14 @@
 """Standalone GTK4 layer-shell overlay for the gridydotool plugin.
 
-Runs as a script in an interpreter that has PyGObject and the gtk4-layer-shell
-typelib, both of which the daemon's venv lacks. It is a real module rather than
-an embedded `-c` string so Ruff lints it and the unit suite can exercise the pure
-parts (the `_atspi_insert.py` precedent), which is also why `gi` is imported
-inside functions: importing it at module scope would make the whole file
-unimportable from the venv.
+Runs as a script in an interpreter that has PyGObject with its cairo bindings
+(the click-through input region is a `cairo.Region`, which PyGObject only
+converts with `python3-gi-cairo` installed — without it the probe still passes
+and the first `show` refuses) and the gtk4-layer-shell typelib, both of which
+the daemon's venv lacks. It is a real module rather than an embedded `-c`
+string so Ruff lints it and the unit suite can exercise the pure parts (the
+`_atspi_insert.py` precedent), which is also why `gi` is imported inside
+functions: importing it at module scope would make the whole file unimportable
+from the venv.
 
 Protocol: newline-delimited JSON on stdin and stdout, diagnostics on stderr.
 

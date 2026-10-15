@@ -127,13 +127,19 @@ hold-to-dictate. Two operational rules go with it:
   arm reads the compositor-global geometry (`[0,0,1920,1080]`), renders, hides and
   re-presents the overlay, and the live arm's injected click is **observed** by a
   probe window landing in the expected cell (`3 7 5` → `(1351, 280, 71, 40)`).
-- **Not verified:** real COSMIC acceptance (that cosmic-comp maps an overlay-layer
-  surface and that `is_supported()` returns true there). `cosmic-session` is not in
-  Ubuntu's archive — it comes from the COSMIC PPA — so that run needs a VM with the
-  PPA added (or a Pop!_OS 24.04 image) and the same five-case harness under
-  cosmic-comp. The upstream README's Smithay claim is the basis for expecting it to
-  pass. Also unmeasured: the double-click pair's inter-click gap and the exact
-  acceleration bias (the live arm bounds the landing to the cell ± 10 px instead
-  of recording the offset), and whether a compositor picks up a uinput
-  device that appears *after* it started (the acceptance run's daemon was already
-  up, so its device predated sway).
+- **Not verified:** real COSMIC acceptance — resolved 2026-10-15: on a Pop!_OS
+  24.04 VM whose cosmic-comp was upgraded to the distro-current build
+  (`0.1~1791491785~24.04~4d14528`), `wayland-info` advertises
+  `zwlr_layer_shell_v1` (v5) to an ordinary client and the overlay's
+  `--probe` answers `supported`; the live conversation drew the grid, zoomed
+  `3`→`7`→`5`, injected via a per-invocation uinput device (ydotool 0.1.8 has
+  no daemon) and closed cleanly. Version caveat: the ISO-era cosmic-comp
+  (`0.1~1759311734`, 2025-10-01) gates layer-shell behind
+  `client_is_privileged` and does **not** advertise the global to ordinary
+  clients — COSMIC acceptance therefore needs a cosmic-comp from after the
+  2025-10-30 security rework (`client_not_sandboxed`), which Pop!_OS's own
+  repos ship today. Also unmeasured: the double-click pair's inter-click gap
+  and the exact acceleration bias (the live arm bounds the landing to the cell
+  ± 10 px instead of recording the offset), and whether a compositor picks up a
+  uinput device that appears *after* it started (the acceptance run's daemon
+  was already up, so its device predated sway).

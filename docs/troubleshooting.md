@@ -31,8 +31,18 @@ rm -rf ~/.local/share/gnome-shell/extensions/gnome@easyspeak.dev
 The grid needs either the Shell extension (GNOME 47+) or the `gridydotool`
 backend, which needs `ydotool` installed (its own tool list must offer
 `mousemove`, `click` and `type`), a compositor with layer-shell support (COSMIC,
-wlroots, KDE) and an interpreter with PyGObject and the gtk4-layer-shell
-typelib. `ydotool` also needs write access to `/dev/uinput`.
+wlroots, KDE) and an interpreter with PyGObject, the cairo bindings
+(`python3-gi-cairo` — the click-through input region is built from a
+`cairo.Region`) and the gtk4-layer-shell typelib. `ydotool` also needs write
+access to `/dev/uinput`.
+
+On COSMIC specifically, the compositor must be one that exposes
+`zwlr_layer_shell_v1` to ordinary clients: cosmic-comp builds from before the
+2025-10-30 security rework gated layer-shell to a privileged client class and
+the grid's gate fails closed there, while Pop!_OS's current repos (cosmic-comp
+`0.1~1791491785` and later) admit any non-sandboxed client — measured on a
+Pop!_OS 24.04 VM where `apt install cosmic-comp` moved the session from
+refusing the probe to drawing the grid live.
 
 On Debian/Ubuntu the runtime pieces are:
 
