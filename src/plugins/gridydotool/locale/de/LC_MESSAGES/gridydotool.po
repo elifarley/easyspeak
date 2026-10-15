@@ -1,0 +1,49 @@
+# German translations for EasySpeak.
+# Copyright (C) 2026 EasySpeak contributors
+# This file is distributed under the same license as the EasySpeak project.
+msgid ""
+msgstr ""
+"Project-Id-Version: EasySpeak\n"
+"Report-Msgid-Bugs-To: https://github.com/ctsdownloads/easyspeak/issues\n"
+"POT-Creation-Date: 2026-10-14 17:50-0300\n"
+"PO-Revision-Date: 2026-10-14 17:50-0300\n"
+"Last-Translator: EasySpeak contributors\n"
+"Language: de\n"
+"Language-Team: German\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "1-9 or chains like '3 7 5' - zoom to zone(s)"
+msgstr "1-9 oder Folgen wie '3 7 5' - in Zone(n) zoomen"
+
+msgid "Grid"
+msgstr "Raster"
+
+msgid "Grid closed"
+msgstr "Raster geschlossen"
+
+msgid "I couldn't move the pointer."
+msgstr "Ich konnte den Zeiger nicht bewegen."
+
+msgid "I couldn't show the grid."
+msgstr "Ich konnte das Raster nicht anzeigen."
+
+msgid "I tried, but I'm not sure it worked."
+msgstr "Ich habe es versucht, aber ich bin nicht sicher, ob es geklappt hat."
+
+msgid "again - reopen at the last spot"
+msgstr "again - an der letzten Stelle wieder öffnen"
+
+msgid "click - left click"
+msgstr "click - Linksklick"
+
+msgid "close/cancel - hide the grid"
+msgstr "close/cancel - Raster ausblenden"
+
+msgid "grid/mouse/pointer/cursor - show mouse grid"
+msgstr "grid/mouse/pointer/cursor - Mausraster anzeigen"
+
+msgid "right click / double click / middle click"
+msgstr "right click / double click / middle click - Rechts-, Doppel-, Mittelklick"

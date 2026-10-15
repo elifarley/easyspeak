@@ -4,7 +4,10 @@
 - **Speech-to-text** — NVIDIA's Parakeet model transcribes commands locally,
   through onnx-asr; faster-whisper stands in for languages it lacks
 - **Text-to-speech** — Piper provides voice feedback
-- **Mouse control** — GNOME Shell extension with Clutter virtual input
+- **Mouse control** — a GNOME Shell extension with Clutter virtual input on
+  GNOME 47+, or a layer-shell overlay with kernel-level injection
+  (`gridydotool`) on the compositors that can run neither the extension nor its
+  grid
 - **Browser scroll** — JavaScript injection via qutebrowser IPC
 - **Dictation** — clipboard and a synthetic paste keystroke, with AT-SPI used to
   check something is focused (and as a fallback where no clipboard tool exists)
@@ -55,6 +58,7 @@ easyspeak/
 │       ├── headtrack/         # Head tracking (experimental)
 │       ├── media/             # Playback controls
 │       ├── mousegrid/         # Grid overlay mouse control
+│       ├── gridydotool/       # Grid overlay + kernel-level injection (layer-shell + ydotool)
 │       ├── sleep/             # Voice deactivate
 │       └── system/            # Volume, brightness, DND
 ├── tests/
