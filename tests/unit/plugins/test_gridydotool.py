@@ -1,10 +1,13 @@
 """Tests for the gridydotool plugin: the zone math, its parity with mousegrid,
 and the parser that turns an utterance into zone numbers."""
 
+import ctypes
 import importlib.util
 import io
 import json
+import sys
 import time
+import types
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -693,6 +696,22 @@ class TestOverlayPureParts:
         assert overlay.parse_command("") is None
         assert overlay.parse_command("{oops") is None
 
+    def test_take_lines_splits_every_complete_line_of_one_chunk(self):
+        """A `stop` behind another command in the same write must arrive too."""
+        overlay = _overlay_module()
+        lines, remainder = overlay.take_lines("", '{"cmd": "hide"}\n{"cmd": "stop"}\n')
+        assert lines == ['{"cmd": "hide"}', '{"cmd": "stop"}']
+        assert remainder == ""
+
+    def test_take_lines_carries_a_partial_line_into_the_next_chunk(self):
+        overlay = _overlay_module()
+        lines, remainder = overlay.take_lines("", '{"cmd": "hi')
+        assert lines == []
+        assert remainder == '{"cmd": "hi'
+        lines, remainder = overlay.take_lines(remainder, 'de"}\n{"cmd":')
+        assert lines == ['{"cmd": "hide"}']
+        assert remainder == '{"cmd":'
+
     def test_probe_mode_reports_unsupported_without_a_display(self):
         overlay = _overlay_module()
         assert overlay.main(["--probe"]) == 1
@@ -735,3 +754,74 @@ class TestOverlayServePath:
         monkeypatch.setattr(overlay, "run", run)
         assert overlay.main([]) == 7
         run.assert_called_once_with(*stack)
+
+
+class TestOverlayLoadGuard:
+    """A loadable library must not turn a missing PyGObject into a traceback.
+
+    That shape is exactly the daemon's venv with the library findable on the
+    loader path: the reviewer reproduced it with a dummy `libgtk4-layer-shell.so`
+    and `--probe` died inside `load_layer_shell` before it could answer
+    `unsupported`, skipping every caller's error path.
+    """
+
+    @staticmethod
+    def _library_loads(monkeypatch):
+        monkeypatch.setattr(ctypes, "CDLL", lambda name: Mock())
+        monkeypatch.setitem(sys.modules, "gi", None)
+
+    def test_load_layer_shell_reports_the_missing_pygobject(self, monkeypatch, capsys):
+        self._library_loads(monkeypatch)
+        overlay = _overlay_module()
+        assert overlay.load_layer_shell() == (None, None)
+        assert "PyGObject" in capsys.readouterr().err
+
+    def test_probe_answers_unsupported_instead_of_dying(self, monkeypatch, capsys):
+        self._library_loads(monkeypatch)
+        overlay = _overlay_module()
+        assert overlay.main(["--probe"]) == 1
+        assert capsys.readouterr().out.strip() == "unsupported"
+
+
+class TestOverlayClickThrough:
+    """The empty input region is the pass-through mechanism: apply it or refuse.
+
+    Measured on this stack (GTK 4.6.9, two stacked windows, an XTest click):
+    with `set_can_target(False)` alone the click is swallowed - neither window
+    receives it - while an empty input region lets the window below receive it.
+    The feature is a click injected while the pointer is over the surface, so a
+    surface that cannot be made click-through has to surface as an error, never
+    as a grid that silently eats its own click.
+    """
+
+    def test_the_surface_gets_an_empty_region(self, monkeypatch):
+        overlay = _overlay_module()
+
+        class FakeRegion:
+            pass
+
+        monkeypatch.setitem(
+            sys.modules, "cairo", types.SimpleNamespace(Region=FakeRegion)
+        )
+        surface = Mock()
+        assert overlay.clear_input_region(surface) is None
+        region = surface.set_input_region.call_args.args[0]
+        assert isinstance(region, FakeRegion)
+
+    def test_missing_pycairo_is_a_diagnostic_not_a_traceback(self, monkeypatch):
+        overlay = _overlay_module()
+        monkeypatch.setitem(sys.modules, "cairo", None)
+        surface = Mock()
+        problem = overlay.clear_input_region(surface)
+        assert "input region" in problem
+        surface.set_input_region.assert_not_called()
+
+    def test_a_surface_that_rejects_the_region_is_a_diagnostic(self, monkeypatch):
+        overlay = _overlay_module()
+        monkeypatch.setitem(
+            sys.modules, "cairo", types.SimpleNamespace(Region=lambda: None)
+        )
+        surface = Mock()
+        surface.set_input_region.side_effect = TypeError("no foreign struct converter")
+        problem = overlay.clear_input_region(surface)
+        assert "input region" in problem

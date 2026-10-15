@@ -52,6 +52,19 @@ def parse_command(line):
     return payload if isinstance(payload, dict) else None
 
 
+def take_lines(pending, chunk):
+    """Split every complete line out of `pending + chunk`.
+
+    Returns `(lines, remainder)`: the newline-terminated lines in order, and
+    the trailing fragment that has not arrived completely yet. Splitting the
+    whole buffer - instead of reading one line per wake-up - is what keeps a
+    command that sits behind another one in the same write from being
+    stranded where no io watch can see it.
+    """
+    lines = (pending + chunk).split("\n")
+    return lines[:-1], lines[-1]
+
+
 def emit(payload):
     """Write one event to the parent."""
     sys.stdout.write(json.dumps(payload) + "\n")
@@ -72,7 +85,15 @@ def load_layer_shell():
     except OSError as exc:
         sys.stderr.write(f"grid-overlay: libgtk4-layer-shell.so not found: {exc}\n")
         return None, None
-    import gi  # pragma: no cover - PyGObject is absent from the daemon's venv
+    try:
+        import gi
+    except ModuleNotFoundError as exc:
+        # The daemon's venv: a loadable library with PyGObject missing. A bare
+        # import here used to escape as a traceback, skipping every caller's
+        # error path (reproduced with a dummy library on the loader path:
+        # `--probe` under the venv died on this line).
+        sys.stderr.write(f"grid-overlay: PyGObject is not installed: {exc}\n")
+        return None, None
 
     try:  # pragma: no cover - needs the layer-shell typelib from the live stack
         gi.require_version("Gtk", "4.0")
@@ -90,6 +111,28 @@ def is_supported():
     if layer_shell is None:
         return False
     return bool(layer_shell.is_supported())  # pragma: no cover - live shell only
+
+
+def clear_input_region(surface):
+    """Empty the surface's input region, so clicks pass through it.
+
+    `set_can_target(False)` is not enough on this stack: with it alone the
+    click is swallowed - neither window receives it - while an empty input
+    region lets the window below receive it (measured on GTK 4.6.9, two
+    stacked windows, an XTest click). The feature is exactly a click injected
+    while the pointer is over this surface, so a swallowing surface breaks it
+    silently.
+
+    Returns None on success, or a diagnostic when the region cannot be
+    applied; the caller must refuse rather than present the surface without it.
+    """
+    try:
+        import cairo
+
+        surface.set_input_region(cairo.Region())
+    except (ImportError, AttributeError, TypeError) as exc:
+        return f"cannot clear the input region: {exc}"
+    return None
 
 
 class Overlay:  # pragma: no cover - needs GTK; run live
@@ -117,10 +160,13 @@ class Overlay:  # pragma: no cover - needs GTK; run live
         ):
             layer_shell.set_anchor(self.window, edge, True)  # noqa: FBT003
         layer_shell.set_layer(self.window, layer_shell.Layer.OVERLAY)
-        # Never take focus, and let the injected click pass through to whatever
-        # is underneath: a grid that swallows its own click is useless.
+        # Never take focus, and never eat the injected click. `set_can_target`
+        # stops GTK from targeting the window; the empty input region - applied
+        # by `make_click_through` as soon as the surface exists - is what
+        # actually lets the click reach whatever is underneath.
         layer_shell.set_keyboard_mode(self.window, layer_shell.KeyboardMode.NONE)
         self.window.set_can_target(False)
+        self.click_through_surface = None
 
     def _draw(self, area, cr, width, height):
         """Paint the nine cells with their digits.
@@ -150,10 +196,33 @@ class Overlay:  # pragma: no cover - needs GTK; run live
             self.presented = True
             emit({"event": "presented"})
 
+    def make_click_through(self):
+        """Give the surface an empty input region, or say why it could not.
+
+        Returns None when the surface is click-through already, or has not
+        been created yet - the ready poll retries - and a diagnostic string
+        otherwise; the caller refuses the session on a diagnostic, because a
+        surface that cannot be made click-through must not be presented as if
+        the click would pass through it.
+        """
+        surface = self.window.get_surface()
+        if surface is None or surface is self.click_through_surface:
+            return None
+        problem = clear_input_region(surface)
+        if problem is None:
+            self.click_through_surface = surface
+        return problem
+
     def show(self, bounds):
+        """Draw the grid over `bounds`; a diagnostic means refuse the session.
+
+        The region is re-checked here, on every show: a surface presented later
+        must not go up without it.
+        """
         self.bounds = tuple(bounds)
         self.window.present()
         self.area.queue_draw()  # the bounds changed: repaint, mapped or not
+        return self.make_click_through()
 
     def hide(self):
         self.window.set_visible(False)
@@ -188,6 +257,15 @@ def run(gtk, layer_shell):  # pragma: no cover - drives the GTK loop
 
     app = gtk.Application(application_id="dev.easyspeak.gridydotool.overlay")
     overlay = None
+    fatal = None
+
+    def refuse(problem):
+        """Emit the refusal instead of the surface that could not be made safe."""
+        nonlocal fatal
+        fatal = problem
+        emit({"event": "error", "message": problem})
+        app.quit()
+        return False
 
     def on_activate(_app):
         """Build and present the surface inside the application's lifetime.
@@ -208,11 +286,16 @@ def run(gtk, layer_shell):  # pragma: no cover - drives the GTK loop
         """Report geometry only once the surface exists, then stop polling.
 
         `ready` is what the plugin waits for before it can compute a single
-        coordinate, so it must be sent after GTK has a surface to ask, not from
-        the constructor where there is none yet.
+        coordinate, so it must be sent after GTK has a surface to ask, not
+        from the constructor where there is none yet - and only after the
+        surface has been made click-through, or the click this grid aims would
+        be swallowed before it arrived.
         """
         if overlay is None or overlay.window.get_surface() is None:
             return True
+        problem = overlay.make_click_through()
+        if problem is not None:
+            return refuse(problem)
         report_monitor(overlay)
         return False
 
@@ -227,7 +310,9 @@ def run(gtk, layer_shell):  # pragma: no cover - drives the GTK loop
             return True
         name = command.get("cmd")
         if name == "show" and overlay is not None:
-            overlay.show(command["bounds"])
+            problem = overlay.show(command["bounds"])
+            if problem is not None:
+                return refuse(problem)
         elif name == "hide" and overlay is not None:
             overlay.hide()
         elif name in ("stop", "quit"):
@@ -238,28 +323,23 @@ def run(gtk, layer_shell):  # pragma: no cover - drives the GTK loop
     def on_stdin_ready(_source, _condition):
         """Consume every complete line the descriptor holds, not just one.
 
-        `sys.stdin.readline()` reads ahead into the text layer, and the io watch
-        is blind to a line left there: a `stop` sitting behind another command
-        in the same write never ends the process. Reading the descriptor
-        directly - and doing our own buffering - keeps unread lines where the
-        watch can see them, and the chunk boundary is safe because a partial
-        line waits here for the next wake-up.
+        One chunk is read per wake-up and `take_lines` splits every complete
+        line out of it - a `stop` behind another command in the same write must
+        not be stranded where no watch can see it - while a partial line waits
+        in `pending` for the next wake-up.
         """
         nonlocal pending
         chunk = os.read(sys.stdin.fileno(), 4096)
         if not chunk:  # the plugin is gone; never outlive it
             app.quit()
             return False
-        pending += chunk.decode("utf-8", "replace")
-        keep_going = True
-        while keep_going and "\n" in pending:
-            line, _, pending = pending.partition("\n")
-            keep_going = handle_line(line)
-        return keep_going
+        lines, pending = take_lines(pending, chunk.decode("utf-8", "replace"))
+        # `all` short-circuits at the first `stop`/`quit`, same as a loop would.
+        return all(handle_line(line) for line in lines)
 
     GLib.io_add_watch(sys.stdin.fileno(), GLib.IO_IN | GLib.IO_HUP, on_stdin_ready)
     app.run([])
-    return 0
+    return 1 if fatal is not None else 0
 
 
 def main(argv=None):
