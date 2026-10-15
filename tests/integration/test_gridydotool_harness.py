@@ -394,9 +394,10 @@ class TestForcedBackendArm:
                 return iter(commands[1:])
 
         with caplog.at_level("INFO"):
-            gridydotool.setup(FakeCore())
+            core = FakeCore()
+            gridydotool.setup(core)
             assert gridydotool.active() is True
-            gridydotool.handle(commands[0], gridydotool._core)
+            gridydotool.handle(commands[0], core)
 
         ready = [r for r in caplog.records if "ready on" in r.message]
         assert ready, "the helper never reported ready"
