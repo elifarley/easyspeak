@@ -229,6 +229,27 @@ class TestLiveArm:
         _grim(session, after)
         assert before.read_bytes() != after.read_bytes(), "the overlay did not render"
 
+        # The hide -> show lifecycle: hiding unmaps the surface and showing it
+        # again remaps it, the case the helper's per-show region check exists
+        # for. The fresh surface must still be click-through, and the injected
+        # click further down is the observable: GDK keeps the region on the
+        # surface and re-applies it to the re-created wl_surface, but only the
+        # probe's press can prove it. The two screenshots keep a failed
+        # re-present from passing silently, because a click would sail through
+        # an absent overlay anyway.
+        gridydotool._send({"cmd": "hide"})
+        time.sleep(0.5)
+        hidden = tmp_path / "hidden.png"
+        _grim(session, hidden)
+        assert hidden.read_bytes() != after.read_bytes(), "the overlay did not hide"
+        gridydotool._redraw(gridydotool._bounds)
+        time.sleep(0.5)
+        shown_again = tmp_path / "shown-again.png"
+        _grim(session, shown_again)
+        assert shown_again.read_bytes() != hidden.read_bytes(), (
+            "the overlay did not come back"
+        )
+
         x, y = gridydotool.center(EXPECTED_CELL)
         print(f"about to click at {x},{y}")  # noqa: T201
         gridydotool.move_to(x, y)
