@@ -41,8 +41,10 @@ replacement for that extension that doesn't exist yet.
     installed: a compositor with layer-shell support, `ydotool` with write
     access to `/dev/uinput`, and an interpreter with PyGObject and the
     gtk4-layer-shell typelib. That access is input-injection grade — the same
-    class as the `input` group hold-to-dictate needs — and on ydotool 1.0.x it
-    also needs a running `ydotoold` (0.1.8 works without one).
+    class as the `input` group hold-to-dictate needs — and on ydotool 1.0.x
+    (Ubuntu 26.04) it also needs a running `ydotoold`: that client refuses to emit
+    without a socket. 0.1.8 (25.10) works without one and only warns about
+    latency.
 
 KDE Plasma support is new, so this table reflects a first test on Plasma 6. If you
 find something that works differently, please [report it][issues].

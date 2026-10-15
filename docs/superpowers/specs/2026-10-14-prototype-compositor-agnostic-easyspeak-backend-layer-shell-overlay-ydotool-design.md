@@ -656,7 +656,13 @@ match" criterion creates.
 
 Real-COSMIC acceptance (that cosmic-comp maps an overlay-layer surface and that
 `is_supported()` returns true there) — still the follow-up scope, and the one
-premise the packaged-stack acceptance does not touch. Everything short of that
+premise the packaged-stack acceptance does not touch. It needs a guest with
+`cosmic-session`, which **Ubuntu's archive does not carry**: it comes from the
+COSMIC PPA (`ppa:system76-dev/stable`) or a Pop!_OS 24.04 image, so the run is
+"add the PPA (or boot Pop!_OS), install `cosmic-session`, start a COSMIC session
+in the guest, and run the same five harness cases under cosmic-comp" — the
+harness needs no change, because the compositor it starts is only sway's
+stand-in for the real session. Everything short of that
 boundary is now verified on a real stack: in a provisioned Ubuntu 26.04.1 LTS VM
 with the packaged gtk4-layer-shell 1.3.0, the integration harness reports **5
 passed** — three gate tests, the forced-backend arm (helper handshake, geometry
@@ -688,7 +694,10 @@ Smithay claim is still the basis for COSMIC itself.
   (`user:ecc:rw-`; `ecc` is not in the `input` group), so this prototype needs **no
   new privilege here**. A bare `setfacl` does not survive a reboot, so making it
   durable means the udev rule the issue's security note presumes — a persisted
-  grant, not an ad-hoc one. That is the first open item below, not an assumption.
+  grant, not an ad-hoc one. That rule is now the one `docs/troubleshooting.md`
+  carries (`KERNEL=="uinput", MODE="0660", GROUP="input"`, plus the user in
+  `input`; open item 1 below records it), which is also the shape the acceptance
+  VM runs with — not an assumption any more.
 - **The risk class is stated, not implied**: uinput access is input-spoofing grade,
   the same class as the existing `input`-group grant for hold-to-dictate. The docs
   change carries this wording, because a user enabling the backend is granting it.
@@ -708,7 +717,8 @@ Smithay claim is still the basis for COSMIC itself.
    the folder's convention of skipping gracefully when a prerequisite is absent
    means a green run has to say *which* prerequisite it skipped rather than being
    read as a pass.
-2. Upstream issue on `ctsdownloads/easyspeak` carrying the findings: both ydotool
+2. Upstream issue on `ctsdownloads/easyspeak` carrying the findings — drafted in
+   `docs/upstream-issue-draft.md`, not filed: both ydotool
    dialects (0.1.8's argc exit codes, clamp-then-relative `mousemove` and 0600
    socket; 1.0.x's `--absolute` move, hex button codes and no per-invocation
    fallback), the layer-shell-on-Smithay-but-not-GNOME boundary as the natural
@@ -718,27 +728,68 @@ Smithay claim is still the basis for COSMIC itself.
    repository forbids AI-written production code and mostly-AI issue text**, so
    nothing is filed there; its README is cited, not changed.
 
-## Open items — probe at implementation start, not blockers
+## Open items — settled by the implementation and the acceptance run, or still owed
 
-1. **Does the `/dev/uinput` ACL survive a reboot?** (`udevadm test`/reboot.) If
-   not, a udev rule becomes part of the deployment docs.
+Settled: 1, 3, 4, 5 and 6 below. Item 2 (the GTK 4.6 build floor) and item 7
+(multi-output) stay open and unchanged — the acceptance VM packages 1.3.0, so it
+cannot answer a build-floor question, and multi-output needs a second output.
+
+1. **Does the `/dev/uinput` ACL survive a reboot?** Settled, by the shape of the
+   grant rather than by a reboot: a bare `setfacl` is re-applied by nothing, so it
+   does not; the durable form is a udev rule, and `docs/troubleshooting.md` now
+   carries it (`KERNEL=="uinput", MODE="0660", GROUP="input"` plus the user in
+   `input` — the shape the acceptance VM runs with, `/dev/uinput` `root:input`
+   `0660`). This workstation's own grant is the transient form and is untouched by
+   the change.
 2. **Which gtk4-layer-shell release builds against GTK 4.6?** Start at v1.0.4;
-   the meson declares no floor but the C code may use newer API.
-3. **Click-through**: whether `window.set_can_target(False)` yields an empty input
-   region on a layer surface in GTK4, or whether a `GdkSurface` input region is
-   needed. The harness settles it behaviourally (the probe must receive the click).
-4. **How tight is the double-click pair in practice?** With `--delay 0` the gap is
-   process spawn plus connect, so measure the observed inter-click delta rather
-   than assuming it — the default 100 ms sleeps are gone, and a delta beyond the
-   desktop's double-click window turns the pair into two single clicks. Log the
-   measured gap when it exceeds the window, and record the number.
-5. **How large is the acceleration bias?** Measured in the harness with a flat
-   profile; the measurement sets the tolerance *within the bound arm B states* (a
-   quarter of the cell's smaller dimension), and the recorded number goes in the
-   docs. The bound exists so that a measurement cannot quietly turn the assertion
-   into a formality.
-6. **Does headless `sway` pick up a uinput device that appears after startup?**
-   (wlroots monitors udev; if not, the device is created before sway starts.)
+   the meson declares no floor but the C code may use newer API. (Still open: the
+   acceptance VM runs the packaged 1.3.0, and no build was made here.)
+3. **Click-through — settled by measurement.** `window.set_can_target(False)`
+   alone is **not** enough on a layer surface in GTK4: with it alone the click is
+   swallowed by the overlay and reaches neither window (measured on GTK 4.6.9,
+   two stacked windows, an XTest click). What works is an **empty input region on
+   the `GdkSurface`** — `surface.set_input_region(cairo.Region())`, applied as
+   soon as the surface exists and *before* `ready` is emitted, and re-applied for
+   the surface a show-after-hide creates — and the real stack observed it: in the
+   Ubuntu 26.04 VM the injected click passed through the presented overlay and the
+   probe window under it saw the press in the expected cell.
+4. **How tight is the double-click pair in practice? — partly settled, the number
+   still owed.** The pair spends no time in sleeps: 0.1.8's invocations pass
+   `--delay 0` (its 100 ms default is gone) and 1.0.x has no delay flag, so the
+   gap is whatever the first invocation itself takes — process spawn, the daemon
+   connect, the emission and the exit — and its only stated upper bound today is
+   the plugin's own 2 s injection timeout (`INJECT_TIMEOUT`), which is not the same
+   number as the observed delta and is not what the measurement is for: a delta
+   beyond the desktop's double-click window (typically 400-500 ms) turns the pair
+   into two single clicks. What is *not* in any artifact is that observed delta:
+   the acceptance run clicked once, and `grid_probe_window.py` does not timestamp
+   its presses, so measuring it needs the probe to carry a timestamp and the live
+   arm to drive a double click. Until that run, no number is quoted here.
+5. **How large is the acceleration bias? — the acceptance run bounds the landing,
+   the bias itself is still owed.** The live arm asserts that the observed press
+   falls inside the hand-computed cell `(1351, 280, 71, 40)` expanded by at most
+   10 px on each side (a quarter of the cell's smaller dimension, 40 px), and on
+   Ubuntu 26.04 with ydotool 1.0.4 and `accel_profile flat` it did — so the
+   composed error (acceleration bias, integer rounding, and whatever the
+   compositor does with injected motion) stayed inside that rect, and the
+   tolerance was not widened to make the assertion pass. It is a bound, not a
+   measurement of the bias: the intended point is the cell's centre `(1386, 300)`,
+   which is ~46 px from the rect's edge in x, so a bias an order larger than the
+   bound itself could still be hiding inside it. The observed offset was not
+   logged (a passing run records nothing), and 0.1.8's clamp-then-relative move is
+   the dialect most exposed to acceleration; logging the offset from the same
+   harness change item 4 needs is what turns the bound into a number.
+6. **Does headless `sway` pick up a uinput device that appears after startup? —
+   still owed, and the acceptance run cannot answer it.** The run's seat assertion
+   (`swaymsg -t get_inputs` listing a device before anything was injected) proves
+   the compositor's input list carried the injecting device at click time, but the
+   harness starts no `ydotoold`, so the guest's daemon — and its uinput device —
+   were already up when sway started and the birth order is in no artifact.
+   wlroots hot-plugs input devices at runtime in general (a USB mouse plugged in
+   after login works), which is the reason to expect yes; the measurement is a
+   harness shape that starts sway first, then the daemon, and asserts the device
+   appears in `get_inputs` afterwards. Operator rule until then: start `ydotoold`
+   (or let the distro's user unit start it at login) before relying on the grid.
 7. **Multi-output**: the grid opens on whichever output the compositor chooses
    today (the plugin makes no `set_monitor` call), and D6's single addition (the
    monitor origin at injection time) is what a non-primary monitor needs. Whether
@@ -752,8 +803,12 @@ Smithay claim is still the basis for COSMIC itself.
 Mapped to the issue's, with how each is discharged:
 
 1. **Plugin loads in the existing daemon, zero core edits** — the updated roster
-   assertion proves discovery; a daemon startup smoke on this box shows
-   `Loaded: GridYdotool`; `git diff origin/main -- src/core` is empty, mechanically.
+   assertion proves discovery; a daemon startup smoke on this box shows the
+   loader's own line, `✓ Loaded: gridydotool` (the loader prints the module's
+   `NAME`, which is lowercase like every other plugin's — not the
+   `GridYdotool` the plan's step text guessed), directly under
+   `grid backend inert` and its reason; `git diff origin/main -- src/core` is
+   empty, mechanically.
 2. **Grid overlay renders as a layer surface in headless sway** — arm A: the
    plugin's captured `ready`+`presented` log records, plus the `grim` pixel
    sampling.

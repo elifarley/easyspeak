@@ -133,9 +133,12 @@ The mouse grid is served by the GNOME Shell extension on GNOME and by the
 `gridydotool` backend elsewhere. The backend activates only where the stack
 works — a compositor with layer-shell support (COSMIC, wlroots, KDE), `ydotool`
 with write access to `/dev/uinput`, and, on ydotool 1.0.x, a running `ydotoold`
+(0.1.8 works without one, at the cost of the latency its own notice names)
 — and leaves the words to the extension backend everywhere else. Installing
 `ydotool` and granting that access is input-injection grade access, the same
-class as the `input` group hold-to-dictate needs.
+class as the `input` group hold-to-dictate needs; [Troubleshooting](troubleshooting.md)
+has the package names, the udev rule and what to do when the layer-shell stack is
+not packaged.
 
 | Variable                 | Default | Effect                                                         |
 | ------------------------ | ------- | -------------------------------------------------------------- |

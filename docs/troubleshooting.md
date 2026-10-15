@@ -34,6 +34,34 @@ backend, which needs `ydotool` installed (its own tool list must offer
 wlroots, KDE) and an interpreter with PyGObject and the gtk4-layer-shell
 typelib. `ydotool` also needs write access to `/dev/uinput`.
 
+On Debian/Ubuntu the runtime pieces are:
+
+```bash
+sudo apt install ydotool libgtk4-layer-shell0 gir1.2-gtk4layershell-1.0 python3-gi python3-cairo
+```
+
+`libgtk4-layer-shell0` with `gir1.2-gtk4layershell-1.0` is the library and its
+typelib (they first appear in 25.10 and 26.04; 24.04 has neither). Where the
+distro packages them, that is all the overlay needs: the helper resolves the
+library **by its soname** (`libgtk4-layer-shell.so.0`), so the `-dev` package
+and its unversioned `.so` symlink are not needed and `EASYSPEAK_GRID_TYPELIB` is
+unnecessary. Where no package exists, build gtk4-layer-shell and point
+`EASYSPEAK_GRID_TYPELIB` at the build tree's `src` directory (the helper exports
+it as both `GI_TYPELIB_PATH` and `LD_LIBRARY_PATH`).
+
+Granting `/dev/uinput` access is a deployment step, not a session tweak: a
+`setfacl` grant does not survive a reboot, a udev rule does. Add
+
+```udev
+# /etc/udev/rules.d/60-uinput.rules
+KERNEL=="uinput", MODE="0660", GROUP="input"
+```
+
+then `sudo udevadm control --reload-rules`, `sudo udevadm trigger`, add yourself
+to the group (`sudo usermod -aG input $USER`) and log out and back in. This is
+input-injection grade access — the same class as the `input` group hold-to-dictate
+needs — so grant it to the account that should be able to click.
+
 `ydotool` ships in two command dialects, and the backend reads which one is
 installed from the client itself:
 
