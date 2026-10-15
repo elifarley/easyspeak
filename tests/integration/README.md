@@ -34,7 +34,9 @@ conftest.py                    # stubs heavy deps; skip fixtures for audio/syste
 
 ## The gridydotool harness
 
-`test_gridydotool_harness.py` asserts the gate stays inert without a daemon,
+`test_gridydotool_harness.py` asserts a failed injector probe keeps `mousegrid`
+in charge and that the daemonless gate passes on a real ydotool (the socket is a
+logged mode, not a condition),
 observes the overlay geometry and the exact ydotool argv under a forced backend,
 and — only when opted in — proves that a click lands in the cell the utterance
 aimed at, by watching `grid_probe_window.py` inside a headless sway session the
@@ -50,7 +52,9 @@ Its prerequisites, in one place:
   point `EASYSPEAK_GRID_TYPELIB` at its `src` directory (the harness exports it
   as both `GI_TYPELIB_PATH` and `LD_LIBRARY_PATH`), or `EASYSPEAK_GRID_PYTHON`
   at an interpreter that already has the library and the typelib.
-- A running `ydotoold`, **for the live arm only**.
+- A running `ydotoold` is **optional** — it removes the per-invocation latency
+  caveat the client names when it is absent, and the VM measured the daemonless
+  path working. It is not needed by any arm.
 
 Two environment variables the harness reads: `EASYSPEAK_GRID_LIVE=click` opts
 into the live click arm, and `EASYSPEAK_GRID_BACKEND=uinput` (set by the harness

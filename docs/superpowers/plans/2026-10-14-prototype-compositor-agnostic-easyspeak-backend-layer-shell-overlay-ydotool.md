@@ -14,14 +14,14 @@
 
 - `NAME = "gridydotool"`, `PRIORITY = 0` (ahead of `mousegrid`'s 1), and every `handle` returns `None` unless the gate passed.
 - Timers, exactly: `PROBE_TIMEOUT = 5.0`, `INJECT_TIMEOUT = 2.0`, `REAP_GRACE = 2.0`.
-- Every `ydotool` invocation passes `--delay 0`, and the daemon socket `/tmp/.ydotool_socket` must accept a connection before the plugin activates.
+- Every `ydotool` invocation passes `--delay 0`. The daemon socket `/tmp/.ydotool_socket` is **logged, not gated**: its absence is a latency caveat (the client falls back to a per-invocation device, which the VM measured working), and the plugin activates on the capability probe alone.
 - Env knobs: `EASYSPEAK_GRID_BACKEND=uinput|gnome` (forced override, short-circuits the probes), `EASYSPEAK_GRID_PYTHON` (interpreter override), `EASYSPEAK_GRID_LIVE=move|click` (test-only, harness).
 - Zero edits under `src/core/**`. The only existing files touched are `tests/unit/core/test_main.py` (two assertions), `tests/packaging/test_python_wheel.sh`, `pyproject.toml`, the docs and `tests/integration/README.md`.
 - `_ = translator(__file__)` at module top, and every spoken string wrapped in `_()`. Catalogs are complete for `de`, `es`, `fr`, `it` — no empty and no fuzzy entries ever committed.
 - Bounds are monitor-local; the monitor origin from the helper's `ready` event is added only at injection time.
 - Zone math: 3×3 recursion with integer thirds (`w // 3`), no clamp, containment invariant holds.
 - `handle` returns `True` whenever the phrase was claimed and answered (including every failure path); only the gate-inert case returns `None`.
-- Helper: lazy `import gi` (so the venv can import the module in tests), `CDLL("libgtk4-layer-shell.so")` immediately before the gi import, `is_supported()` re-checked in `show`, empty input region, `keyboard_mode` NONE, never `auto_exclusive_zone_enable()`.
+- Helper: lazy `import gi` (so the venv can import the module in tests), the library load (`ctypes.util.find_library` for the soname, trusted only when the result names this library, then the literal soname and the plain name) immediately before the gi import, `is_supported()` re-checked in `show`, empty input region, `keyboard_mode` NONE, never `auto_exclusive_zone_enable()`.
 
 ---
 
@@ -367,15 +367,23 @@ def core():
 
 
 class TestOutcomeClassification:
-    """`ydotool` exits with argc, so the exit code alone says nothing; the seam
-    returns one of three outcomes and the tests pin all three."""
+    """The exit code alone says nothing: Exec returns argc but the 0.1.8 client
+    discards it — success is 0, measured on the VM — and the daemonless notice
+    is a caveat. The seam returns one of three outcomes and the tests pin all
+    three."""
 
     def _result(self, returncode=3, stderr="", stdout=""):
         return Mock(returncode=returncode, stderr=stderr, stdout=stdout)
 
-    def test_ran_is_the_invocations_own_success_code(self, monkeypatch):
+    def test_ran_is_the_measured_clients_exit_code(self, monkeypatch):
+        monkeypatch.setattr(g, "_spawn", lambda *a, **k: self._result(0))
+        assert g._run_bounded(["ydotool", "mousemove", "0", "0"]) == "ran"
+
+    def test_ran_accepts_the_argv_shaped_success_code(self, monkeypatch):
+        """A build that forwards Exec's argc return still classifies: the code
+        the tool computes is `len(args) - 1`, which this argv makes 3."""
         monkeypatch.setattr(g, "_spawn", lambda *a, **k: self._result(3))
-        assert g._run_bounded(["ydotool", "mousemove_relative", "0", "0"]) == "ran"
+        assert g._run_bounded(["ydotool", "mousemove", "0", "0"]) == "ran"
 
     def test_errored_on_an_error_signature(self, monkeypatch):
         monkeypatch.setattr(
@@ -400,17 +408,22 @@ class TestOutcomeClassification:
         monkeypatch.setattr(g, "_spawn", Mock(side_effect=FileNotFoundError("ydotool")))
         assert g._run_bounded(["ydotool", "click", "1"]) == "unknown"
 
-    def test_notice_is_unknown_not_ran(self, monkeypatch):
-        """A fallback notice means the client built a one-shot device, which is
-        exactly the case `ran` excludes."""
+    def test_zero_exit_is_ran_even_with_the_daemonless_notice(
+        self, monkeypatch, caplog
+    ):
+        """The VM measured a dispatched tool exiting 0 with the fallback notice
+        on stderr: no daemon is a latency caveat, not a failure, and the log
+        names the per-invocation mode."""
         monkeypatch.setattr(
             g,
             "_spawn",
             lambda *a, **k: self._result(
-                3, stderr="ydotool: notice: ydotoold backend unavailable ..."
+                0, stderr="ydotool: notice: ydotoold backend unavailable ...\n"
             ),
         )
-        assert g._run_bounded(["ydotool", "mousemove_relative", "0", "0"]) == "unknown"
+        with caplog.at_level("INFO"):
+            assert g._run_bounded(["ydotool", "type", "", "--delay", "0"]) == "ran"
+        assert any("per-invocation" in r.message for r in caplog.records)
 
     def test_dry_run_records_without_spawning(self, monkeypatch):
         spawn = Mock()
@@ -537,6 +550,12 @@ REAP_GRACE = 2.0
 YDTOOL_SOCKET = "/tmp/.ydotool_socket"
 ERROR_SIGNATURES = ("error:", "Which coordinate", "Unknown tool", "failed to")
 FALLBACK_NOTICE = "backend unavailable"
+# The verbs the plugin's argv is allowed to use, read off the binary's own list:
+# `mousemove` and `click` are the injections, and `type` is the probe's no-op.
+# Ubuntu's 0.1.8 build offers exactly {type, recorder, mousemove, key, click} —
+# no `mousemove_relative` — so a hard-coded verb gates the plugin off there.
+YDTOOL_VERBS = ("mousemove", "click", "type")
+YDTOOL_NOOP = ("ydotool", "type", "", "--delay", "0")
 
 _core = None
 _active = False
@@ -562,22 +581,19 @@ def _spawn(cmd, timeout):
 def _run_bounded(args, timeout=INJECT_TIMEOUT):
     """Run one ydotool invocation and return its outcome, never its exit code.
 
-    `MouseMove::Exec` and `Click::Exec` both `return argc`, so a successful
-    `click 1` exits 2 and a parse error can exit 2 as well: the code carries no
-    failure meaning. The three outcomes are what the rest of the module reasons
-    about.
+    `MouseMove::Exec` and `Click::Exec` do `return argc`, but the 0.1.8 client
+    discards that value in `main()`: a dispatched tool exits **0** whatever its
+    argv length (measured on Ubuntu 25.10 — `ydotool click 1` exits 0). The seam
+    therefore reads a zero exit with a clean stderr as `ran`, and still accepts
+    the argv-shaped code for a build that forwards Exec's return. The three
+    outcomes are what the rest of the module reasons about.
 
-    `timeout` bounds the process, which is what keeps a wedged ydotoold from
-    freezing the modal loop with the overlay on screen.
+    `timeout` bounds the process, which is what keeps a wedged ydotool (or
+    ydotoold) from freezing the modal loop with the overlay on screen.
     """
     if os.environ.get("EASYSPEAK_GRID_DRY_RUN"):
         logger.info("dry run: %s", " ".join(args))
         return "ran"
-    # The tool returns the argc it sees, which is this argv minus its own program
-    # name: ["ydotool", "mousemove_relative", "0", "0"] succeeds with 3, and the
-    # same probe with "--delay", "0" appended succeeds with 5. Deriving it from
-    # the argv we built is what keeps the expectation honest as the argv changes.
-    expected = len(args) - 1
     try:
         result = _spawn(args, timeout)
     except subprocess.TimeoutExpired:
@@ -590,11 +606,15 @@ def _run_bounded(args, timeout=INJECT_TIMEOUT):
         logger.warning("ydotool refused: %s", result.stderr.strip())
         return "errored"
     if FALLBACK_NOTICE in result.stderr:
-        # No daemon: the client built a device for this invocation, and a device
-        # that new may not be recognised before the events are emitted.
-        logger.warning("ydotool fell back to a per-invocation device")
-        return "unknown"
-    if result.returncode == expected:
+        # No daemon: the client built a device for this invocation and said so.
+        # The VM measured that path working — the notice names a latency
+        # caveat, not a capability gap — so the invocation still counts, and
+        # this line states which mode was in use.
+        logger.info("grid: per-invocation device (ydotoold unavailable)")
+    # The argv-shaped code (`["ydotool", "mousemove", "0", "0"]` → 3) is what
+    # Exec returns and what a build forwarding it would report; the 0.1.8
+    # client discards it, so the zero is the measured success code.
+    if result.returncode == 0 or result.returncode == len(args) - 1:
         return "ran"
     if result.returncode < 0:
         logger.warning("ydotool was killed by signal %s", -result.returncode)
@@ -707,9 +727,12 @@ def _probe_overlay():
 
 
 def _socket_accepts(sock_path=YDTOOL_SOCKET):
-    """True when the ydotoold socket takes a connection. No injection, no side
-    effect; the daemon holds an already-recognised device, which is what makes a
-    successful injection mean anything."""
+    """True when the ydotoold socket takes a connection.
+
+    No injection, no side effect; the answer only decides which mode the gate
+    logs. The daemon holds an already-recognised device, so injections through
+    it carry no per-invocation latency caveat — which is the whole difference.
+    """
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         conn.settimeout(PROBE_TIMEOUT)
@@ -721,23 +744,82 @@ def _socket_accepts(sock_path=YDTOOL_SOCKET):
     return True
 
 
-def _probe_injector():
-    """True when ydotool exists, the daemon answers, and a no-op move reports
-    `ran`.
+def parse_tool_list(text):
+    """Return the verbs named by a `ydotool help` output.
 
-    `mousemove_relative 0 0` is the probe because it is a true no-op whose
-    success code (3) is unambiguous: `click 1` succeeds with 2, which collides
-    with the move tools' parse-error return.
+    The list is the lines after the "Available commands:" header, one verb per
+    line; the usage line before it is not a verb. Capability is read from this
+    list because the verb set is build-dependent: Ubuntu's ydotool 0.1.8 offers
+    `type`, `recorder`, `mousemove`, `key` and `click` — and no
+    `mousemove_relative` at all.
+    """
+    lines = text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if "Available commands:" in line:
+            start = index
+            break
+    if start is None:
+        return set()
+    return {line.strip() for line in lines[start + 1 :] if line.strip()}
+
+
+def _probe_tools():
+    """Return the verbs `ydotool help` offers, or None when it cannot answer.
+
+    The help text goes to stderr and the process exits 1 by design (ShowHelp
+    then exit(1)), so this reads the output rather than the code; both streams
+    are consulted so a build that moves the list to stdout still parses.
+    """
+    try:
+        result = _spawn(["ydotool", "help"], PROBE_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.info("grid: `ydotool help` did not answer: %s", exc)
+        return None
+    return parse_tool_list(result.stdout + result.stderr)
+
+
+def _probe_injector():
+    """True when ydotool offers the plugin's verbs and a no-op reports `ran`.
+
+    Capability is read from the binary's own tool list, never assumed: Ubuntu's
+    ydotool 0.1.8 has no `mousemove_relative`, so a probe built on that verb
+    could never pass there. The functional half is `type ""` — the only
+    side-effect-free verb of the five, where `mousemove 0 0` would move the
+    pointer and `click 0` is a real left click.
+
+    The daemon is not a gate. Ubuntu packages no `ydotoold` binary, and ydotool
+    works without one (the VM measured no-op invocations exiting 0; the client's
+    own `notice:` calls the fallback a latency caveat), so the socket decides
+    the mode this logs, not whether the plugin activates. The capability half
+    still fails closed: no binary, no verbs, or a probe that does not report
+    `ran` leaves the words to `mousegrid`.
     """
     if shutil.which("ydotool") is None:
         logger.info("grid: ydotool is not installed")
         return False
-    if not _socket_accepts():
+    tools = _probe_tools()
+    if tools is None:
+        return False
+    missing = [verb for verb in YDTOOL_VERBS if verb not in tools]
+    if missing:
         logger.info(
-            "grid: no ydotoold on %s (clicks would be lost silently)", YDTOOL_SOCKET
+            "grid: ydotool offers no %s (has: %s)",
+            ", ".join(missing),
+            ", ".join(sorted(tools)) or "nothing",
         )
         return False
-    outcome = _run_bounded(["ydotool", "mousemove_relative", "0", "0", "--delay", "0"])
+    if _socket_accepts():
+        logger.info(
+            "grid: ydotoold answers on %s; injections use the daemon", YDTOOL_SOCKET
+        )
+    else:
+        logger.info(
+            "grid: no ydotoold on %s; injections build a per-invocation device "
+            "(latency caveat, not a capability gap)",
+            YDTOOL_SOCKET,
+        )
+    outcome = _run_bounded(YDTOOL_NOOP)
     if outcome != "ran":
         logger.info("grid: the injector probe reported %s", outcome)
         return False
@@ -1502,7 +1584,9 @@ without mapping anything.
 """
 
 import json
+import os
 import sys
+from pathlib import Path
 
 DEFAULT_NAMESPACE = "gridydotool"
 
@@ -1537,19 +1621,60 @@ def emit(payload):
     sys.stdout.flush()
 
 
+def layer_shell_names():
+    """The loadable names for gtk4-layer-shell, most specific first.
+
+    `ctypes.util.find_library` asks the loader's own cache, so an installed
+    runtime is found by *soname*: Ubuntu 25.10's `libgtk4-layer-shell0` ships
+    only `libgtk4-layer-shell.so.0`, and the unversioned `.so` symlink belongs
+    to the `-dev` package a normal user does not have. The soname and the plain
+    name are literal fallbacks: the plain one covers an uninstalled build tree
+    on `LD_LIBRARY_PATH`, which ldconfig cannot see.
+
+    Only a result that names this library is trusted. `find_library` answers
+    with the soname *inside* the file that spells the queried name, so a stale
+    or misnamed `libgtk4-layer-shell.so` on the loader path answers with that
+    file's own soname (measured: a copy of libm under that name answered
+    `libm.so.6`). Loading that answer would preload an unrelated library and
+    the link order this load exists for would be silently lost.
+    """
+    from ctypes.util import find_library
+
+    names = []
+    found = find_library("gtk4-layer-shell")
+    if found and os.path.basename(found).startswith("libgtk4-layer-shell."):
+        names.append(found)
+    for candidate in ("libgtk4-layer-shell.so.0", "libgtk4-layer-shell.so"):
+        if candidate not in names:
+            names.append(candidate)
+    return names
+
+
 def load_layer_shell():
     """Load gtk4-layer-shell and Gtk, or return (None, None).
 
     The library must be loaded before Gtk's Wayland client is, which is what the
     CDLL call buys: linking it later lets libwayland-client win the symbol
     resolution and the layer surface silently comes up as an ordinary window.
+    The names are tried in `layer_shell_names()` order, so a runtime that ships
+    only the soname still loads; the load happens before `gi` regardless.
     """
     from ctypes import CDLL
 
-    try:
-        CDLL("libgtk4-layer-shell.so")
-    except OSError as exc:
-        sys.stderr.write(f"grid-overlay: libgtk4-layer-shell.so not found: {exc}\n")
+    names = layer_shell_names()
+    error = None
+    for name in names:
+        try:
+            CDLL(name)
+        except OSError as exc:
+            error = exc
+        else:
+            break
+    else:
+        sys.stderr.write(
+            f"grid-overlay: gtk4-layer-shell not found "
+            f"(tried {', '.join(names)}): {error}\n"
+        )
         return None, None
     import gi
 
@@ -2153,12 +2278,18 @@ In `docs/troubleshooting.md`, add a section after the existing grid one:
 ## Mouse grid: the grid never appears on a non-GNOME desktop
 
 The grid needs either the Shell extension (GNOME 47+) or the `gridydotool`
-backend, which needs three things: `ydotool` installed, a running `ydotoold`, and a
-compositor with layer-shell support (COSMIC, wlroots, KDE). `ydotoold` also needs
-write access to `/dev/uinput`.
+backend, which needs `ydotool` installed (its tool list must offer `mousemove`
+and `click`, as every packaged 0.1.8 build does) and a compositor with layer-shell
+support (COSMIC, wlroots, KDE). `ydotool` also needs write access to `/dev/uinput`.
 
-Not every distro ships a user unit for the daemon. If `systemctl --user enable
---now ydotoold` answers "Unit ydotoold.service not found", install this as
+A running `ydotoold` is optional. It holds an already-recognised device, so it
+removes the latency caveat the client itself names when it is absent ("ydotoold
+backend unavailable (may have latency+delay issues)"); without it the client
+builds a device per invocation, which works and is what the plugin's log calls the
+per-invocation mode. Some distros ship no `ydotoold` binary at all (Ubuntu's
+`ydotool` package is CLI-only; the daemon is a separate package there). If your
+distro has it but no user unit, `systemctl --user enable --now ydotoold`
+answering "Unit ydotoold.service not found" means installing this as
 `~/.config/systemd/user/ydotoold.service`:
 
 ```ini
@@ -2178,8 +2309,10 @@ ydotoold`. The socket path and its 0600 mode are what the daemon hardcodes in th
 version, which is also why the daemon has to run as your user rather than as root:
 a root daemon's socket is unreachable by your client.
 
-If any of them is missing the daemon logs `grid backend inert` at startup with the
-reason, says nothing out loud, and `mousegrid` keeps the words.
+If `ydotool` or the layer-shell stack is missing, the daemon logs `grid backend
+inert` at startup with the reason, says nothing out loud, and `mousegrid` keeps
+the words. A missing `ydotoold` alone does not: the log names the per-invocation
+mode and the grid still answers.
 ````
 
 - [ ] **Step 5: Document the requirements and the risk**
@@ -2192,8 +2325,9 @@ In `docs/compatibility.md`, extend the mouse-grid row's note to name the second 
 ```
 
 Also state the security note where the requirements are described: installing
-`ydotoold` and granting it `/dev/uinput` is input-injection grade access, the same
-class as the `input` group that hold-to-dictate needs.
+`ydotool` — and running `ydotoold` when the distro offers it — with `/dev/uinput`
+access is input-injection grade access, the same class as the `input` group that
+hold-to-dictate needs.
 
 - [ ] **Step 6: Fix the feature lines**
 
@@ -2226,7 +2360,7 @@ troubleshooting section for a missing stack on a non-GNOME desktop, the
 compatibility and usage pages, the feature lines that implied the Shell extension
 was the only route, and the wheel test's member list.
 
-The requirements section carries the security note as well: ydotoold plus
+The requirements section carries the security note as well: ydotool plus
 /dev/uinput access is input-injection grade, the same class as the input group
 hold-to-dictate needs.
 

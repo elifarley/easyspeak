@@ -24,6 +24,7 @@ without mapping anything.
 import json
 import os
 import sys
+from pathlib import Path
 
 DEFAULT_NAMESPACE = "gridydotool"
 
@@ -71,19 +72,60 @@ def emit(payload):
     sys.stdout.flush()
 
 
+def layer_shell_names():
+    """The loadable names for gtk4-layer-shell, most specific first.
+
+    `ctypes.util.find_library` asks the loader's own cache, so an installed
+    runtime is found by *soname*: Ubuntu 25.10's `libgtk4-layer-shell0` ships
+    only `libgtk4-layer-shell.so.0`, and the unversioned `.so` symlink belongs
+    to the `-dev` package a normal user does not have. The soname and the plain
+    name are literal fallbacks: the plain one covers an uninstalled build tree
+    on `LD_LIBRARY_PATH`, which ldconfig cannot see.
+
+    Only a result that names this library is trusted. `find_library` answers
+    with the soname *inside* the file that spells the queried name, so a stale
+    or misnamed `libgtk4-layer-shell.so` on the loader path answers with that
+    file's own soname (measured: a copy of libm under that name answered
+    `libm.so.6`). Loading that answer would preload an unrelated library and
+    the link order this load exists for would be silently lost.
+    """
+    from ctypes.util import find_library
+
+    names = []
+    found = find_library("gtk4-layer-shell")
+    if found and Path(found).name.startswith("libgtk4-layer-shell."):
+        names.append(found)
+    for candidate in ("libgtk4-layer-shell.so.0", "libgtk4-layer-shell.so"):
+        if candidate not in names:
+            names.append(candidate)
+    return names
+
+
 def load_layer_shell():
     """Load gtk4-layer-shell and Gtk, or return (None, None).
 
     The library must be loaded before Gtk's Wayland client is, which is what the
     CDLL call buys: linking it later lets libwayland-client win the symbol
     resolution and the layer surface silently comes up as an ordinary window.
+    The names are tried in `layer_shell_names()` order, so a runtime that ships
+    only the soname still loads; the load happens before `gi` regardless.
     """
     from ctypes import CDLL
 
-    try:
-        CDLL("libgtk4-layer-shell.so")
-    except OSError as exc:
-        sys.stderr.write(f"grid-overlay: libgtk4-layer-shell.so not found: {exc}\n")
+    names = layer_shell_names()
+    error = None
+    for name in names:
+        try:
+            CDLL(name)
+        except OSError as exc:
+            error = exc
+        else:
+            break
+    else:
+        sys.stderr.write(
+            f"grid-overlay: gtk4-layer-shell not found "
+            f"(tried {', '.join(names)}): {error}\n"
+        )
         return None, None
     try:
         import gi

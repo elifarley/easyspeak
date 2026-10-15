@@ -37,6 +37,7 @@ constraints), and one was confirmed independently:
 | ydotool CLI shape | `v0.1.8`'s own `Client/ydotool.cpp`, `Tools/*/*.cpp` | ⚠️ **differs from every current doc and from 1.0.x** — see table below |
 | gtk4-layer-shell availability | Launchpad (`+source/gtk4-layer-shell`) | ⚠️ **absent from noble 24.04**; first lands in 25.10/26.04 (1.3.0) |
 | uinput access on this host | `getfacl /dev/uinput`, `id -nG` | ⚠️ granted to `ecc` by a **bare ACL**, not a group or udev rule |
+| VM re-check (Ubuntu 25.10, questing cloud image) | packaged `libgtk4-layer-shell0` 1.0.4-2, `ydotool` 0.1.8-3build1, `python3-gi` 3.50; probes run over SSH | ⚠️ **three contract rows changed** — the packaged soname, the five ydotool verbs, and the daemonless notice; the contract tables below carry each as a row |
 
 ## Verified semantics (the contract this plugin relies on)
 
@@ -44,15 +45,16 @@ constraints), and one was confirmed independently:
 
 | Behaviour | Verified detail | Consequence for the plugin |
 |---|---|---|
-| Exit code | `MouseMove::Exec` and `Click::Exec` both `return argc` | `ydotool click 1` **exits 2 on success**; the code carries no failure meaning on its own |
-| Success code per invocation | `argc` of the argv the tool itself sees, so it depends on the invocation: `mousemove_relative 0 0` returns **3**, and the same probe with `--delay 0` appended returns **5**; `click 1` returns **2**, which collides with the parse-error return of the move tools | the seam derives the expected code from the argv it built (`len(args) - 1`) rather than pinning a number, and the gate's probe stays on `mousemove_relative`, never `click`, whose success code is indistinguishable from an error |
+| Exit code | `MouseMove::Exec` and `Click::Exec` both `return argc`, but the client's `main()` **discards that value**: `int rc = this_tool->Exec(...)` is never returned, so any dispatched tool exits 0 | `ydotool click 1` **exits 0 on success** (VM-measured), so the code carries no failure meaning on its own; the seam reads 0 with a clean stderr as `ran` and still accepts the argv-shaped code for a build that forwards it |
+| Available verbs (VM-measured) | Ubuntu's `ydotool help` lists exactly `type`, `recorder`, `mousemove`, `key`, `click` — and **no `mousemove_relative`** at all | capability is read from that list (`parse_tool_list`), and every argv the plugin builds uses a verb from it: the probe's no-op is `type ""`, never `click` (a real click) and never `mousemove` (a real move) |
+| Success code per invocation | the argv-shaped numbers (`mousemove 0 0` → 3, with `--delay 0` → 5, `click 1` → 2) exist only inside `Exec`; the process reports 0 | the seam accepts 0 (the measured client) or `len(args) - 1` (the forwarded-argc build) with no error signature; nothing about the probe depends on the number matching a particular argv |
 | Absolute move | `mousemove <x> <y>` — first emits `RelativeMove({-INT32_MAX, -INT32_MAX})` (clamps at the desktop origin), then the relative delta | "absolute" is an approximation; pointer acceleration can bias it |
 | Move syntax | positional `x y` (1.0.x's `--absolute -x -y` does not exist here) | argv is `["mousemove", str(x), str(y)]` |
 | Click buttons | `1` left, `2` right, `3` middle; press+release in one call, no `--repeat` | double-click = two sequential invocations |
-| Default delay | 100 ms before the action, per invocation (`--delay`) | the plugin passes **`--delay 0`** — the daemon's device is already recognised — so a double-click pair carries no sleeps at all and its gap is measured in the harness (open item 4), not assumed |
-| Scroll | **no wheel verb at all** (`click`/`key`/`type`/`mousemove`/`mousemove_relative`) | scroll verbs are not expressible in this version — deferred, not silently dropped |
-| Daemon socket | hardcoded `/tmp/.ydotool_socket`, `chmod 0600`, no CLI flags | `ydotoold` must run **as the user**; a system-level daemon is unreachable by the client |
-| No daemon | client falls back to creating its own uinput device ("ydotoold backend unavailable (may have latency+delay issues)") | this fallback is exactly why the socket **is** a prerequisite for the click path: a device created per invocation may not be recognised before the events are emitted, so the gate requires the daemon and a fallback `notice:` classifies as `unknown` |
+| Default delay | 100 ms before the action, per invocation (`--delay`) | the plugin passes **`--delay 0`** — with a daemon the device is already recognised, and without one the notice's latency caveat is logged, not hidden — so a double-click pair carries no sleeps at all and its gap is measured in the harness (open item 4), not assumed |
+| Scroll | **no wheel verb at all** (the five verbs the VM's build lists: `type`, `recorder`, `mousemove`, `key`, `click`) | scroll verbs are not expressible in this version — deferred, not silently dropped |
+| Daemon socket | hardcoded `/tmp/.ydotool_socket`, `chmod 0600`, no CLI flags | `ydotoold` must run **as the user** when it is used; a system-level daemon is unreachable by the client, and a distro need not package the binary at all (Ubuntu's `ydotool` package ships only `/usr/bin/ydotool`) |
+| No daemon (VM-measured) | the client falls back to creating its own uinput device and **still works**: `type ""`, `click 0` and `mousemove 0 0` all exit 0 without a daemon, printing `ydotoold backend unavailable (may have latency+delay issues)` on stderr | the fallback is a **latency caveat, not a capability gap**: the socket is not a gate condition, the gate logs which mode is in use, and a fallback `notice:` no longer excludes `ran` |
 | Failure signals | errors go to stderr (`error: …`, `Which coordinate …`, `Unknown tool …`); the daemon notice also goes to stderr | stderr signatures identify `errored`; they cannot identify `unknown`, which is why the seam returns one of three outcomes instead of a boolean |
 
 ### gtk4-layer-shell (Python binding)
@@ -60,7 +62,8 @@ constraints), and one was confirmed independently:
 | Detail | Value |
 |---|---|
 | Namespace | `gi.require_version('Gtk4LayerShell', '1.0')` → `from gi.repository import Gtk4LayerShell` |
-| Link order | `CDLL('libgtk4-layer-shell.so')` **before** importing `gi` (it must precede `libwayland-client`) |
+| Runtime name (VM-measured) | Ubuntu 25.10's `libgtk4-layer-shell0` installs only `libgtk4-layer-shell.so.0` → `libgtk4-layer-shell.so.1.0.4`; the unversioned `.so` symlink is `-dev`-package-only | the helper resolves the soname through `ctypes.util.find_library`, trusting the result only when it names this library (the call reports the soname inside the file that spelled the name, so a stale or misnamed file would answer with its own soname), and falling back to the literal soname and then the plain name (an uninstalled build tree on `LD_LIBRARY_PATH`) |
+| Link order | the library load (first name that loads, soname first) **before** importing `gi` (it must precede `libwayland-client`) |
 | Build floor | meson declares `dependency('gtk4')` with **no version floor** (checked at v1.0.4 and master) |
 | Uninstalled build | `GI_TYPELIB_PATH=<build>/src LD_LIBRARY_PATH=<build>/src` runs without installing |
 | Supported-desktop probe | `is_supported()` — the gate's overlay half |
@@ -285,10 +288,15 @@ forced = EASYSPEAK_GRID_BACKEND
 overlay_ready  = grid_python() is not None
                  AND helper --probe exits 0 within PROBE_TIMEOUT
 injector_ready = shutil.which("ydotool")
-                 AND the ydotoold socket accepts a connection
-                 AND a no-op mousemove_relative 0 0 reports outcome `ran`
-                     (the invocation's own argc, no error signature) within PROBE_TIMEOUT
+                 AND `ydotool help`'s tool list offers the verbs the plugin
+                     builds (`mousemove`, `click`) and the probe's no-op (`type`)
+                 AND a no-op `type "" --delay 0` reports outcome `ran`
+                     (exit 0 on the measured client; no error signature) within PROBE_TIMEOUT
 ```
+
+The socket is **not** part of `injector_ready`: the gate logs whether `ydotoold`
+answers on `/tmp/.ydotool_socket`, because its absence changes latency, not
+capability (the VM row above and the paragraph below).
 
 `grid_python()` mirrors dictation's probe: `EASYSPEAK_GRID_PYTHON` override, then
 `python3`, `/usr/bin/python3`, `/usr/bin/python`, each tested with the helper's
@@ -312,21 +320,27 @@ wherever this one cannot work.
 Readiness is a *positive* signal, never the absence of a negative one. "No error
 signature on stderr" also describes a probe that was killed before it could write
 anything, which would activate a dead injector and then silently swallow every
-click (see the outcome table below). `ran` is what the gate requires, and its
-success code is unambiguous because the probe's argv is chosen for that property.
-A `--probe` that exits 0 inside the timeout is the only other way in.
+click (see the outcome table below). `ran` is what the gate requires, and the
+probe is chosen so that reading it is unambiguous: `type ""` emits nothing, so
+its exit 0 means the tool ran and no side effect happened. A `--probe` that exits
+0 inside the timeout is the only other way in.
 
-**The daemon is required for the click path, and that is what makes `ran` mean
-anything.** Without `ydotoold`, the client creates a uinput device per invocation
-and upstream documents the consequence: a freshly created device needs time for the
-graphical environment to recognise and enable it, and the events emitted before
-that are lost. A click through such a device exits cleanly and lands nowhere, so
-the seam would report `ran` for a click that never happened — a silent no-op
-wearing a success signal, in the one configuration that makes it silent. So the
-socket is part of `injector_ready`: a host without the daemon stays inert (and says
-why in the log at INFO), rather than half-working in a way the user cannot see. The
-socket check is a bare `connect()` on `/tmp/.ydotool_socket` — no injection, no
-side effect.
+**The daemon is a latency caveat, not a prerequisite — the VM proved it.** Ubuntu
+25.10's `ydotool` package ships no `ydotoold` binary at all, and ydotool works
+without one: the client falls back to creating a uinput device per invocation and
+says so (`ydotoold backend unavailable (may have latency+delay issues)`), with
+`type ""`, `click 0` and `mousemove 0 0` all exiting 0 daemonless. Upstream's own
+warning is about latency — a freshly created device needs time for the graphical
+environment to recognise and enable it — and that caveat is real (a click through
+such a device can be lost), but it is not a capability gap and it used to make the
+feature permanently inert on the one OS that packages gtk4-layer-shell. So the
+socket is a logged mode, not a gate condition: `injector_ready` keeps the
+functional capability probe (`type ""`, the only side-effect-free verb of the
+five, because `mousemove 0 0` moves and `click 0` clicks), and the log line names
+which mode is in use — `ydotoold` answers, or a per-invocation device. The socket
+check is a bare `connect()` on `/tmp/.ydotool_socket` — no injection, no side
+effect. A probe that fails (no binary, no verb, no `ran`) still fails closed to
+`mousegrid`.
 
 ### Routing
 
@@ -404,13 +418,13 @@ Every external process — the gate's probes, the helper, and the injections —
 through one module-level seam, `_run_bounded(args, timeout)`, which unit tests
 patch (and which the dry-run switch short-circuits by logging the argv and
 returning `ran` without spawning anything). It never returns a bare exit code,
-because the exit code here is `argc` and carries no failure meaning: it returns one
-of exactly three outcomes.
+because the process code carries no failure meaning — 0 for any dispatched tool on
+the measured client — so it returns one of exactly three outcomes.
 
 | Outcome | Detected by | What it means |
 |---|---|---|
-| `ran` | returncode equals the invocation's own success code, and stderr carries no error signature | the tool emitted the events through the daemon's already-recognised device and exited cleanly. **Emission, not proof of application**: what the compositor did with them is observed in exactly one place, the harness's arm B |
-| `errored` | an error signature on stderr, or a usage/parse returncode | the tool refused; nothing was clicked |
+| `ran` | exit 0 (or the argv-shaped code on a build that forwards `Exec`'s return), and stderr carries no error signature | the tool dispatched cleanly. With a daemon it emitted through the daemon's already-recognised device; without one it built a per-invocation device and the log names that mode. **Emission, not proof of application**: what the compositor did with them is observed in exactly one place, the harness's arm B |
+| `errored` | an error signature on stderr, or a returncode that matches neither success form | the tool refused; nothing was clicked |
 | `unknown` | `TimeoutExpired`, a negative returncode (killed by a signal), or `OSError` from the spawn | **the click may or may not have landed** |
 
 `unknown` is the outcome a review misses, and the reason this is a table rather
@@ -418,22 +432,21 @@ than a boolean: a timeout is not a failure, and it is certainly not a success. I
 is logged at WARNING with the captured stderr and spoken as its own string (D8),
 and **no path retries it** — a repeated click is a second click, so the user's own
 utterance is the only retry this design allows. A `notice: … backend unavailable`
-line on stderr is the one signal that must not be filed as `ran`: it means the
-client fell back to a device created for this invocation, which is exactly the case
-the `ran` row excludes — so it classifies as `unknown`, with the stderr captured
-and the unknown-outcome string spoken. The gate required the socket, so seeing this
-line at all means the daemon died between setup and the click, and the log says so.
+line on stderr is the daemonless fallback naming its latency caveat: the VM
+measured that path working, so it is logged (with the mode it implies) and does
+not change the outcome — the invocation still counts as `ran`.
 
 `INJECT_TIMEOUT = 2.0` bounds each injection, and every invocation passes
-**`--delay 0`**: the delay exists upstream to give a fresh device time to be
-recognised, and the daemon the gate requires already holds a recognised one, so
-here it would buy nothing but latency. That is also what keeps a double-click pair
-tight — two invocations with the default 100 ms sleep each would spend most of the
-desktop's double-click window in sleeps (see open item 4). The timeout is what
-keeps a wedged `ydotoold` from freezing the modal loop with the overlay up: the
-loop exists so the tray stays live and an unattended mode ends itself, and a
-blocking call defeats both. Moves and clicks are sequential calls, which is what
-makes the ordering (move, then click) deterministic.
+**`--delay 0`**: with a daemon the device is already recognised and the delay would
+buy nothing but latency, and without one the invocation is the per-invocation
+shape the VM measured working (the notice itself carries the latency caveat).
+That is also what keeps a double-click pair tight — two invocations with
+the default 100 ms sleep each would spend most of the desktop's double-click window
+in sleeps (see open item 4). The timeout is what keeps a wedged ydotool or
+`ydotoold` from freezing the modal loop with the overlay up: the loop exists so the
+tray stays live and an unattended mode ends itself, and a blocking call defeats
+both. Moves and clicks are sequential calls, which is what makes the ordering
+(move, then click) deterministic.
 
 ### Session lifecycle and failure handling
 
@@ -494,15 +507,18 @@ makes the ordering (move, then click) deterministic.
   sample: they are small, and a sampled comparison is how a drifted entry slips
   through. The parser is compared over a shared utterance sample, since a function
   cannot be enumerated — and what the whole test proves is scoped in D5.
-- **Injection**: exact argv per verb; monitor offset applied to moves only;
-  double-click issues two calls in order; the outcome matrix — `ran` for the
-  invocation's own success code with clean stderr, `errored` for an error signature
-  or a usage returncode, `unknown` for a timeout, a negative returncode or a spawn
-  failure; a `notice:` line means the client fell back to a per-invocation device
-  and classifies as `unknown`, never as `ran`; an
-  `unknown` outcome is logged and spoken but never counted as a success; dry-run
-  records without executing; nothing retries a click; the socket check is part of
-  the gate matrix (a host with the binary but no daemon stays inert).
+- **Injection**: exact argv per verb, and every verb checked against the binary's
+  own list so `mousemove_relative` cannot sneak back in; monitor offset applied to
+  moves only; double-click issues two calls in order; the outcome matrix — `ran`
+  for exit 0 (or the argv-shaped code) with clean stderr, `errored` for an error
+  signature or a returncode matching neither success form, `unknown` for a timeout,
+  a negative returncode or a spawn failure; a `notice:` line means the client fell
+  back to a per-invocation device, is logged with that mode, and still counts as
+  `ran`; an `unknown` outcome is logged and spoken but never counted as a success;
+  dry-run records without executing; nothing retries a click; the socket check is
+  exercised as a mode log, never a gate condition (a host with the binary but no
+  daemon stays active; a missing verb or a failed no-op probe is what keeps it
+  inert).
 - **Bounded waits**: every probe and every injection is exercised against a stub
   that never returns, asserting that the timeout fires, that the gate then reports
   not-ready (so `mousegrid` keeps the words), and that the mode still ends with the
@@ -534,19 +550,22 @@ and its conftest's heavy-dependency stubs so no mic or model is needed. It:
    point is otherwise biased by pointer acceleration;
 2. launches the probe window and the plugin's helper inside that session, with
    `GI_TYPELIB_PATH`/`LD_LIBRARY_PATH` pointing at the layer-shell build tree;
-3. exercises the gate and the plugin in **two shapes**, because the gate's daemon
-   requirement and a privilege-free dry-run arm otherwise pull in opposite
-   directions:
+3. exercises the gate and the plugin in **two shapes**, because the injector's
+   daemonless capability and a privilege-free dry-run arm otherwise pull in
+   opposite directions:
 
-   - **as the box stands** — with no running `ydotoold`, the plugin must come out
-     inert: `handle("grid")` returns `None`, the INFO log names the socket, and the
-     word is left to `mousegrid`. That is a real gate assertion and it needs no
-     privileges at all;
+   - **as the box stands** — with no running `ydotoold`, the injector probe must
+     still come out ready (the VM's daemonless path), the INFO log names which mode
+     is in use, and the socket's absence does not send the word back to
+     `mousegrid`; what does is a tool list without the verbs or a no-op probe that
+     does not report `ran`. The assertion is on `_probe_injector()`/the gate and
+     needs no privileges at all;
    - **with `EASYSPEAK_GRID_BACKEND=uinput`** forcing the backend, so the overlay
      and argv assertions have a session to observe. The forced value
      short-circuits the probes by design, which is what keeps this arm free of any
-     `/dev/uinput` requirement — arm B is the one that keeps the daemon, because
-     arm B is the one that injects.
+     `/dev/uinput` requirement — arm B is the one that injects, and a running
+     `ydotoold` is optional there (the daemon removes the latency caveat the
+     daemonless notice names).
 
    Then `handle("grid", fake_core)` runs with a fake `listen_modal` that replays
    `["3 7 5", "click"]`;
@@ -601,11 +620,12 @@ worth doing rather than a nice-to-have.
 
 - **`ydotoold` runs as the user** (systemd `--user`), because 0.1.8 hardcodes
   `/tmp/.ydotool_socket` at `0600`; a system-level daemon would be unreachable by
-  the client. It is also part of the gate, not an optional extra: upstream
-  documents that a device created per invocation may not be recognised in time, so
-  without the daemon a click can be emitted and lost (see the `ran` row). A host
-  without it keeps `mousegrid` and reads the reason in the log, which is a better
-  outcome than a grid whose clicks quietly do nothing.
+  the client. It is **optional, not part of the gate**: upstream documents that a
+  device created per invocation may not be recognised in time, so without the
+  daemon a click can be emitted and lost — the VM measured the daemonless path
+  working, but that latency caveat is real, and the gate logs which mode is in use
+  rather than refusing to activate. A host without it still serves the grid, with
+  the per-invocation mode in the log.
 - **One daemon owner stays the rule.** The install doc records this as a
   hit-live trap, and this plugin sharpens the consequence: two daemons mean two
   helpers, two stacked overlays and two injections per utterance — one command,
@@ -630,12 +650,12 @@ worth doing rather than a nice-to-have.
 
 1. Branch pushed to the fork (`hug bpush`), CI green: `just format`, `lint`,
    `types`, `pytest`, `check-translations`, `check-python-packages` — and
-   `just integration` wherever sway, ydotool and the layer-shell build exist — plus
-   a running `ydotoold` for arm B, which is the only arm that injects, since arm A
-   forces the backend and needs none. That run is where arm A's assertions live, so
-   the folder's convention of skipping gracefully when a prerequisite is absent
-   means a green run has to say *which* prerequisite it skipped rather than being
-   read as a pass.
+   `just integration` wherever sway, ydotool and the layer-shell build exist. A
+   running `ydotoold` is optional for arm B (it removes the latency caveat the
+   daemonless notice names), and arm A forces the backend and needs none. That run
+   is where arm A's assertions live, so the folder's convention of skipping
+   gracefully when a prerequisite is absent means a green run has to say *which*
+   prerequisite it skipped rather than being read as a pass.
 2. Upstream issue on `ctsdownloads/easyspeak` carrying the findings: the ydotool
    0.1.8 semantics table (exit codes, `mousemove`, the 0600 socket), the
    layer-shell-on-Smithay-but-not-GNOME boundary as the natural gate, the

@@ -1,9 +1,10 @@
 """The gridydotool end-to-end loop, in a headless sway session.
 
-Three checks: the gate stays inert when there is no daemon (no privileges
-needed), the overlay renders and the argv is exact under a forced backend (the
-dry-run arm, which is the arm CI can run), and, only when EASYSPEAK_GRID_LIVE is
-set, that a click lands where the grid aimed it.
+Checks: a failed injector probe keeps `mousegrid` in charge (no privileges
+needed), the injector gate passes daemonless on a real ydotool (the socket is a
+logged mode, not a condition), the overlay renders and the argv is exact under a
+forced backend (the dry-run arm, which is the arm CI can run), and, only when
+EASYSPEAK_GRID_LIVE is set, that a click lands where the grid aimed it.
 
 The literal in the live arm is hand-computed. Deriving it with the same algorithm
 the plugin uses would make the assertion agree with any shared off-by-one, so the
@@ -141,16 +142,33 @@ def _reap_leaked_helper():
         gridydotool.stop_helper("harness cleanup")
 
 
-class TestGateWithoutADaemon:
-    def test_the_plugin_stays_inert(self, monkeypatch):
-        """A box with no ydotoold must keep mousegrid in charge: this is the
-        gate assertion that needs no privileges at all."""
+class TestGate:
+    def test_a_failed_injector_probe_keeps_mousegrid_in_charge(self, monkeypatch):
+        """The fail-closed property, asserted where it needs no privileges and
+        no display: a probe that cannot inject leaves the words to mousegrid."""
         monkeypatch.delenv("EASYSPEAK_GRID_BACKEND", raising=False)
         monkeypatch.setattr(gridydotool, "_probe_overlay", lambda: True)
         monkeypatch.setattr(gridydotool, "_probe_injector", lambda: False)
         gridydotool.setup(core=None)
         assert gridydotool.active() is False
         assert gridydotool.handle("grid", core=None) is None
+
+    def test_the_injector_gate_passes_daemonless(self, monkeypatch, caplog):
+        """A stock Ubuntu box has no `ydotoold` at all, and the VM measured the
+        daemonless path working: the socket is a logged mode, not a condition.
+        This runs the real `ydotool help` and `type ""` probe, so it skips where
+        ydotool is absent or /dev/uinput is not reachable."""
+        if shutil.which("ydotool") is None:
+            pytest.skip("ydotool is not installed")
+        if not os.access("/dev/uinput", os.W_OK):
+            pytest.skip("no /dev/uinput access for the daemonless probe")
+        monkeypatch.delenv("EASYSPEAK_GRID_BACKEND", raising=False)
+        with caplog.at_level("INFO"):
+            assert gridydotool._probe_injector() is True
+        assert any("injections " in r.message for r in caplog.records)
+        monkeypatch.setattr(gridydotool, "_probe_overlay", lambda: True)
+        gridydotool.setup(core=None)
+        assert gridydotool.active() is True
 
 
 class TestForcedBackendArm:

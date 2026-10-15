@@ -2,6 +2,7 @@
 and the parser that turns an utterance into zone numbers."""
 
 import ctypes
+import ctypes.util
 import importlib.util
 import io
 import json
@@ -14,6 +15,20 @@ from unittest.mock import Mock
 import pytest
 from easyspeak.plugins import gridydotool, mousegrid
 from easyspeak.plugins import gridydotool as g
+
+# What Ubuntu 25.10's ydotool 0.1.8 prints for `ydotool help`, read off the VM:
+# the five verbs are the whole surface there, and `mousemove_relative` is not
+# one of them — that absence is what the portable probe exists for.
+UBUNTU_HELP = (
+    "Usage: ydotool <cmd> <args>\n"
+    "Available commands:\n"
+    "  type\n"
+    "  recorder\n"
+    "  mousemove\n"
+    "  key\n"
+    "  click\n"
+)
+UBUNTU_VERBS = {"type", "recorder", "mousemove", "key", "click"}
 
 
 @pytest.fixture(autouse=True)
@@ -117,15 +132,23 @@ def core():
 
 
 class TestOutcomeClassification:
-    """`ydotool` exits with argc, so the exit code alone says nothing; the seam
-    returns one of three outcomes and the tests pin all three."""
+    """The exit code alone says nothing: Exec returns argc but the 0.1.8 client
+    discards it — success is 0, measured on the VM — and the daemonless notice
+    is a caveat. The seam returns one of three outcomes and the tests pin all
+    three."""
 
     def _result(self, returncode=3, stderr="", stdout=""):
         return Mock(returncode=returncode, stderr=stderr, stdout=stdout)
 
-    def test_ran_is_the_invocations_own_success_code(self, monkeypatch):
+    def test_ran_is_the_measured_clients_exit_code(self, monkeypatch):
+        monkeypatch.setattr(g, "_spawn", lambda *a, **k: self._result(0))
+        assert g._run_bounded(["ydotool", "mousemove", "0", "0"]) == "ran"
+
+    def test_ran_accepts_the_argv_shaped_success_code(self, monkeypatch):
+        """A build that forwards Exec's argc return still classifies: the code
+        the tool computes is `len(args) - 1`, which this argv makes 3."""
         monkeypatch.setattr(g, "_spawn", lambda *a, **k: self._result(3))
-        assert g._run_bounded(["ydotool", "mousemove_relative", "0", "0"]) == "ran"
+        assert g._run_bounded(["ydotool", "mousemove", "0", "0"]) == "ran"
 
     def test_errored_on_an_error_signature(self, monkeypatch):
         monkeypatch.setattr(
@@ -150,17 +173,26 @@ class TestOutcomeClassification:
         monkeypatch.setattr(g, "_spawn", Mock(side_effect=FileNotFoundError("ydotool")))
         assert g._run_bounded(["ydotool", "click", "1"]) == "unknown"
 
-    def test_notice_is_unknown_not_ran(self, monkeypatch):
-        """A fallback notice means the client built a one-shot device, which is
-        exactly the case `ran` excludes."""
+    def test_zero_exit_is_ran_even_with_the_daemonless_notice(
+        self, monkeypatch, caplog
+    ):
+        """The VM measured a dispatched tool exiting 0 with the fallback notice
+        on stderr: no daemon is a latency caveat, not a failure, and the log
+        names the per-invocation mode."""
         monkeypatch.setattr(
             g,
             "_spawn",
             lambda *a, **k: self._result(
-                3, stderr="ydotool: notice: ydotoold backend unavailable ..."
+                0, stderr="ydotool: notice: ydotoold backend unavailable ...\n"
             ),
         )
-        assert g._run_bounded(["ydotool", "mousemove_relative", "0", "0"]) == "unknown"
+        with caplog.at_level("INFO"):
+            assert g._run_bounded(["ydotool", "type", "", "--delay", "0"]) == "ran"
+        assert any("per-invocation" in r.message for r in caplog.records)
+
+    def test_a_nonzero_exit_matching_no_success_code_is_errored(self, monkeypatch):
+        monkeypatch.setattr(g, "_spawn", lambda *a, **k: self._result(7))
+        assert g._run_bounded(["ydotool", "click", "1", "--delay", "0"]) == "errored"
 
     def test_dry_run_records_without_spawning(self, monkeypatch):
         spawn = Mock()
@@ -202,6 +234,62 @@ class TestAdapterArgv:
         g.double_click()
         assert [a[2] for a in seen] == ["1", "1"]
 
+    def test_every_argv_the_seam_builds_uses_a_verb_the_binary_lists(self, monkeypatch):
+        """The VM's ydotool offers five verbs and no `mousemove_relative`:
+        every argv the adapter and the probe build must come from its list."""
+        seen = []
+        monkeypatch.setattr(
+            g, "_run_bounded", lambda args, **k: seen.append(list(args)) or "ran"
+        )
+        monkeypatch.setattr(
+            g,
+            "_spawn",
+            lambda cmd, timeout: Mock(returncode=1, stdout="", stderr=UBUNTU_HELP),
+        )
+        monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(g, "_socket_accepts", lambda: False)
+        g._monitor_origin = (0, 0)
+        g.move_to(10, 20)
+        g.click("right")
+        g.double_click()
+        assert g._probe_injector() is True
+        assert [argv[1] for argv in seen] == [
+            "mousemove",
+            "click",
+            "click",
+            "click",
+            "type",
+        ]
+        assert all(argv[1] in UBUNTU_VERBS for argv in seen)
+
+
+class TestToolListParsing:
+    """Capability is read from the binary's own list, never assumed: Ubuntu's
+    ydotool 0.1.8 offers five verbs and no `mousemove_relative`, so a probe
+    built on an assumed verb could never pass there."""
+
+    def test_reads_the_five_verbs_the_vm_showed(self):
+        assert g.parse_tool_list(UBUNTU_HELP) == UBUNTU_VERBS
+
+    def test_an_answer_without_the_header_yields_nothing(self):
+        assert (
+            g.parse_tool_list("Run 'ydotool help' if you want a tools list\n") == set()
+        )
+
+    def test_only_the_lines_after_the_header_are_verbs(self):
+        text = (
+            "Usage: ydotool <cmd> <args>\nAvailable commands:\n  mousemove\n\n  click\n"
+        )
+        assert g.parse_tool_list(text) == {"mousemove", "click"}
+
+    def test_the_probe_reads_the_list_from_stderr(self, monkeypatch):
+        monkeypatch.setattr(
+            g,
+            "_spawn",
+            lambda cmd, timeout: Mock(returncode=1, stdout="", stderr=UBUNTU_HELP),
+        )
+        assert g._probe_tools() == UBUNTU_VERBS
+
 
 class TestGate:
     def test_inert_at_import(self):
@@ -230,13 +318,81 @@ class TestGate:
         g.setup(core)
         assert g.active() is False
 
-    def test_injector_probe_requires_the_socket(self, monkeypatch):
-        monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
-        # `connect` raises, so the probe fails on the socket alone and never
-        # spawns: deterministic also on a host with ydotool and a live daemon.
+    @staticmethod
+    def _help_result():
+        """What `ydotool help` returns on Ubuntu: the list on stderr, exit 1."""
+        return Mock(returncode=1, stdout="", stderr=UBUNTU_HELP)
+
+    def test_socket_check_is_a_bare_connect_that_cannot_raise(self, monkeypatch):
         stub = Mock()
         stub.connect.side_effect = OSError("connection refused")
         monkeypatch.setattr(g.socket, "socket", Mock(return_value=stub))
+        assert g._socket_accepts() is False
+        stub.close.assert_called_once()
+
+    def test_socket_check_reports_the_daemon_mode(self, monkeypatch):
+        monkeypatch.setattr(g.socket, "socket", Mock(return_value=Mock()))
+        assert g._socket_accepts() is True
+
+    def test_injector_probe_is_portable_and_daemonless(self, monkeypatch, caplog):
+        """The VM shape: Ubuntu's five verbs, no ydotoold, a no-op that reports
+        `ran` — the socket is a logged mode, not a gate condition."""
+        monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(g, "_socket_accepts", lambda: False)
+        monkeypatch.setattr(g, "_spawn", lambda cmd, timeout: self._help_result())
+        seen = []
+        monkeypatch.setattr(
+            g, "_run_bounded", lambda args, **k: seen.append(list(args)) or "ran"
+        )
+        with caplog.at_level("INFO"):
+            assert g._probe_injector() is True
+        assert seen == [["ydotool", "type", "", "--delay", "0"]]
+        assert any("per-invocation" in r.message for r in caplog.records)
+
+    def test_injector_probe_logs_the_daemon_mode_when_the_socket_answers(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(g, "_socket_accepts", lambda: True)
+        monkeypatch.setattr(g, "_spawn", lambda cmd, timeout: self._help_result())
+        monkeypatch.setattr(g, "_run_bounded", lambda args, **k: "ran")
+        with caplog.at_level("INFO"):
+            assert g._probe_injector() is True
+        assert any("use the daemon" in r.message for r in caplog.records)
+
+    def test_injector_probe_fails_closed_without_a_verb_it_builds(self, monkeypatch):
+        """Ubuntu's list minus `mousemove`: the gate must not claim the words."""
+        text = "Usage: ydotool <cmd> <args>\nAvailable commands:\n  type\n  click\n"
+        monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(
+            g,
+            "_spawn",
+            lambda cmd, timeout: Mock(returncode=1, stdout="", stderr=text),
+        )
+        monkeypatch.setattr(g, "_run_bounded", Mock(side_effect=AssertionError))
+        assert g._probe_injector() is False
+
+    def test_injector_probe_fails_closed_when_the_noop_reports_not_ran(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(g, "_spawn", lambda cmd, timeout: self._help_result())
+        monkeypatch.setattr(g, "_run_bounded", lambda args, **k: "errored")
+        assert g._probe_injector() is False
+
+    def test_injector_probe_fails_closed_without_the_binary(self, monkeypatch):
+        monkeypatch.setattr(g.shutil, "which", lambda name: None)
+        assert g._probe_injector() is False
+
+    def test_a_help_that_does_not_answer_is_no_capability(self, monkeypatch):
+        import subprocess
+
+        monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+        def boom(cmd, timeout):
+            raise subprocess.TimeoutExpired(cmd="ydotool", timeout=5.0)
+
+        monkeypatch.setattr(g, "_spawn", boom)
         assert g._probe_injector() is False
 
 
@@ -718,6 +874,138 @@ class TestOverlayPureParts:
 
     def test_the_module_imports_without_gi(self):
         assert _overlay_module() is not None
+
+
+class TestOverlayLibraryLookup:
+    """The runtime ships only the soname; the unversioned `.so` is `-dev`-only.
+
+    Ubuntu 25.10's `libgtk4-layer-shell0` installs `libgtk4-layer-shell.so.0`
+    (-> `.so.1.0.4`) and nothing unversioned, so `CDLL("libgtk4-layer-shell.so")`
+    refuses everywhere the library is merely installed. The chain resolves the
+    soname through the loader's own cache and keeps the plain name for an
+    uninstalled build tree on `LD_LIBRARY_PATH`. A `find_library` result is
+    trusted only when it names this library, because it reports the soname
+    *inside* the file that spelled the name.
+    """
+
+    def test_the_chain_ends_at_the_soname_and_the_plain_name(self, monkeypatch):
+        overlay = _overlay_module()
+        monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
+        assert overlay.layer_shell_names() == [
+            "libgtk4-layer-shell.so.0",
+            "libgtk4-layer-shell.so",
+        ]
+
+    def test_the_chain_prefers_what_find_library_resolves(self, monkeypatch):
+        overlay = _overlay_module()
+        monkeypatch.setattr(
+            ctypes.util, "find_library", lambda name: "libgtk4-layer-shell.so.0"
+        )
+        assert overlay.layer_shell_names() == [
+            "libgtk4-layer-shell.so.0",
+            "libgtk4-layer-shell.so",
+        ]
+
+    def test_a_result_that_names_another_library_is_not_trusted(self, monkeypatch):
+        """`find_library` answers with the soname embedded in the file it found,
+        never a made-up one: a copy of libm under the name
+        `libgtk4-layer-shell.so` answers `libm.so.6`, and trusting it would make
+        the loader preload libm while the link order the CDLL exists for is
+        silently lost."""
+        overlay = _overlay_module()
+        monkeypatch.setattr(ctypes.util, "find_library", lambda name: "libm.so.6")
+        assert overlay.layer_shell_names() == [
+            "libgtk4-layer-shell.so.0",
+            "libgtk4-layer-shell.so",
+        ]
+
+    def test_load_walks_the_chain_until_a_name_loads(self, monkeypatch):
+        overlay = _overlay_module()
+        monkeypatch.setattr(
+            ctypes.util, "find_library", lambda name: "libgtk4-layer-shell.so.99"
+        )
+        attempts = []
+
+        def cdll(name):
+            attempts.append(name)
+            if name != "libgtk4-layer-shell.so.0":
+                msg = f"{name}: cannot open shared object file"
+                raise OSError(msg)
+            return Mock()
+
+        monkeypatch.setattr(ctypes, "CDLL", cdll)
+        overlay.load_layer_shell()
+        assert attempts == [
+            "libgtk4-layer-shell.so.99",
+            "libgtk4-layer-shell.so.0",
+        ]
+
+    def test_a_host_with_only_the_versioned_soname_loads_it(self, monkeypatch):
+        """The VM shape: `libgtk4-layer-shell0` installs only `.so.0`, which
+        find_library resolves through the loader's cache. A chain reduced to the
+        single hardcoded plain name would try `.so`, fail, and refuse where the
+        library is installed."""
+        overlay = _overlay_module()
+        monkeypatch.setattr(
+            ctypes.util, "find_library", lambda name: "libgtk4-layer-shell.so.0"
+        )
+        attempts = []
+
+        def cdll(name):
+            attempts.append(name)
+            if name != "libgtk4-layer-shell.so.0":
+                msg = f"{name}: cannot open shared object file"
+                raise OSError(msg)
+            return Mock()
+
+        monkeypatch.setattr(ctypes, "CDLL", cdll)
+        overlay.load_layer_shell()
+        assert attempts == ["libgtk4-layer-shell.so.0"]
+
+    def test_load_never_opens_a_name_meant_for_another_library(self, monkeypatch):
+        overlay = _overlay_module()
+        monkeypatch.setattr(ctypes.util, "find_library", lambda name: "libm.so.6")
+        attempts = []
+
+        def cdll(name):
+            attempts.append(name)
+            msg = f"{name}: cannot open shared object file"
+            raise OSError(msg)
+
+        monkeypatch.setattr(ctypes, "CDLL", cdll)
+        assert overlay.load_layer_shell() == (None, None)
+        assert attempts == [
+            "libgtk4-layer-shell.so.0",
+            "libgtk4-layer-shell.so",
+        ]
+
+    def test_load_reaches_the_plain_name_of_an_uninstalled_build(self, monkeypatch):
+        overlay = _overlay_module()
+        monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
+        attempts = []
+
+        def cdll(name):
+            attempts.append(name)
+            if name != "libgtk4-layer-shell.so":
+                msg = f"{name}: cannot open shared object file"
+                raise OSError(msg)
+            return Mock()
+
+        monkeypatch.setattr(ctypes, "CDLL", cdll)
+        overlay.load_layer_shell()
+        assert attempts == [
+            "libgtk4-layer-shell.so.0",
+            "libgtk4-layer-shell.so",
+        ]
+
+    def test_the_refusal_names_every_candidate(self, monkeypatch, capsys):
+        overlay = _overlay_module()
+        monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
+        monkeypatch.setattr(ctypes, "CDLL", Mock(side_effect=OSError("absent")))
+        assert overlay.load_layer_shell() == (None, None)
+        err = capsys.readouterr().err
+        assert "libgtk4-layer-shell.so.0" in err
+        assert "libgtk4-layer-shell.so" in err
 
 
 class TestOverlayServePath:
