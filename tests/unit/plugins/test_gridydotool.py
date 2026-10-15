@@ -464,6 +464,102 @@ class TestClientEnv:
         assert seen["env"]["YDOTOOL_SOCKET"] == "/alive.sock"
 
 
+class TestHelperEnv:
+    """`EASYSPEAK_GRID_TYPELIB` reaches the helper and the probes that gate it."""
+
+    def test_the_build_tree_is_exported_as_both_search_paths(self):
+        env = g.helper_env({"EASYSPEAK_GRID_TYPELIB": "/build/src"})
+        assert env["GI_TYPELIB_PATH"] == "/build/src"
+        assert env["LD_LIBRARY_PATH"] == "/build/src"
+
+    def test_existing_search_paths_are_prepended_not_replaced(self):
+        env = g.helper_env(
+            {
+                "EASYSPEAK_GRID_TYPELIB": "/build/src",
+                "GI_TYPELIB_PATH": "/flake/gi",
+                "LD_LIBRARY_PATH": "/flake/lib",
+            }
+        )
+        assert env["GI_TYPELIB_PATH"] == f"/build/src{os.pathsep}/flake/gi"
+        assert env["LD_LIBRARY_PATH"] == f"/build/src{os.pathsep}/flake/lib"
+
+    def test_without_the_override_nothing_is_rewritten(self):
+        base = {"GI_TYPELIB_PATH": "/flake/gi", "LD_LIBRARY_PATH": "/flake/lib"}
+        env = g.helper_env(base)
+        assert env == base
+        assert env is not base
+
+    def test_the_default_base_is_this_process_environment(self, monkeypatch):
+        monkeypatch.setenv("EASYSPEAK_GRID_TYPELIB", "/build/src")
+        monkeypatch.delenv("GI_TYPELIB_PATH", raising=False)
+        assert g.helper_env()["GI_TYPELIB_PATH"] == "/build/src"
+
+    def test_the_interpreter_probe_runs_under_the_export(self, monkeypatch):
+        """Without the paths here, the resolver reports the build tree's own
+        interpreter as unsupported and the gate closes on a box it would serve."""
+        monkeypatch.setenv("EASYSPEAK_GRID_TYPELIB", "/build/src")
+        monkeypatch.setenv("GI_TYPELIB_PATH", "/flake/gi")
+        monkeypatch.setenv("LD_LIBRARY_PATH", "/flake/lib")
+        monkeypatch.delenv("EASYSPEAK_GRID_PYTHON", raising=False)
+        seen = []
+        monkeypatch.setattr(
+            g.subprocess,
+            "run",
+            lambda cmd, **kwargs: seen.append((cmd, kwargs)) or Mock(returncode=0),
+        )
+        assert g.grid_python() == "python3"
+        assert seen[0][1]["env"]["GI_TYPELIB_PATH"] == (
+            f"/build/src{os.pathsep}/flake/gi"
+        )
+        assert seen[0][1]["env"]["LD_LIBRARY_PATH"] == (
+            f"/build/src{os.pathsep}/flake/lib"
+        )
+
+    def test_the_helper_probe_runs_under_the_export(self, monkeypatch):
+        monkeypatch.setenv("EASYSPEAK_GRID_TYPELIB", "/build/src")
+        monkeypatch.setenv("GI_TYPELIB_PATH", "/flake/gi")
+        monkeypatch.setattr(g, "grid_python", lambda: "python3")
+        seen = []
+        monkeypatch.setattr(
+            g.subprocess,
+            "run",
+            lambda cmd, **kwargs: (
+                seen.append((cmd, kwargs)) or Mock(returncode=0, stdout="", stderr="")
+            ),
+        )
+        assert g._probe_overlay() is True
+        assert seen[0][1]["env"]["GI_TYPELIB_PATH"] == (
+            f"/build/src{os.pathsep}/flake/gi"
+        )
+
+    def test_the_helper_spawn_runs_under_the_export(self, monkeypatch, tmp_path):
+        helper = tmp_path / "helper.py"
+        helper.write_text(
+            "import json, sys\n"
+            "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 1920, 1080],"
+            " 'scale': 1.0}), flush=True)\n"
+            "sys.stdin.readline()\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(g, "HELPER", str(helper))
+        monkeypatch.setattr(g, "grid_python", lambda: sys.executable)
+        monkeypatch.setenv("EASYSPEAK_GRID_TYPELIB", "/build/src")
+        monkeypatch.setenv("LD_LIBRARY_PATH", "/flake/lib")
+        real_popen = g.subprocess.Popen
+        seen = []
+
+        def spy_popen(*args, **kwargs):
+            seen.append(kwargs)
+            return real_popen(*args, **kwargs)
+
+        monkeypatch.setattr(g.subprocess, "Popen", spy_popen)
+        assert g._start_helper() == (0, 0, 1920, 1080)
+        g.stop_helper("test")
+        assert seen[0]["env"]["LD_LIBRARY_PATH"] == (
+            f"/build/src{os.pathsep}/flake/lib"
+        )
+
+
 class TestAdapterArgv:
     def test_move_applies_the_monitor_origin(self, monkeypatch):
         seen = []

@@ -427,6 +427,37 @@ HELPER_PROBE = (
     "gi.require_version('Gtk4LayerShell', '1.0'); "
     "from gi.repository import Gtk, Gtk4LayerShell"
 )
+# The two search paths a gtk4-layer-shell build tree has to be exported through:
+# `GI_TYPELIB_PATH` for `gi` to find the typelib, `LD_LIBRARY_PATH` for the
+# dynamic loader to find the shared object next to it.
+TYPELIB_PATH_VARS = ("GI_TYPELIB_PATH", "LD_LIBRARY_PATH")
+
+
+def helper_env(base=None):
+    """Return the environment the helper and every probe leading to it runs in.
+
+    `EASYSPEAK_GRID_TYPELIB` names the `src` directory of an uninstalled
+    gtk4-layer-shell build — the documented fallback where no distro packages
+    the layer-shell stack — but neither `gi` nor the dynamic loader understands
+    that name. It is translated here into the two paths they do read, each
+    prepended to whatever this process already carries, exactly as the
+    integration fixture does. The same environment is handed to the interpreter
+    probe, the helper's `--probe` and the helper spawn alike: a resolver that
+    cannot see the build tree reports the very interpreter the override was set
+    for as unsupported, and the gate then fails closed on a box the build tree
+    would have served.
+
+    `base` defaults to this process's environment; passing a mapping makes the
+    construction a function of its input alone.
+    """
+    env = dict(os.environ if base is None else base)
+    build = env.get("EASYSPEAK_GRID_TYPELIB")
+    if not build:
+        return env
+    for name in TYPELIB_PATH_VARS:
+        existing = env.get(name, "")
+        env[name] = f"{build}{os.pathsep}{existing}" if existing else build
+    return env
 
 
 def grid_python():
@@ -434,8 +465,10 @@ def grid_python():
 
     Mirrors dictation's AT-SPI probe: the helper needs PyGObject and the
     layer-shell typelib, which the daemon's venv does not have, so each
-    candidate is probed with the helper's own import chain. Bounded, because a
-    startup hang is invisible in a way an exception is not.
+    candidate is probed with the helper's own import chain. The probe runs in
+    `helper_env()`, so an interpreter that only finds the typelib through
+    `EASYSPEAK_GRID_TYPELIB` counts. Bounded, because a startup hang is
+    invisible in a way an exception is not.
     """
     override = os.environ.get("EASYSPEAK_GRID_PYTHON")
     candidates = (override,) if override else GRID_PYTHON_CANDIDATES
@@ -446,6 +479,7 @@ def grid_python():
                 capture_output=True,
                 check=False,
                 timeout=PROBE_TIMEOUT,
+                env=helper_env(),
             )
         except (OSError, subprocess.TimeoutExpired):
             continue
@@ -457,7 +491,8 @@ def grid_python():
 def _probe_overlay():
     """True when an interpreter can run the helper and layer-shell is supported.
 
-    The helper answers the layer-shell question in --probe mode.
+    The helper answers the layer-shell question in --probe mode, under
+    `helper_env()` so a build-tree override reaches the probe as well.
     """
     python = grid_python()
     if python is None:
@@ -469,6 +504,7 @@ def _probe_overlay():
             capture_output=True,
             check=False,
             timeout=PROBE_TIMEOUT,
+            env=helper_env(),
         )
     except (OSError, subprocess.TimeoutExpired):
         logger.info("grid: the helper probe did not answer in time")
@@ -819,7 +855,9 @@ def _start_helper():
     """Spawn the helper, take its geometry, and return it or None.
 
     The helper is spawned with `Popen`, not `run`: `run` would only return once
-    the process exits, and this process must stay up and keep rendering. The
+    the process exits, and this process must stay up and keep rendering. It
+    runs under `helper_env()`, which is where a gtk4-layer-shell build tree
+    named by `EASYSPEAK_GRID_TYPELIB` becomes visible to the helper. The
     `ready` wait is a read on a live child's pipe, so it is bounded by a `select`
     deadline rather than a subprocess timeout, which cannot reach a pipe read. A
     helper that stays alive and writes nothing is the case that distinction
@@ -836,6 +874,7 @@ def _start_helper():
             stdout=subprocess.PIPE,
             text=True,
             bufsize=1,
+            env=helper_env(),
         )
     except OSError as exc:
         logger.warning("grid: the helper could not start: %s", exc)

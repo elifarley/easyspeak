@@ -46,8 +46,10 @@ distro packages them, that is all the overlay needs: the helper resolves the
 library **by its soname** (`libgtk4-layer-shell.so.0`), so the `-dev` package
 and its unversioned `.so` symlink are not needed and `EASYSPEAK_GRID_TYPELIB` is
 unnecessary. Where no package exists, build gtk4-layer-shell and point
-`EASYSPEAK_GRID_TYPELIB` at the build tree's `src` directory (the helper exports
-it as both `GI_TYPELIB_PATH` and `LD_LIBRARY_PATH`).
+`EASYSPEAK_GRID_TYPELIB` at the build tree's `src` directory: EasySpeak
+prepends it to `GI_TYPELIB_PATH` and `LD_LIBRARY_PATH` in the helper's
+environment, and probes interpreter candidates with those same paths, so both
+the check that enables the grid and the grid itself find the build tree.
 
 Granting `/dev/uinput` access is a deployment step, not a session tweak: a
 `setfacl` grant does not survive a reboot, a udev rule does. Add

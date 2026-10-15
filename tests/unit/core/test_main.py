@@ -1,15 +1,17 @@
 """Tests for the core main module."""
 
+import importlib
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, call, patch
 
 import numpy as np
 import pytest
+from easyspeak.core import main as main_module
 from easyspeak.core.config import MISUNDERSTAND_GRACE
 from easyspeak.core.main import EasySpeak
 from easyspeak.core.tray import STATE_MUTED, TrayAction
-from easyspeak.plugins import gridydotool
 
 
 class TestEasySpeakInit:
@@ -120,6 +122,34 @@ class TestEasySpeakUtilities:
         easy.deactivate()
 
         easy.tray.request_sleep.assert_called_once()
+
+
+def _inert_gridydotool(monkeypatch):
+    """Patch the grid plugin's layer-shell probe where the loader calls it.
+
+    `load_plugins` puts `src/` on `sys.path` and imports each plugin as
+    top-level `plugins.<stem>`. That module object is *not* the
+    `easyspeak.plugins.<stem>` the suite imports elsewhere: both names resolve
+    the same file through different package names, so patching one never
+    reaches `setup()` on the other and the real probes still spawn. This
+    imports the loader's own namespace first and patches it there; the returned
+    list records the call the loader makes, and is what fails if the patch ever
+    drifts back off that namespace.
+
+    Returns the probe calls; an empty list means the real probe ran.
+    """
+    src = Path(main_module.__file__).resolve().parent.parent
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    module = importlib.import_module("plugins.gridydotool")
+    probes = []
+
+    def reject_probe():
+        probes.append(True)
+        return False
+
+    monkeypatch.setattr(module, "_probe_overlay", reject_probe)
+    return probes
 
 
 class TestEasySpeakPlugins:
@@ -281,9 +311,11 @@ class TestEasySpeakPlugins:
         easy = EasySpeak()
 
         # setup() runs for real here: the patch keeps a loader test from spawning
-        # probes and injecting anything.
-        monkeypatch.setattr(gridydotool, "_probe_overlay", lambda: False)
+        # probes and injecting anything, and the probe record it returns is the
+        # proof it bound to the namespace the loader calls (_inert_gridydotool).
+        probes = _inert_gridydotool(monkeypatch)
         easy.load_plugins()
+        assert probes == [True]
         loaded = {module.__name__.rsplit(".", 1)[-1] for module in easy.plugins}
 
         assert loaded == {
@@ -304,10 +336,11 @@ class TestEasySpeakPlugins:
         """Commands reach the modes first and the help/exit catch-all last."""
         easy = EasySpeak()
 
-        # setup() runs for real here: the patch keeps a loader test from spawning
-        # probes and injecting anything.
-        monkeypatch.setattr(gridydotool, "_probe_overlay", lambda: False)
+        # Same binding as above: the routing order is only meaningful when
+        # gridydotool loaded through the patched probe rather than a real one.
+        probes = _inert_gridydotool(monkeypatch)
         easy.load_plugins()
+        assert probes == [True]
         names = [module.NAME for module in easy.plugins]
 
         # The grid backend loads ahead of mousegrid: it shadows the same words,
