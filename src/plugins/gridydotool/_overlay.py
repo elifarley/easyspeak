@@ -40,6 +40,25 @@ def cell_rects(bounds):
     ]
 
 
+def surface_rects(bounds, origin):
+    """Map monitor-local bounds into the surface's own coordinate space.
+
+    The plugin computes monitor-local rects and adds the monitor's
+    compositor-global origin only at injection time (design D6). The layer
+    surface covers exactly the monitor it is anchored to, so its own drawing
+    space *is* the monitor-local space, and `origin` — the compositor-global
+    origin `report_monitor` puts on the `ready` event for the plugin's
+    arithmetic — must never shift a cell here. An earlier revision subtracted
+    it, which slid the grid and its digits off the visible surface on any
+    output whose origin was not (0, 0) while the click still landed correctly;
+    the parameter stays in the signature so a unit test can pin the identity
+    mapping against a non-zero origin instead of leaving it to be re-derived
+    by eye.
+    """
+    del origin  # D6: monitor-local bounds are drawn in the surface's own space
+    return cell_rects(bounds)
+
+
 def parse_command(line):
     """Return the command object on a protocol line, or None if there is none."""
     line = line.strip()
@@ -220,12 +239,12 @@ class Overlay:  # pragma: no cover - needs GTK; run live
         """
         if not self.bounds:
             return
-        origin_x, origin_y = self.origin
         cr.set_source_rgba(0.05, 0.05, 0.08, 0.55)
         cr.paint()
         cr.set_source_rgba(0.95, 0.95, 0.95, 0.95)
-        for index, (x, y, w, h) in enumerate(cell_rects(self.bounds), start=1):
-            left, top = x - origin_x, y - origin_y
+        for index, (left, top, w, h) in enumerate(
+            surface_rects(self.bounds, self.origin), start=1
+        ):
             cr.rectangle(left, top, w, h)
             cr.stroke()
             cr.move_to(left + w / 2 - 8, top + h / 2 + 8)
@@ -275,7 +294,10 @@ def report_monitor(overlay):  # pragma: no cover - needs a live surface
 
     The monitor geometry comes from the surface, not from an assumption: the
     compositor chooses the output (the helper makes no set_monitor call), and
-    this report is the plugin's only source of screen size.
+    this report is the plugin's only source of screen size. The origin is the
+    compositor-global one and rides along for the plugin's injection
+    arithmetic; the drawing must stay in the surface's own space and never
+    apply it (see `surface_rects`).
     """
     surface = overlay.window.get_surface()
     display = surface.get_display()

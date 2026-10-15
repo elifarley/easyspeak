@@ -8,6 +8,7 @@ shadows the same phrases, so one utterance must land on the same pixel whichever
 backend answers.
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -664,9 +665,9 @@ def _open_session(core, bounds=None):
     _monitor = geometry
     _monitor_origin = (geometry[0], geometry[1])
     _bounds = tuple(bounds) if bounds else (0, 0, geometry[2], geometry[3])
-    _redraw(_bounds)  # Task 3 fills this in: without a show the
-    # grid is never drawn and the session
-    # looks like a dead daemon
+    # The first show goes out before the mode starts listening: without it the
+    # grid is never drawn and the session looks like a dead daemon.
+    _redraw(_bounds)
     _grid_open = True
     core.speak(_("Grid"))
     try:
@@ -732,7 +733,10 @@ def _run_mode(core):
     """Dispatch one utterance per round until the mode ends.
 
     Core owns the loop (see listen_modal) so the tray stays live and an
-    unattended grid times out instead of holding the microphone for ever.
+    unattended grid times out instead of holding the microphone for ever. Each
+    round first checks the helper is still alive: a helper that died with the
+    grid open ends the mode before this utterance can aim a click at geometry
+    that no longer exists.
     """
     global _bounds, _last_bounds
     for spoken in core.listen_modal(
@@ -744,6 +748,18 @@ def _run_mode(core):
         timeout=10,
         idle_timeout=30,
     ):
+        if _helper is not None and _helper.poll() is not None:
+            # The surface is gone (helper crash, compositor restart, monitor
+            # unplugged). A click is never injected against geometry that no
+            # longer exists: end the mode through the dismissal path, which
+            # discards the bounds too. No speech - the spec asks for the log
+            # line and the end of the mode, not a new reply string.
+            logger.warning(
+                "grid: the helper exited with the grid open; ending the mode"
+            )
+            _dismiss()
+            return
+
         text = spoken.lower()
         words = set(text.split())
 
@@ -903,6 +919,11 @@ def _send(payload):
         _helper.stdin.flush()
     except (BrokenPipeError, ValueError):
         logger.warning("grid: the helper is gone; dropping %s", payload.get("cmd"))
+        # Dispose of the dead stream now: a wrapper that still holds the
+        # undelivered line retries the flush when it is collected, and Python
+        # reports the retried BrokenPipeError as an ignored exception on stderr.
+        with contextlib.suppress(OSError, ValueError):
+            _helper.stdin.close()
         return False
     return True
 

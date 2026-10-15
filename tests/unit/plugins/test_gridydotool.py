@@ -864,8 +864,9 @@ class TestModeDispatch:
 
     def test_unrecognised_utterance_keeps_the_mode(self, monkeypatch, core):
         monkeypatch.setattr(g, "move_to", Mock())
-        # `_dismiss` is stubbed as in the two tests above: its real body calls
-        # `_close_session`, which is Task 4's seam and undefined at this commit.
+        # `_dismiss` is stubbed as in the two tests above: the dispatch of the
+        # unknown utterance is this test's subject, not the session teardown
+        # its real body performs.
         monkeypatch.setattr(g, "_dismiss", Mock())
         core.listen_modal = Mock(return_value=iter(["open firefox", "close"]))
         g._run_mode(core)
@@ -977,9 +978,9 @@ class TestClickKind:
 class TestRedraw:
     def test_sends_the_show_command(self, monkeypatch):
         sent = []
-        # `_send` is Task 4's seam and is not defined at this commit; the stub
-        # is injected anyway because the show payload is this test's subject.
-        monkeypatch.setattr(g, "_send", sent.append, raising=False)
+        # `_send` is stubbed so the show payload can be asserted without a
+        # helper on the other end of the pipe.
+        monkeypatch.setattr(g, "_send", sent.append)
         g._redraw((0, 0, 900, 600))
         assert sent == [{"cmd": "show", "bounds": [0, 0, 900, 600]}]
 
@@ -1088,11 +1089,15 @@ class TestHelperLifecycle:
     """
 
     def _ready_script(self):
+        """A helper that stays up for the session, like the real one does: it
+        reads stdin until EOF, so the loop-top liveness check sees it alive and
+        the teardown paths are what end it."""
         return (
             "import json, sys\n"
             "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 900, 600]}),"
             " flush=True)\n"
-            "sys.stdin.readline()\n"
+            "for _ in sys.stdin:\n"
+            "    pass\n"
         )
 
     def test_a_real_session_that_ends_on_idle_still_closes(self, core, fake_helper):
@@ -1117,6 +1122,44 @@ class TestHelperLifecycle:
             g._("Grid"),
             g._("Grid closed"),
         ]
+
+    def test_a_helper_that_dies_with_the_grid_open_ends_the_mode(
+        self, monkeypatch, core, fake_helper, caplog
+    ):
+        """The spec's row: a helper that dies with the grid open is logged, the
+        mode ends, the bounds are discarded - and a click is never injected
+        against geometry that no longer exists. The death shows at the loop
+        top, so the session is driven one utterance past it."""
+        fake_helper(
+            "import json, sys\n"
+            "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 900, 600]}),"
+            " flush=True)\n"
+            "sys.stdin.readline()\n"
+            "sys.exit(0)\n"
+        )
+        move_to = Mock()
+        click = Mock()
+        monkeypatch.setattr(g, "move_to", move_to)
+        monkeypatch.setattr(g, "click", click)
+
+        def utterances():
+            # The fake helper exits after the first show reaches it, the way a
+            # crashed helper would; make sure it has done so before the first
+            # utterance is consumed, or the check would race the death.
+            assert g._helper.wait(timeout=5) == 0
+            yield "click"
+
+        core.listen_modal = Mock(return_value=utterances())
+        with caplog.at_level("WARNING"):
+            assert g._open_session(core) == "done"
+        move_to.assert_not_called()
+        click.assert_not_called()
+        assert g._helper is None
+        assert g._grid_open is False
+        assert g._bounds is None
+        assert any("grid open" in r.message for r in caplog.records)
+        # Logged, not spoken: no new reply string for this path.
+        assert [call.args[0] for call in core.speak.call_args_list] == [g._("Grid")]
 
     def test_closing_twice_reaps_once_and_survives_the_second_call(self, start_helper):
         assert start_helper(
@@ -1162,13 +1205,16 @@ class TestHelperLifecycle:
 
     def test_a_broken_pipe_swallows_the_command(self, monkeypatch, caplog):
         """A helper that died between the handshake and a command is not a
-        crash: the write fails, the line is dropped, and the log says so."""
+        crash: the write fails, the line is dropped, the log says so, and the
+        dead stream is closed so the undelivered line is not re-flushed - and
+        reported as an ignored exception - when the wrapper is collected."""
         stdin = Mock()
         stdin.write.side_effect = BrokenPipeError("the helper is gone")
         monkeypatch.setattr(g, "_helper", Mock(stdin=stdin, poll=Mock(return_value=1)))
         with caplog.at_level("WARNING"):
             assert g._send({"cmd": "hide"}) is False
         assert any("the helper is gone" in r.message for r in caplog.records)
+        stdin.close.assert_called_once_with()
 
 
 class TestHelperStartFailures:
@@ -1277,6 +1323,44 @@ class TestOverlayPureParts:
 
     def test_the_module_imports_without_gi(self):
         assert _overlay_module() is not None
+
+
+class TestOverlaySurfaceSpace:
+    """Drawing happens in the surface's own space, never in compositor-global
+    coordinates.
+
+    The plugin sends monitor-local bounds (D6) and adds the monitor origin only
+    at injection time. An earlier revision also subtracted that origin when
+    painting, which moved the grid and its digits off the visible surface on
+    any output whose origin was not (0, 0) - clicks still landed correctly, so
+    a single-output render could never show it.
+    """
+
+    def test_surface_rects_keep_the_monitor_local_cells(self):
+        overlay = _overlay_module()
+        assert overlay.surface_rects((0, 0, 900, 600), (0, 0)) == overlay.cell_rects(
+            (0, 0, 900, 600)
+        )
+
+    def test_a_non_zero_monitor_origin_never_shifts_the_cells(self):
+        overlay = _overlay_module()
+        cells = overlay.surface_rects((0, 0, 900, 600), (1920, 0))
+        assert cells[0] == (0, 0, 300, 200)
+        assert cells[8] == (600, 400, 300, 200)
+
+    def test_the_draw_callback_strokes_in_the_surface_space(self):
+        """The production callback, with the origin a secondary output reports
+        on `ready`: the rectangles handed to cairo are the surface-local ones,
+        not shifted by -origin."""
+        overlay = _overlay_module()
+        cr = Mock()
+        drawer = object.__new__(overlay.Overlay)
+        drawer.bounds = (0, 0, 900, 600)
+        drawer.origin = (1920, 0)
+        drawer.presented = True  # no `presented` emit: this is not a live run
+        drawer._draw(Mock(), cr, 1920, 1080)
+        assert cr.rectangle.call_args_list[0].args == (0, 0, 300, 200)
+        assert cr.rectangle.call_args_list[8].args == (600, 400, 300, 200)
 
 
 class TestOverlayLibraryLookup:
