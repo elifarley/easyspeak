@@ -96,10 +96,14 @@ class.
 ## Routing order
 
 A command is offered to the plugins in order of their `PRIORITY` (default 50,
-lower first, equal ones by name). The grid and head-tracking modes declare `0`
-and `1`, so their words reach them before a look-alike elsewhere, and the base
-plugin declares `100` to act as the catch-all for help and exit. Files and
-directories whose names start with `_` are skipped.
+lower first, equal ones by name). The compositor-agnostic grid mode
+(`gridydotool`) and the head-tracking mode both declare `0` — `gridydotool`
+shadows the extension grid's words and precedes head-tracking by the name
+tie-break, staying inert where its backend stack is missing — and the
+extension grid declares `1`, so the grid words reach a grid backend before a
+look-alike elsewhere, and the base plugin declares `100` to act as the
+catch-all for help and exit. Files and directories whose names start with `_`
+are skipped.
 
 ## Translations
 

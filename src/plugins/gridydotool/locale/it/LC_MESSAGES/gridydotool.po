@@ -1,0 +1,49 @@
+# Italian translations for EasySpeak.
+# Copyright (C) 2026 EasySpeak contributors
+# This file is distributed under the same license as the EasySpeak project.
+msgid ""
+msgstr ""
+"Project-Id-Version: EasySpeak\n"
+"Report-Msgid-Bugs-To: https://github.com/ctsdownloads/easyspeak/issues\n"
+"POT-Creation-Date: 2026-10-14 17:50-0300\n"
+"PO-Revision-Date: 2026-10-14 17:50-0300\n"
+"Last-Translator: EasySpeak contributors\n"
+"Language: it\n"
+"Language-Team: Italian\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "1-9 or chains like '3 7 5' - zoom to zone(s)"
+msgstr "1-9 o sequenze come '3 7 5' - ingrandisce la zona"
+
+msgid "Grid"
+msgstr "Griglia"
+
+msgid "Grid closed"
+msgstr "Griglia chiusa"
+
+msgid "I couldn't move the pointer."
+msgstr "Non sono riuscito a spostare il puntatore."
+
+msgid "I couldn't show the grid."
+msgstr "Non sono riuscito a mostrare la griglia."
+
+msgid "I tried, but I'm not sure it worked."
+msgstr "Ci ho provato, ma non sono sicuro che abbia funzionato."
+
+msgid "again - reopen at the last spot"
+msgstr "again - riapre nell'ultimo punto"
+
+msgid "click - left click"
+msgstr "click - clic sinistro"
+
+msgid "close/cancel - hide the grid"
+msgstr "close/cancel - nasconde la griglia"
+
+msgid "grid/mouse/pointer/cursor - show mouse grid"
+msgstr "grid/mouse/pointer/cursor - mostra la griglia del mouse"
+
+msgid "right click / double click / middle click"
+msgstr "right click / double click / middle click - clic destro, doppio, centrale"
