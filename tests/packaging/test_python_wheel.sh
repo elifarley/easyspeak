@@ -15,6 +15,7 @@ has core
 has core/statusnotifier.xml
 has plugins
 has locale/de/LC_MESSAGES/dictation.po
+has locale/de/LC_MESSAGES/gridydotool.po
 has locale/de/vocabulary.toml
 
 echo "The wheel ships the launcher data and the GNOME extension"

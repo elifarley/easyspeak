@@ -35,13 +35,15 @@ conftest.py                    # stubs heavy deps; skip fixtures for audio/syste
 ## The gridydotool harness
 
 `test_gridydotool_harness.py` asserts a failed injector probe keeps `mousegrid`
-in charge and that the daemonless gate passes on a real ydotool (the socket is a
-logged mode, not a condition),
-observes the overlay geometry and the exact ydotool argv under a forced backend,
-and — only when opted in — proves that a click lands in the cell the utterance
-aimed at, by watching `grid_probe_window.py` inside a headless sway session the
-harness starts and tears down itself. When a prerequisite is absent the file
-skips, naming what is missing.
+in charge, that the injector gate passes on a real ydotool where an answered
+daemon socket lets it inject (ydotool 1.0.x has no per-invocation fallback, so
+there a socket is the only injector there is; 0.1.8 also works daemonless), and
+that the gate fails closed on 1.0.x when no socket answers. It observes the
+overlay geometry and the exact ydotool argv under a forced backend, and — only
+when opted in — proves that a click lands in the cell the utterance aimed at, by
+watching `grid_probe_window.py` inside a headless sway session the harness
+starts and tears down itself. When a prerequisite is absent the file skips,
+naming what is missing.
 
 Its prerequisites, in one place:
 
@@ -52,9 +54,11 @@ Its prerequisites, in one place:
   point `EASYSPEAK_GRID_TYPELIB` at its `src` directory (the harness exports it
   as both `GI_TYPELIB_PATH` and `LD_LIBRARY_PATH`), or `EASYSPEAK_GRID_PYTHON`
   at an interpreter that already has the library and the typelib.
-- A running `ydotoold` is **optional** — it removes the per-invocation latency
-  caveat the client names when it is absent, and the VM measured the daemonless
-  path working. It is not needed by any arm.
+- A running `ydotoold` for the gate's passing shape: on ydotool 1.0.x (Ubuntu
+  26.04's dialect, whose client has no per-invocation fallback) it is what makes
+  a working injector, and that test skips by name when no socket answers; on
+  0.1.8 it removes the per-invocation latency caveat the client names when it is
+  absent, and the daemonless path is measured working.
 
 Two environment variables the harness reads: `EASYSPEAK_GRID_LIVE=click` opts
 into the live click arm, and `EASYSPEAK_GRID_BACKEND=uinput` (set by the harness

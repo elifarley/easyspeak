@@ -26,6 +26,60 @@ rm -rf ~/.local/share/gnome-shell/extensions/gnome@easyspeak.dev
 
 …or click the trash icon next to *EasySpeak* in the Extensions app.
 
+## Mouse grid: the grid never appears on a non-GNOME desktop
+
+The grid needs either the Shell extension (GNOME 47+) or the `gridydotool`
+backend, which needs `ydotool` installed (its own tool list must offer
+`mousemove`, `click` and `type`), a compositor with layer-shell support (COSMIC,
+wlroots, KDE) and an interpreter with PyGObject and the gtk4-layer-shell
+typelib. `ydotool` also needs write access to `/dev/uinput`.
+
+`ydotool` ships in two command dialects, and the backend reads which one is
+installed from the client itself:
+
+- **ydotool 0.1.8 and older** (Ubuntu 25.10): a running `ydotoold` is optional.
+  With no daemon the client builds a uinput device per invocation and says so
+  ("ydotoold backend unavailable (may have latency+delay issues)") — the
+  latency caveat its own notice names, which the plugin's log calls the
+  per-invocation mode.
+- **ydotool 1.0.x** (Ubuntu 26.04): the per-invocation fallback is gone. With no
+  daemon the client exits 2 ("failed to connect socket") and emits nothing, so a
+  running `ydotoold` is required and the backend's capability probe fails closed
+  without one — the log says why, and `mousegrid` keeps the words rather than
+  promising a grid that cannot click.
+
+Not every distro ships a `ydotoold` binary with the client (Ubuntu 25.10's
+`ydotool` package is CLI-only and the daemon is a separate package; 26.04 ships
+the daemon in the same package). If your distro has the daemon but no user unit,
+`systemctl --user enable --now ydotoold` answering "Unit ydotoold.service not
+found" means installing this as `~/.config/systemd/user/ydotoold.service`:
+
+```ini
+[Unit]
+Description=ydotoold - persistent uinput device for ydotool
+
+[Service]
+ExecStart=/usr/bin/ydotoold --socket-path=/tmp/.ydotool_socket --socket-perm=0600
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+Then `systemctl --user daemon-reload` once, and `systemctl --user enable --now
+ydotoold`. The socket path and its 0600 mode are what 0.1.8's client hardcodes,
+which is also why the daemon has to run as your user rather than as root: a root
+daemon's socket is unreachable by your client. On 1.0.x the client defaults to
+`$XDG_RUNTIME_DIR/.ydotool_socket` and honours `YDOTOOL_SOCKET`; the backend
+probes that path, the login session's own `/run/user/<uid>/` path and 0.1.8's
+`/tmp/.ydotool_socket`, so a daemon on either default is found.
+
+If `ydotool` or the layer-shell stack is missing, or (on ydotool 1.0.x) no
+daemon answers, the daemon logs `grid backend inert` at startup with the reason,
+says nothing out loud, and `mousegrid` keeps the words. On 0.1.8 a missing
+`ydotoold` alone does not: the log names the per-invocation mode and the grid
+still answers.
+
 ## Dictation not working
 
 EasySpeak enables the GNOME accessibility bridge on first run; log out and back

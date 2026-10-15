@@ -1,10 +1,13 @@
 """The gridydotool end-to-end loop, in a headless sway session.
 
 Checks: a failed injector probe keeps `mousegrid` in charge (no privileges
-needed), the injector gate passes daemonless on a real ydotool (the socket is a
-logged mode, not a condition), the overlay renders and the argv is exact under a
-forced backend (the dry-run arm, which is the arm CI can run), and, only when
-EASYSPEAK_GRID_LIVE is set, that a click lands where the grid aimed it.
+needed), the injector gate passes on a real ydotool where an answered daemon
+socket lets it inject (ydotool 1.0.x has no per-invocation fallback, so there a
+socket is the only injector there is; 0.1.8 also works daemonless), the gate
+fails closed on 1.0.x when no socket answers, the overlay renders and the argv
+is exact under a forced backend (the dry-run arm, which is the arm CI can run),
+and, only when EASYSPEAK_GRID_LIVE is set, that a click lands where the grid
+aimed it.
 
 The literal in the live arm is hand-computed. Deriving it with the same algorithm
 the plugin uses would make the assertion agree with any shared off-by-one, so the

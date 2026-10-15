@@ -55,6 +55,7 @@ easyspeak/
 │       ├── headtrack/         # Head tracking (experimental)
 │       ├── media/             # Playback controls
 │       ├── mousegrid/         # Grid overlay mouse control
+│       ├── gridydotool/       # Grid overlay + kernel-level injection (layer-shell + ydotool)
 │       ├── sleep/             # Voice deactivate
 │       └── system/            # Volume, brightness, DND
 ├── tests/
