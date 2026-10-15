@@ -13,6 +13,11 @@ prediction is kept only as a cross-check.
 
 Injection is kernel-global: even inside this session, arm B moves the real
 cursor and clicks wherever it aims on the live desktop. That is why it is opt-in.
+
+A failing live arm attributes itself. It proves the probe window rendered before
+anything is injected, and a press that never arrives is reported together with
+what the compositor had as input, so "no seat to route the click", "nothing to
+click on" and "a swallowed click" cannot be mistaken for one another.
 """
 
 import json
@@ -96,7 +101,17 @@ def session(tmp_path, monkeypatch):
     config.write_text(SWAY_CONFIG, encoding="utf-8")
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     monkeypatch.setenv("WLR_BACKENDS", "headless")
-    monkeypatch.setenv("WLR_LIBINPUT_NO_DEVICES", "1")
+    # `WLR_LIBINPUT_NO_DEVICES=1` asks wlroots for a libinput backend with no
+    # devices at all: right for the arms that only look at pixels, whose
+    # session nothing real should be able to perturb, and fatal for the one
+    # arm whose click must be routed through the compositor's seat. So the
+    # flag is set only when the live opt-in is absent; a value inherited from
+    # the caller is dropped for the live arm rather than trusted, so its seat
+    # exists by the harness's own construction.
+    if os.environ.get("EASYSPEAK_GRID_LIVE") == "click":
+        monkeypatch.delenv("WLR_LIBINPUT_NO_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("WLR_LIBINPUT_NO_DEVICES", "1")
     sway = subprocess.Popen(
         ["sway", "-c", str(config)],
         stdout=subprocess.DEVNULL,
@@ -127,6 +142,84 @@ def session(tmp_path, monkeypatch):
 
 def _grim(env, path):
     subprocess.run(["grim", str(path)], env=env, check=False, timeout=10)
+
+
+def _kernel_input_names():
+    """The device names `/proc/bus/input/devices` lists, or an empty list.
+
+    The kernel's view, used only when the compositor will not answer. A device
+    here does not mean the session can see it - with `WLR_LIBINPUT_NO_DEVICES=1`
+    wlroots opens none of them - so this is a fallback, never the first word.
+    """
+    try:
+        listing = Path("/proc/bus/input/devices").read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [
+        line.split('"')[1]
+        for line in listing.splitlines()
+        if line.startswith("N: Name=") and line.count('"') >= 2
+    ]
+
+
+def _input_report(env):
+    """What input the session had, one line of diagnosis for a lost click.
+
+    The compositor is asked first: `swaymsg -t get_inputs` is its own list, and
+    the one that decides whether an injected click has a route, because with
+    `WLR_LIBINPUT_NO_DEVICES=1` it is empty while `/proc/bus/input/devices`
+    still lists the kernel's devices. That gap is the "no seat" reading this
+    report exists to expose; the kernel list is the named fallback, and both
+    failures are tolerated because this runs to explain a failed assertion and
+    must not raise an error of its own.
+
+    Sway's IPC socket is named inside `XDG_RUNTIME_DIR` but is never exported
+    to us (only sway's own children inherit `SWAYSOCK`), so it is discovered
+    here the same way the session fixture discovers the Wayland socket. The
+    answer is a snapshot: a daemonless ydotool destroys its per-invocation
+    device when its client exits, so "no devices" can also mean "the device
+    came and went", which is why the line names its source rather than
+    judging.
+    """
+    runtime = env.get("XDG_RUNTIME_DIR")
+    sockets = sorted(Path(runtime).glob("sway-ipc.*.sock")) if runtime else []
+    ask = None
+    if sockets and shutil.which("swaymsg", path=env.get("PATH")):
+        try:
+            ask = subprocess.run(
+                ["swaymsg", "-t", "get_inputs"],
+                env={**env, "SWAYSOCK": str(sockets[0])},
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            ask = None
+    if ask is not None and ask.returncode == 0:
+        try:
+            devices = [
+                device.get("identifier", "?") for device in json.loads(ask.stdout)
+            ]
+        except (ValueError, AttributeError):
+            devices = None
+        if devices is not None:
+            if devices:
+                return (
+                    f"the compositor sees {len(devices)} input device(s) "
+                    f"({', '.join(devices)}), so the injected click had a seat"
+                )
+            return (
+                "the compositor sees no input device (swaymsg -t get_inputs "
+                "returned []), so the injected click had no seat"
+            )
+    names = _kernel_input_names()
+    if names:
+        return (
+            "swaymsg could not answer, but /proc/bus/input/devices lists "
+            f"{len(names)} device(s) ({', '.join(names)})"
+        )
+    return "input state unknown: neither swaymsg nor /proc/bus/input/devices answered"
 
 
 @pytest.fixture(autouse=True)
@@ -224,6 +317,16 @@ class TestLiveArm:
         # import while everything else worked.
         python = gridydotool.grid_python()
         assert python, "no interpreter can run the GTK4 probe window"
+
+        # The bare session is captured before the probe window exists, and the
+        # same view again once the probe has had the settle time below. Identical
+        # pixels mean the probe never realised a surface - a GPU-less guest's
+        # GTK4 may fail to get a GL/EGL context - and the click further down
+        # would land on an empty scene. This runs before anything injects, so
+        # that failure reports "the probe window never rendered" instead of the
+        # lost click it would otherwise masquerade as.
+        bare = tmp_path / "bare.png"
+        _grim(session, bare)
         probe = subprocess.Popen(
             [python, str(repo_root / "tests" / "integration" / "grid_probe_window.py")],
             env=session,
@@ -233,6 +336,12 @@ class TestLiveArm:
         time.sleep(1.5)
         before = tmp_path / "before.png"
         _grim(session, before)
+        probe_rendered = bare.read_bytes() != before.read_bytes()
+        assert probe_rendered, (
+            "the probe window never rendered: the bare session and the spawned "
+            "probe are pixel-identical, so a click could only land on an empty "
+            "scene"
+        )
 
         monkeypatch.setattr(gridydotool, "PROBE_TIMEOUT", 8.0)
         gridydotool.setup(core=None)
@@ -279,7 +388,19 @@ class TestLiveArm:
         out, _ = probe.communicate(timeout=5)
         events = [json.loads(line) for line in (out or "").splitlines()]
         presses = [e for e in events if e["event"] == "press"]
-        assert presses, f"the probe window saw no click: {events}"
+        # With the probe window proven on screen, an empty press list has two
+        # readings left and this report tells them apart: a compositor that saw
+        # no input device had no seat to route the click through, while one
+        # that saw a device means the click had a real route and was swallowed
+        # before the probe observed it - the reading that points at the
+        # overlay's input region. The report names its source, because a
+        # daemonless ydotool destroys its per-invocation device when its client
+        # exits and the snapshot can then read as empty for that reason too.
+        session_input = _input_report(session)
+        assert presses, (
+            f"the probe window saw no click: {events}; "
+            f"probe window on screen: {probe_rendered}; {session_input}"
+        )
         left, top, width, height = EXPECTED_CELL
         px, py = presses[-1]["x"], presses[-1]["y"]
         assert left - EXPECTED_TOLERANCE <= px <= left + width + EXPECTED_TOLERANCE
