@@ -24,6 +24,14 @@ from pathlib import Path
 
 from easyspeak.core.i18n import translator
 
+# Module-scope import is safe: `_overlay` imports only stdlib at its own module
+# scope (gi is imported inside its functions), so the daemon's gi-less venv can
+# import the plugin. The explicit binding is what `helper_env` reads for the
+# LD_PRELOAD probe below — a `from . import _overlay as alias` form would leave
+# the plain name working only through the import machinery's implicit
+# package-attribute side effect, which reads like a typo.
+from . import _overlay
+
 logger = logging.getLogger(__name__)
 
 _ = translator(__file__)
@@ -556,15 +564,21 @@ def helper_env(base=None):
     would have served.
 
     `base` defaults to this process's environment; passing a mapping makes the
-    construction a function of its input alone.
+    construction a function of its input alone. The layer-shell library is
+    exported last so its loadability probe sees the same loader environment the
+    helper will get: with an uninstalled build tree, the soname only resolves
+    after `LD_LIBRARY_PATH` names the tree.
     """
     env = dict(os.environ if base is None else base)
     build = env.get("EASYSPEAK_GRID_TYPELIB")
-    if not build:
-        return env
-    for name in TYPELIB_PATH_VARS:
-        existing = env.get(name, "")
-        env[name] = f"{build}{os.pathsep}{existing}" if existing else build
+    if build:
+        for name in TYPELIB_PATH_VARS:
+            existing = env.get(name, "")
+            env[name] = f"{build}{os.pathsep}{existing}" if existing else build
+    preload = _overlay.layer_shell_lib_path()
+    if preload:
+        existing = env.get("LD_PRELOAD", "")
+        env["LD_PRELOAD"] = f"{preload}:{existing}" if existing else preload
     return env
 
 

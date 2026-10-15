@@ -24,6 +24,7 @@ without mapping anything.
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 DEFAULT_NAMESPACE = "gridydotool"
@@ -120,6 +121,30 @@ def layer_shell_names():
     return names
 
 
+def layer_shell_lib_path():
+    """The first loadable layer-shell soname from `layer_shell_names()`, or None.
+
+    The helper must receive this name on LD_PRELOAD: gtk4-layer-shell works by
+    interposing libwayland, and interposition only reaches GTK when the library
+    sits at the front of the lookup order — RTLD_GLOBAL cannot win, because
+    libwayland-client is a direct dependency of GDK and beats the global scope
+    (measured live: without the preload the layer surface came up as an
+    ordinary window and the probe answered unsupported on a compositor that
+    supports layer shell). The driver process loads the name here as a
+    loadability probe; the real load happens in the helper under LD_PRELOAD.
+    """
+    from ctypes import CDLL
+
+    for name in layer_shell_names():
+        try:
+            CDLL(name)
+        except OSError:
+            continue
+        else:
+            return name
+    return None
+
+
 def load_layer_shell():
     """Load gtk4-layer-shell and Gtk, or return (None, None).
 
@@ -167,11 +192,38 @@ def load_layer_shell():
 
 
 def is_supported():
-    """True when this compositor speaks wlr-layer-shell."""
-    _, layer_shell = load_layer_shell()
-    if layer_shell is None:
+    """True when this compositor speaks wlr-layer-shell.
+
+    GTK must have opened a display before the question is asked:
+    `gtk4_layer_shell_is_supported()` reads the default display and answers
+    false with a gdk assertion when none is open. `Gtk.init` opens it — and
+    PyGObject returns None for it (a void function), so testing its return
+    value as truthiness answered False unconditionally (measured live: the
+    probe refused on sway, which supports layer shell).
+    """
+    Gtk, layer_shell = load_layer_shell()
+    if Gtk is None or layer_shell is None:
         return False
-    return bool(layer_shell.is_supported())  # pragma: no cover - live shell only
+    Gtk.init()
+    from gi.repository import Gdk, GLib
+
+    # The Wayland registry arrives through the main context: without running
+    # it, is_supported reads before the compositor's globals are known and
+    # answers false on compositors that do support layer shell. Bound the
+    # wait; a compositor that never answers fails closed in two seconds.
+    ctx = GLib.MainContext.default()
+    deadline = time.monotonic() + 2.0
+    supported = False
+    while time.monotonic() < deadline:
+        while ctx.iteration(may_block=False):
+            pass
+        if Gdk.Display.get_default() is None:
+            return False
+        if layer_shell.is_supported():
+            supported = True
+            break
+        time.sleep(0.03)
+    return supported
 
 
 def clear_input_region(surface):

@@ -633,11 +633,34 @@ class TestHelperEnv:
         assert env["GI_TYPELIB_PATH"] == f"/build/src{os.pathsep}/flake/gi"
         assert env["LD_LIBRARY_PATH"] == f"/build/src{os.pathsep}/flake/lib"
 
-    def test_without_the_override_nothing_is_rewritten(self):
+    def test_without_the_override_nothing_is_rewritten(self, monkeypatch):
+        monkeypatch.setattr(g._overlay, "layer_shell_lib_path", lambda: None)
         base = {"GI_TYPELIB_PATH": "/flake/gi", "LD_LIBRARY_PATH": "/flake/lib"}
         env = g.helper_env(base)
         assert env == base
         assert env is not base
+
+    def test_the_layer_shell_library_is_preloaded_for_the_helper(self, monkeypatch):
+        """gtk4-layer-shell interposes libwayland, and interposition only reaches
+        GTK from the front of the lookup order: a plain RTLD_GLOBAL load loses to
+        GDK's direct libwayland dependency, and the layer surface silently comes
+        up as an ordinary window (measured live on sway)."""
+        monkeypatch.setattr(
+            g._overlay, "layer_shell_lib_path", lambda: "libgtk4-layer-shell.so.0"
+        )
+        env = g.helper_env({})
+        assert env["LD_PRELOAD"] == "libgtk4-layer-shell.so.0"
+
+    def test_an_existing_ld_preload_is_prepended_not_replaced(self, monkeypatch):
+        monkeypatch.setattr(
+            g._overlay, "layer_shell_lib_path", lambda: "libgtk4-layer-shell.so.0"
+        )
+        env = g.helper_env({"LD_PRELOAD": "/keep.so"})
+        assert env["LD_PRELOAD"] == "libgtk4-layer-shell.so.0:/keep.so"
+
+    def test_without_a_loadable_library_no_preload_is_set(self, monkeypatch):
+        monkeypatch.setattr(g._overlay, "layer_shell_lib_path", lambda: None)
+        assert "LD_PRELOAD" not in g.helper_env({})
 
     def test_the_default_base_is_this_process_environment(self, monkeypatch):
         monkeypatch.setenv("EASYSPEAK_GRID_TYPELIB", "/build/src")
@@ -692,6 +715,11 @@ class TestHelperEnv:
             "sys.stdin.readline()\n",
             encoding="utf-8",
         )
+        # The LD_PRELOAD probe is a different concern (tested below); pinning it
+        # here keeps `seen[0]` the helper's own Popen: on a host with the
+        # library installed, `find_library` inside the real probe spawns
+        # ldconfig (and a gcc link test) *before* the helper spawn.
+        monkeypatch.setattr(g._overlay, "layer_shell_lib_path", lambda: None)
         monkeypatch.setattr(g, "HELPER", str(helper))
         monkeypatch.setattr(g, "grid_python", lambda: sys.executable)
         monkeypatch.setenv("EASYSPEAK_GRID_TYPELIB", "/build/src")
@@ -2188,6 +2216,86 @@ class TestOverlayLibraryLookup:
         err = capsys.readouterr().err
         assert "libgtk4-layer-shell.so.0" in err
         assert "libgtk4-layer-shell.so" in err
+
+    def test_lib_path_returns_the_first_loadable_name(self, monkeypatch):
+        overlay = _overlay_module()
+        monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
+        monkeypatch.setattr(ctypes, "CDLL", lambda name: name)
+        assert overlay.layer_shell_lib_path() == "libgtk4-layer-shell.so.0"
+
+    def test_lib_path_walks_to_a_later_name(self, monkeypatch):
+        overlay = _overlay_module()
+        monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
+
+        def cdll(name):
+            if name != "libgtk4-layer-shell.so":
+                msg = f"{name}: cannot open shared object file"
+                raise OSError(msg)
+            return name
+
+        monkeypatch.setattr(ctypes, "CDLL", cdll)
+        assert overlay.layer_shell_lib_path() == "libgtk4-layer-shell.so"
+
+    def test_lib_path_answers_none_when_nothing_loads(self, monkeypatch):
+        overlay = _overlay_module()
+        monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
+        monkeypatch.setattr(ctypes, "CDLL", Mock(side_effect=OSError("absent")))
+        assert overlay.layer_shell_lib_path() is None
+
+
+class TestOverlaySupportProbe:
+    """`is_supported` must give the compositor's globals a chance to arrive.
+
+    `gtk4_layer_shell_is_supported()` reads the default display; before the main
+    context has run, the Wayland registry is not yet known and a compositor that
+    supports layer shell still answers false (measured live on sway: the probe
+    refused until the context iterations were added). And `Gtk.init` must not be
+    tested for truthiness — PyGObject maps the void function to None, so
+    `if not Gtk.init()` refused on every compositor.
+    """
+
+    @staticmethod
+    def _fake_gi(monkeypatch, iteration, display):
+        """A stand-in for gi.repository: GLib with the scripted main context and
+        Gdk with the scripted display, reached by is_supported's own import."""
+        glib = Mock()
+        glib.MainContext.default.return_value.iteration.side_effect = iteration
+        gdk = Mock()
+        gdk.Display.get_default.return_value = display
+        gi = types.ModuleType("gi")
+        repository = types.ModuleType("gi.repository")
+        repository.GLib = glib
+        repository.Gdk = gdk
+        gi.repository = repository
+        monkeypatch.setitem(sys.modules, "gi", gi)
+        monkeypatch.setitem(sys.modules, "gi.repository", repository)
+        return glib, gdk
+
+    def test_supported_once_the_compositor_answers(self, monkeypatch):
+        overlay = _overlay_module()
+        stack = (Mock(), Mock(is_supported=Mock(return_value=True)))
+        monkeypatch.setattr(overlay, "load_layer_shell", lambda: stack)
+        self._fake_gi(monkeypatch, iteration=lambda **kwargs: False, display=Mock())
+        assert overlay.is_supported() is True
+
+    def test_refuses_when_no_display_opens(self, monkeypatch):
+        overlay = _overlay_module()
+        stack = (Mock(), Mock(is_supported=Mock(return_value=True)))
+        monkeypatch.setattr(overlay, "load_layer_shell", lambda: stack)
+        self._fake_gi(monkeypatch, iteration=lambda **kwargs: False, display=None)
+        assert overlay.is_supported() is False
+
+    def test_the_wait_is_bounded(self, monkeypatch):
+        """A compositor that never answers fails closed instead of hanging the
+        gate, and the compositor is never asked after the deadline."""
+        overlay = _overlay_module()
+        layer_shell = Mock(is_supported=Mock(return_value=False))
+        monkeypatch.setattr(overlay, "load_layer_shell", lambda: (Mock(), layer_shell))
+        self._fake_gi(monkeypatch, iteration=lambda **kwargs: False, display=Mock())
+        ticks = iter([0.0, 3.0])  # deadline read, then a check past it
+        monkeypatch.setattr(overlay.time, "monotonic", lambda: next(ticks))
+        assert overlay.is_supported() is False
+        layer_shell.is_supported.assert_not_called()
 
 
 class TestOverlayServePath:
