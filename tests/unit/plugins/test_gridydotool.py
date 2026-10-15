@@ -458,7 +458,7 @@ class TestSocketDiscovery:
         returned as the injector.
         no_claim: does not claim a same-uid impostor is impossible (unix
         sockets cannot authenticate beyond ownership); does not touch the
-        filesystem — `os.stat` is stubbed.
+        filesystem — `Path.stat` is stubbed.
         seam: none
         """
         monkeypatch.setenv("YDOTOOL_SOCKET", "/tmp/.ydotool_socket")
@@ -1515,6 +1515,34 @@ class TestHelperChannel:
             assert g._start_helper() == (0, 0, 1920, 1080)
         g.stop_helper("test")
         assert any("ready" in r.message and "1920" in r.message for r in caplog.records)
+
+    def test_the_handshake_never_waits_for_presented(self, monkeypatch, tmp_path):
+        """protects: the first-frame wait lives after the first `show`, never in
+        the ready handshake — the helper cannot announce a frame it has no
+        bounds for yet, so a handshake wait would expire its whole bound on
+        every single grid open.
+        fails_when: the `presented` read moves back into `_start_helper` (with
+        a never-presenting helper and a raised bound, the handshake then blocks
+        the full timeout instead of returning immediately).
+        no_claim: does not claim the announcement is consumed anywhere in
+        particular; only that this function does not wait for it.
+        seam: none
+        """
+        helper = self._fake_helper(
+            tmp_path,
+            "import json, sys, time\n"
+            "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 800, 600]}),"
+            " flush=True)\n"
+            "for line in sys.stdin:\n"  # never announces anything
+            "    time.sleep(0.01)\n",
+        )
+        monkeypatch.setattr(g, "HELPER", helper)
+        monkeypatch.setattr(g, "grid_python", lambda: "python3")
+        monkeypatch.setattr(g, "PRESENT_TIMEOUT", 30)
+        started = time.monotonic()
+        assert g._start_helper() == (0, 0, 800, 600)
+        assert time.monotonic() - started < 5
+        g.stop_helper("test")
 
     def test_a_silent_helper_hits_the_deadline_and_is_reaped(
         self, monkeypatch, tmp_path

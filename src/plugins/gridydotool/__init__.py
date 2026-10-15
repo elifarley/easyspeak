@@ -783,47 +783,42 @@ def setup(core):  # noqa: ARG001 — unused since the dead `_core` global went a
         logger.info("grid: forced inert by EASYSPEAK_GRID_BACKEND=gnome")
     else:
         # The two probes are independent until the conjunction, so they run
-        # side by side: each is bounded individually, and a host where both
-        # would hang pays its longest bound once instead of the serial sum at
+        # side by side: one common deadline covers both, and a host where both
+        # would hang pays the longest probe bound once, not the serial sum, at
         # daemon startup. Both always run when nothing is forced — skipping
         # the injector probe on an overlay failure would save one bounded
         # connect and cost the concurrency.
         #
-        # The join budget is each thread's own worst case (the overlay probe
-        # may try three interpreter candidates plus the helper probe; the
-        # injector probe asks for help, the dialect and one no-op), and past
-        # it the gate fails closed even though the probe would still answer.
-        # The threads are daemons so a wedged probe can never hold the daemon
-        # shut-down hostage; a late result lands in `outcome` unread.
+        # The deadline is sized to the larger worst case: the overlay probe may
+        # try three interpreter candidates plus the helper probe. The injector
+        # probe's own worst case is not fully accountable (a wedged ydotoold
+        # socket burns its settimeout per connect, per candidate, per type), so
+        # overshoot fails closed by design: past the deadline the gate shuts
+        # even though the probe would still answer. The threads are daemons so
+        # a wedged probe can never hold the daemon shut-down hostage; a late
+        # result lands in `outcome` unread.
         outcome = {}
 
         def _run(name, probe):
             outcome[name] = probe()
 
-        budgets = {
-            "overlay": (len(GRID_PYTHON_CANDIDATES) + 1) * PROBE_TIMEOUT,
-            "injector": 2 * PROBE_TIMEOUT + INJECT_TIMEOUT,
-        }
         threads = [
-            (
-                name,
-                threading.Thread(
-                    target=_run,
-                    args=(name, probe),
-                    name=f"grid-probe-{name}",
-                    daemon=True,
-                ),
-                budgets[name],
+            threading.Thread(
+                target=_run,
+                args=(name, probe),
+                name=f"grid-probe-{name}",
+                daemon=True,
             )
             for name, probe in (
                 ("overlay", _probe_overlay),
                 ("injector", _probe_injector),
             )
         ]
-        for _, thread, _budget in threads:
+        deadline = time.monotonic() + (len(GRID_PYTHON_CANDIDATES) + 1) * PROBE_TIMEOUT
+        for thread in threads:
             thread.start()
-        for _name, thread, budget in threads:
-            thread.join(budget)
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
         overlay = bool(outcome.get("overlay"))
         injector = bool(outcome.get("injector"))
         _active = overlay and injector
@@ -885,6 +880,15 @@ def _open_session(core, bounds=None):
     announcement = read_until(_helper.stdout, time.monotonic() + PRESENT_TIMEOUT)
     if announcement and announcement.get("event") == "presented":
         logger.info("grid: first frame on screen")
+    elif announcement and announcement.get("event") == "error":
+        # The same read is the first consumer of a show-triggered refusal: the
+        # helper emits `error` and quits when the surface went up but the
+        # click-through region could not be applied. Mirroring `_start_helper`'s
+        # refusal path keeps the helper's contract whole on this side too.
+        logger.warning("grid: helper refused the show: %s", announcement.get("message"))
+        stop_helper("show refused")
+        core.speak(_("I couldn't show the grid."))
+        return None
     else:
         logger.debug("grid: no presented announcement inside PRESENT_TIMEOUT")
     _grid_open = True
