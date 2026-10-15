@@ -7,9 +7,9 @@ Author: Elifarley (with Command Code). Status: draft.
 EasySpeak's pointer control ships as a bundled GNOME Shell extension requiring
 GNOME 47+. This workstation runs GNOME Shell 42.9 (Pop!_OS 22.04, frozen at 42):
 the `mousegrid` plugin loads and appears in the startup log, but every action is
-a silent no-op — a live trap recorded in
-[elifarley/system-priv#68](https://github.com/elifarley/system-priv/issues/68) and
-in the install doc (`03-solutions/20261014-easyspeak-install.md`).
+a silent no-op — a live trap recorded in the private work journal as
+`system-priv#68` (not publicly linkable) and in the install doc
+(`03-solutions/20261014-easyspeak-install.md`).
 
 COSMIC — the migration target — is not GNOME, so the extension can never run
 there. Worse, cosmic-comp deliberately lacks `wlr-virtual-pointer` (System76
@@ -112,9 +112,9 @@ for real-COSMIC acceptance, and its source build of gtk4-layer-shell.
 ## Open questions
 
 1. **Does the `/dev/uinput` ACL survive a reboot?** (`udevadm test` or a reboot.)
-   If not, it needs the udev rule whose need
-   [elifarley/system-priv#69](https://github.com/elifarley/system-priv/issues/69)'s
-   security note already presumes — a persisted grant, not an ad-hoc `setfacl`.
+   If not, it needs the udev rule whose need the private work journal's
+   `system-priv#69` (not publicly linkable) security note already presumes — a
+   persisted grant, not an ad-hoc `setfacl`.
 2. **Which gtk4-layer-shell release compiles against GTK 4.6?** Its meson
    declares no GTK floor (checked in v1.0.4 and master), but the C code may use
    newer API. Start at 1.0.4.

@@ -3,8 +3,8 @@
 Status: design approved in brainstorm 2026-10-14 (four user decisions; see
 Decisions for what was chosen and what was rejected).
 Intent: `docs/superpowers/intents/2026-10-14-prototype-compositor-agnostic-easyspeak-backend-layer-shell-overlay-ydotool-intent.md`
-Upstream tracker: [elifarley/system-priv#69](https://github.com/elifarley/system-priv/issues/69)
-(decision context: [elifarley/system-priv#68](https://github.com/elifarley/system-priv/issues/68))
+Upstream tracker: the private work journal's `system-priv#69` (not publicly
+linkable; decision context: `system-priv#68`)
 
 ## Summary
 
@@ -704,7 +704,9 @@ Smithay claim is still the basis for COSMIC itself.
 - **Environment variables**: `EASYSPEAK_GRID_BACKEND=uinput|gnome` and
   `EASYSPEAK_GRID_PYTHON` are user-facing and documented in `docs/usage.md`;
   `EASYSPEAK_GRID_LIVE=move|click` is test-only and documented with the harness in
-  `tests/integration/README.md`.
+  `tests/integration/README.md`; `EASYSPEAK_GRID_DRY_RUN` is a seam the `_run_bounded`
+  unit tests set to skip real spawns, read inside the shipped seam but named in the
+  `docs/usage.md` variable table so a stale export can't silently no-op injections.
 
 ## Delivery
 
@@ -830,8 +832,8 @@ Mapped to the issue's, with how each is discharged:
 ## References
 
 - Intent: `docs/superpowers/intents/2026-10-14-prototype-compositor-agnostic-easyspeak-backend-layer-shell-overlay-ydotool-intent.md`
-- Issue: [elifarley/system-priv#69](https://github.com/elifarley/system-priv/issues/69) ·
-  decision context: [elifarley/system-priv#68](https://github.com/elifarley/system-priv/issues/68)
+- Issue: the private work journal's `system-priv#69` (not publicly linkable) ·
+  decision context: `system-priv#68`
 - Install doc: `03-solutions/20261014-easyspeak-install.md` (system-priv)
 - ydotool 0.1.8 source: `Client/ydotool.cpp`, `Daemon/ydotoold.cpp`,
   `Tools/{MouseMove,Click}/{MouseMove,Click}.cpp` (tag `v0.1.8`)

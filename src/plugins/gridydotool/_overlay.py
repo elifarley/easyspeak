@@ -242,13 +242,13 @@ class Overlay:  # pragma: no cover - needs GTK; run live
         cr.set_source_rgba(0.05, 0.05, 0.08, 0.55)
         cr.paint()
         cr.set_source_rgba(0.95, 0.95, 0.95, 0.95)
+        cr.set_font_size(28)
         for index, (left, top, w, h) in enumerate(
             surface_rects(self.bounds, self.origin), start=1
         ):
             cr.rectangle(left, top, w, h)
             cr.stroke()
             cr.move_to(left + w / 2 - 8, top + h / 2 + 8)
-            cr.set_font_size(28)
             cr.show_text(str(index))
         del area, width, height
         if not self.presented:

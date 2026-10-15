@@ -100,9 +100,19 @@ def _reap_leaked_helper():
 
 @pytest.fixture(autouse=True)
 def _fresh_client_state(monkeypatch):
-    """The dialect is cached module state; every test resolves its own."""
+    """The dialect and the session state are cached module state; every test
+    starts from the plugin's own import-time shape, so no test inherits
+    another's gate decision or session leftovers (an earlier version reset
+    only `_dialect`, which made the inert-plugin test depend on file order)."""
     monkeypatch.setattr(g, "_dialect", None)
     monkeypatch.setattr(g, "_monitor_origin", (0, 0))
+    monkeypatch.setattr(g, "_active", False)
+    monkeypatch.setattr(g, "_grid_open", False)
+    monkeypatch.setattr(g, "_bounds", None)
+    monkeypatch.setattr(g, "_last_bounds", None)
+    monkeypatch.setattr(g, "_grid_python", None)
+    monkeypatch.setattr(g, "_grid_python_found", False)
+    monkeypatch.setattr(g, "_socket_last_good", None)
 
 
 class TestZoneMath:
@@ -211,10 +221,34 @@ class TestOutcomeClassification:
         assert g._run_bounded(["ydotool", "mousemove", "0", "0"]) == "ran"
 
     def test_ran_accepts_the_argv_shaped_success_code(self, monkeypatch):
-        """A build that forwards Exec's argc return still classifies: the code
-        the tool computes is `len(args) - 1`, which this argv makes 3."""
+        """A legacy build that forwards Exec's argc return still classifies: the
+        code the tool computes is `len(args) - 1`, which this argv makes 3. The
+        dialect is pinned because the tolerance is legacy-only."""
+        monkeypatch.setattr(g, "_dialect", g.YDTOOL_DIALECT_LEGACY)
         monkeypatch.setattr(g, "_spawn", lambda *a, **k: self._result(3))
         assert g._run_bounded(["ydotool", "mousemove", "0", "0"]) == "ran"
+
+    def test_the_argv_shaped_code_is_never_a_modern_success(self, monkeypatch):
+        """On the modern dialect exit 2 is `failed to connect socket` — a real
+        failure — and a click argv's `len(args) - 1` is also 2. Clean output or
+        not, the shape alone must never read as `ran` there, or one wording
+        drift in a 1.0.x variant turns every daemon-less click into silent
+        success."""
+        monkeypatch.setattr(g, "_dialect", g.YDTOOL_DIALECT_MODERN)
+        monkeypatch.setattr(g, "_spawn", lambda *a, **k: self._result(2))
+        assert g._run_bounded(["ydotool", "click", "0xC0"]) == "errored"
+
+    def test_a_refusal_on_stdout_refuses_too(self, monkeypatch):
+        """Both streams are scanned, like the probe seams: a build that moves
+        its refusal from stderr to stdout must not turn a rejection into a
+        `ran`."""
+        monkeypatch.setattr(g, "_dialect", g.YDTOOL_DIALECT_MODERN)
+        monkeypatch.setattr(
+            g,
+            "_spawn",
+            lambda *a, **k: self._result(0, stdout="failed to connect socket"),
+        )
+        assert g._run_bounded(["ydotool", "click", "0xC0"]) == "errored"
 
     def test_errored_on_an_error_signature(self, monkeypatch):
         monkeypatch.setattr(
@@ -412,6 +446,55 @@ class TestSocketDiscovery:
             "/tmp/.ydotool_socket",
         ]
 
+    def test_a_foreign_or_non_socket_candidate_is_never_trusted(self, monkeypatch):
+        """protects: a connectable path is not automatically our daemon — the
+        `/tmp` fallback lives in a world-writable directory, so a socket
+        planted there by another uid would pass a bare `connect()` probe,
+        receive every injected coordinate, and inject nothing.
+        fails_when: ownership or socket-type is not checked before the
+        candidate is offered to `_socket_accepts`, or a foreign socket is
+        returned as the injector.
+        no_claim: does not claim a same-uid impostor is impossible (unix
+        sockets cannot authenticate beyond ownership); does not touch the
+        filesystem — `os.stat` is stubbed.
+        seam: none
+        """
+        monkeypatch.setenv("YDOTOOL_SOCKET", "/tmp/.ydotool_socket")
+        foreign_mode = 0o140600  # S_IFSOCK | 0600, without importing stat
+        foreign = Mock(st_mode=foreign_mode, st_uid=os.getuid() + 1)
+        monkeypatch.setattr(g.os, "stat", lambda _path, **_kwargs: foreign)
+        asked = []
+        monkeypatch.setattr(
+            g, "_socket_accepts", lambda path: asked.append(path) or True
+        )
+        assert g.injector_socket() is None
+        assert asked == []
+
+    def test_the_last_good_socket_is_probed_first(self, monkeypatch):
+        """protects: the path that answered last time is re-validated first, so
+        the steady state costs one connect instead of the full four-path,
+        two-socket-type fan-out per injection — while a stale cache still
+        falls through to the full rediscovery.
+        fails_when: the cache short-circuits without re-validating (a stopped
+        daemon would stay "good"), or the fan-out is skipped when the cached
+        path dies.
+        no_claim: does not claim which path a real daemon binds; every probe
+        answer is stubbed.
+        seam: none
+        """
+        asked = []
+        monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
+        monkeypatch.setenv("YDOTOOL_SOCKET", "/first")
+        monkeypatch.setattr(
+            g, "_socket_accepts", lambda path: asked.append(path) or path == "/first"
+        )
+        assert g.injector_socket() == "/first"
+        assert g._socket_last_good == "/first"
+        assert asked == ["/first"]
+
+        assert g.injector_socket() == "/first"
+        assert asked == ["/first", "/first"]
+
     def test_repeated_paths_are_collapsed(self, monkeypatch):
         uid = os.getuid()
         monkeypatch.setenv("YDOTOOL_SOCKET", f"/run/user/{uid}/.ydotool_socket")
@@ -425,11 +508,13 @@ class TestSocketDiscovery:
         monkeypatch.setattr(
             g, "ydotool_socket_candidates", lambda: ["/dead", "/alive", "/tmp/.x"]
         )
+        monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
         monkeypatch.setattr(g, "_socket_accepts", lambda path: path == "/alive")
         assert g.injector_socket() == "/alive"
 
     def test_no_answer_is_none_not_a_guess(self, monkeypatch):
         monkeypatch.setattr(g, "ydotool_socket_candidates", lambda: ["/dead"])
+        monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
         monkeypatch.setattr(g, "_socket_accepts", lambda path: False)
         assert g.injector_socket() is None
 
@@ -538,6 +623,7 @@ class TestHelperEnv:
             "import json, sys\n"
             "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 1920, 1080],"
             " 'scale': 1.0}), flush=True)\n"
+            "print(json.dumps({'event': 'presented'}), flush=True)\n"
             "sys.stdin.readline()\n",
             encoding="utf-8",
         )
@@ -558,6 +644,52 @@ class TestHelperEnv:
         assert seen[0]["env"]["LD_LIBRARY_PATH"] == (
             f"/build/src{os.pathsep}/flake/lib"
         )
+
+
+class TestInterpreterResolution:
+    """`EASYSPEAK_GRID_PYTHON` names the interpreter outright; the built-in
+    candidates are the fallback for when it is not set, never a supplement."""
+
+    def test_the_override_is_the_only_candidate_probed_then_cached(self, monkeypatch):
+        """protects: with `EASYSPEAK_GRID_PYTHON` set, that interpreter and no
+        other is probed with the helper's own import chain; a failed probe
+        reports none and is never cached, so a box that grows a working
+        interpreter is found on the next call; and a positive is remembered,
+        so later opens reuse it without paying the import probe again.
+        fails_when: the override is ignored (the defaults are probed first or
+        instead), a failed override falls through to the defaults, a failure is
+        cached as the answer, or the cache skips a resolver that never ran.
+        no_claim: does not claim which interpreters exist on this host; the
+        probe result is stubbed.
+        seam: none
+        """
+        monkeypatch.setenv("EASYSPEAK_GRID_PYTHON", "/opt/grid/python3")
+        seen = []
+        monkeypatch.setattr(
+            g.subprocess,
+            "run",
+            lambda cmd, **kwargs: seen.append(list(cmd)) or Mock(returncode=1),
+        )
+        # A failing override is reported as none twice: never cached, never
+        # silently widened to the built-in candidates.
+        assert g.grid_python() is None
+        assert g.grid_python() is None
+        assert [cmd[0] for cmd in seen] == ["/opt/grid/python3"] * 2
+
+        monkeypatch.setattr(
+            g.subprocess,
+            "run",
+            lambda cmd, **kwargs: seen.append(list(cmd)) or Mock(returncode=0),
+        )
+        assert g.grid_python() == "/opt/grid/python3"
+        assert seen == [["/opt/grid/python3", "-c", g.HELPER_PROBE]] * 3
+
+        monkeypatch.setattr(
+            g.subprocess,
+            "run",
+            Mock(side_effect=AssertionError("a cached resolver must not re-probe")),
+        )
+        assert g.grid_python() == "/opt/grid/python3"
 
 
 class TestAdapterArgv:
@@ -627,6 +759,31 @@ class TestAdapterArgv:
         monkeypatch.setattr(g, "_dialect", g.YDTOOL_DIALECT_LEGACY)
         g.double_click()
         assert [a[2] for a in seen] == ["1", "1"]
+
+    def test_double_click_aggregates_the_two_outcomes(self, monkeypatch):
+        """protects: the pair is one gesture, so `double_click` reports `ran`
+        only when both clicks ran; a refused or uncertain half is never a false
+        `ran`, which `_fire_click` would read as success and stay silent on.
+        fails_when: the first click's outcome is returned alone (a second click
+        that never ran reports success), or the pair always reports `ran`.
+        no_claim: does not claim the desktop received either click, nor that
+        `errored` and `unknown` are told apart inside the pair - both collapse
+        to `unknown`, the same coarsening a refused move already gets.
+        seam: none
+        """
+        outcomes = {
+            ("ran", "ran"): "ran",
+            ("ran", "unknown"): "unknown",
+            ("ran", "errored"): "unknown",
+            ("unknown", "ran"): "unknown",
+            ("errored", "ran"): "unknown",
+        }
+        for pair, want in outcomes.items():
+            answers = iter(pair)
+            monkeypatch.setattr(
+                g, "click", lambda button="click", answers=answers: next(answers)
+            )
+            assert g.double_click() == want, pair
 
     def test_every_argv_the_seam_builds_uses_a_verb_the_binary_lists(self, monkeypatch):
         """The VM's ydotool offers five verbs and no `mousemove_relative`:
@@ -747,11 +904,6 @@ class TestGate:
         g.setup(core)
         assert g.active() is False
 
-    @staticmethod
-    def _help_result():
-        """What `ydotool help` returns on Ubuntu: the list on stderr, exit 1."""
-        return Mock(returncode=1, stdout="", stderr=UBUNTU_HELP)
-
     def test_socket_check_is_a_bare_connect_that_cannot_raise(self, monkeypatch):
         stub = Mock()
         stub.connect.side_effect = OSError("connection refused")
@@ -799,7 +951,7 @@ class TestGate:
         `ran` — there the socket is a logged mode, not a gate condition."""
         monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
         monkeypatch.setattr(g, "_socket_accepts", lambda path=None: False)
-        monkeypatch.setattr(g, "_spawn", lambda cmd, timeout: self._help_result())
+        monkeypatch.setattr(g, "_spawn", lambda cmd, timeout: _help_result())
         seen = []
         monkeypatch.setattr(
             g, "_run_bounded", lambda args, **k: seen.append(list(args)) or "ran"
@@ -816,8 +968,9 @@ class TestGate:
         monkeypatch.setattr(
             g, "ydotool_socket_candidates", lambda: ["/run/user/1000/.ydotool_socket"]
         )
+        monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
         monkeypatch.setattr(g, "_socket_accepts", lambda path=None: True)
-        monkeypatch.setattr(g, "_spawn", lambda cmd, timeout: self._help_result())
+        monkeypatch.setattr(g, "_spawn", lambda cmd, timeout: _help_result())
         monkeypatch.setattr(g, "_run_bounded", lambda args, **k: "ran")
         with caplog.at_level("INFO"):
             assert g._probe_injector() is True
@@ -848,6 +1001,7 @@ class TestGate:
         monkeypatch.setattr(
             g, "ydotool_socket_candidates", lambda: ["/run/user/1000/.ydotool_socket"]
         )
+        monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
         monkeypatch.setattr(g, "_socket_accepts", lambda path=None: True)
         monkeypatch.setattr(g, "_spawn", _modern_client)
         seen = []
@@ -875,7 +1029,7 @@ class TestGate:
         self, monkeypatch
     ):
         monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
-        monkeypatch.setattr(g, "_spawn", lambda cmd, timeout: self._help_result())
+        monkeypatch.setattr(g, "_spawn", lambda cmd, timeout: _help_result())
         monkeypatch.setattr(g, "_run_bounded", lambda args, **k: "errored")
         assert g._probe_injector() is False
 
@@ -893,6 +1047,86 @@ class TestGate:
 
         monkeypatch.setattr(g, "_spawn", boom)
         assert g._probe_injector() is False
+
+
+class TestOverlayProbe:
+    """The gate's overlay half is a readiness question: only an answer that says
+    yes opens it, and every other answer fails closed to `mousegrid`.
+
+    The whole plugin rests on this half: claiming the grid words on a host whose
+    compositor cannot show the surface would answer "grid" with an apology while
+    the extension backend was still able to serve it.
+    """
+
+    def test_the_overlay_probe_fails_closed_when_it_cannot_answer(
+        self, monkeypatch, caplog
+    ):
+        """protects: `_probe_overlay` reports not-ready when there is no
+        interpreter, when every candidate interpreter hangs, when the helper's
+        `--probe` refuses, and when that probe times out - the fail-closed half
+        of the gate - while a clean `--probe` still reports ready.
+        fails_when: any of those answers is read as ready, a helper is probed
+        without an interpreter, or a hanging candidate is chosen as the
+        overlay's interpreter.
+        no_claim: does not claim where the probes run (TestHelperEnv pins the
+        environment) nor what a live compositor answers.
+        seam: none
+        """
+        import subprocess
+
+        real_grid_python = g.grid_python
+
+        # No interpreter at all: nothing may be spawned, and the gate is shut.
+        monkeypatch.setattr(g, "grid_python", lambda: None)
+        runner = Mock(side_effect=AssertionError("a helper must not be probed"))
+        monkeypatch.setattr(g.subprocess, "run", runner)
+        with caplog.at_level("INFO"):
+            assert g._probe_overlay() is False
+        runner.assert_not_called()
+        assert any("no interpreter" in r.message for r in caplog.records)
+
+        # Every candidate hangs: each is skipped, none is reported as the
+        # overlay's interpreter, and the helper probe is never reached.
+        monkeypatch.delenv("EASYSPEAK_GRID_PYTHON", raising=False)
+        monkeypatch.setattr(g, "grid_python", real_grid_python)
+        asked = []
+
+        def hang(cmd, **kwargs):
+            asked.append(list(cmd))
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=5.0)
+
+        monkeypatch.setattr(g.subprocess, "run", hang)
+        with caplog.at_level("INFO"):
+            assert g._probe_overlay() is False
+        assert asked == [
+            [candidate, "-c", g.HELPER_PROBE] for candidate in g.GRID_PYTHON_CANDIDATES
+        ]
+
+        # The helper is there and refuses: the refusal is what the log carries.
+        monkeypatch.setattr(g, "grid_python", lambda: "python3")
+        monkeypatch.setattr(
+            g.subprocess,
+            "run",
+            Mock(return_value=Mock(returncode=1, stdout="unsupported\n", stderr="")),
+        )
+        caplog.clear()
+        with caplog.at_level("INFO"):
+            assert g._probe_overlay() is False
+        assert any("unsupported" in r.message for r in caplog.records)
+
+        # The helper probe itself hangs: another not-ready, never a wait.
+        monkeypatch.setattr(g.subprocess, "run", hang)
+        caplog.clear()
+        with caplog.at_level("INFO"):
+            assert g._probe_overlay() is False
+        assert any("did not answer in time" in r.message for r in caplog.records)
+
+        # Control: the clean answer still opens the gate, so the test cannot
+        # pass by the probe being dead.
+        monkeypatch.setattr(
+            g.subprocess, "run", Mock(return_value=Mock(returncode=0, stdout=""))
+        )
+        assert g._probe_overlay() is True
 
 
 class TestRouting:
@@ -913,6 +1147,106 @@ class TestRouting:
         monkeypatch.setattr(g, "_dismiss", Mock())
         assert g.handle("close the grid", core) is True
         g._dismiss.assert_called_once()
+
+    def test_again_reopens_at_the_remembered_cell(self, monkeypatch, core, fake_helper):
+        """protects: "again" reopens the grid on the cell a click was dispatched
+        from: the remembered cell is handed to the session as its bounds, so the
+        fresh open draws over that cell instead of the whole output.
+        fails_when: the remembered cell is dropped (reopen at the full monitor
+        because the global was assigned before `_open_session` overwrote it, or
+        the bounds were never passed), or the word is not claimed.
+        no_claim: does not claim the overlay's pixels; the redraw it asks for is
+        asserted, not what the helper painted, and the memory is process state
+        that a daemon restart clears.
+        seam: none
+        """
+        fake_helper(
+            "import json, sys\n"
+            "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 1920, 1080]}),"
+            " flush=True)\n"
+            "print(json.dumps({'event': 'presented'}), flush=True)\n"
+            "for _ in sys.stdin:\n"
+            "    pass\n"
+        )
+        monkeypatch.setattr(g, "_active", True)
+        monkeypatch.setattr(g, "_last_bounds", (1351, 280, 71, 40))
+        drawn = []
+        monkeypatch.setattr(g, "_redraw", drawn.append)
+        core.listen_modal = Mock(return_value=iter([]))
+
+        assert g.handle("again", core) is True
+
+        assert drawn == [(1351, 280, 71, 40)]
+        assert g._last_bounds == (1351, 280, 71, 40)
+
+    def test_a_remembered_cell_that_no_longer_fits_reopens_full(
+        self, monkeypatch, core, fake_helper
+    ):
+        """protects: the remembered cell is only reused when it still fits the
+        output the FRESH session reports — a resolution change or a dock swap
+        between sessions would otherwise draw it clipped and aim its click at
+        the edge of the new output.
+        fails_when: stale bounds are used verbatim against the new geometry,
+        or a fitting cell is discarded (the memory would be useless).
+        no_claim: does not claim the compositor cannot resize between the
+        helper's ready and the click; the clamp is against the geometry the
+        session actually opened with.
+        seam: none
+        """
+        fake_helper(
+            "import json, sys\n"
+            "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 900, 600]}),"
+            " flush=True)\n"
+            "print(json.dumps({'event': 'presented'}), flush=True)\n"
+            "for _ in sys.stdin:\n"
+            "    pass\n"
+        )
+        monkeypatch.setattr(g, "_active", True)
+        # A cell from a 1920x1080 session, replayed on a 900x600 output.
+        monkeypatch.setattr(g, "_last_bounds", (1351, 280, 71, 40))
+        drawn = []
+        monkeypatch.setattr(g, "_redraw", drawn.append)
+        core.listen_modal = Mock(return_value=iter([]))
+
+        assert g.handle("again", core) is True
+
+        assert drawn == [(0, 0, 900, 600)]
+        assert g._bounds == (0, 0, 900, 600)
+
+    def test_a_subdivide_only_session_leaves_again_nothing_to_reopen(
+        self, monkeypatch, core, fake_helper
+    ):
+        """protects: the cell "again" reopens is the one a click was dispatched
+        from - walking zones without clicking records nothing, so "again" falls
+        through to the other plugins (mousegrid included) rather than reopening.
+        fails_when: a subdivision records the walked cell (again would reopen
+        where the user last pointed, not where they last clicked), or handle
+        claims "again" with nothing remembered.
+        no_claim: does not claim a clicked session is the only way the memory is
+        set - that path is test_again_reopens_at_the_remembered_cell's subject.
+        seam: none
+        """
+        fake_helper(
+            "import json, sys\n"
+            "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 900, 600]}),"
+            " flush=True)\n"
+            "print(json.dumps({'event': 'presented'}), flush=True)\n"
+            "for _ in sys.stdin:\n"
+            "    pass\n"
+        )
+        monkeypatch.setattr(g, "_active", True)
+        monkeypatch.setattr(g, "_last_bounds", None)
+        core.listen_modal = Mock(return_value=iter(["3 7 5", "close"]))
+
+        assert g.handle("grid", core) is True
+        assert g._last_bounds is None
+
+        monkeypatch.setattr(
+            g,
+            "_open_session",
+            Mock(side_effect=AssertionError("again reopened with nothing remembered")),
+        )
+        assert g.handle("again", core) is None
 
     def test_unknown_input_passes_to_the_next_plugin(self, monkeypatch, core):
         monkeypatch.setattr(g, "_active", True)
@@ -960,12 +1294,16 @@ class TestModeDispatch:
 
     def test_unrecognised_utterance_keeps_the_mode(self, monkeypatch, core):
         monkeypatch.setattr(g, "move_to", Mock())
+        monkeypatch.setattr(g, "click", Mock())
         # `_dismiss` is stubbed as in the two tests above: the dispatch of the
         # unknown utterance is this test's subject, not the session teardown
         # its real body performs.
         monkeypatch.setattr(g, "_dismiss", Mock())
         core.listen_modal = Mock(return_value=iter(["open firefox", "close"]))
         g._run_mode(core)
+        g.move_to.assert_not_called()
+        g.click.assert_not_called()
+        g._dismiss.assert_called_once()
 
     def test_unknown_outcome_speaks_the_uncertain_line(self, monkeypatch, core):
         monkeypatch.setattr(g, "move_to", lambda x, y: "unknown")
@@ -986,6 +1324,31 @@ class TestModeDispatch:
         g._bounds = (0, 0, 900, 600)
         core.listen_modal = Mock(return_value=iter(["click"]))
         g._run_mode(core)
+        assert core.speak.call_args_list[-1].args[0] == "I couldn't move the pointer."
+
+    def test_errored_move_does_not_click(self, monkeypatch, core):
+        """protects: a move that errored is not followed by a click, the same
+        `ran`-or-nothing guard the `unknown` case carries: the click is only
+        fired once the move reported `ran`, so a refusal cannot land a click
+        where the pointer happens to sit.
+        fails_when: `_fire_click` treats anything but `unknown` as a green light
+        (an errored move would click at the unproven position), or skips the
+        dismissal.
+        no_claim: does not claim the user hears more than the definite line, and
+        does not claim where the pointer actually was.
+        seam: none
+        """
+        monkeypatch.setattr(g, "move_to", Mock(return_value="errored"))
+        monkeypatch.setattr(g, "click", Mock(return_value="ran"))
+        monkeypatch.setattr(g, "double_click", Mock(return_value="ran"))
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        monkeypatch.setattr(g, "_bounds", (0, 0, 900, 600))
+        monkeypatch.setattr(g, "_last_bounds", None)
+        core.listen_modal = Mock(return_value=iter(["click"]))
+        g._run_mode(core)
+        g.click.assert_not_called()
+        g.double_click.assert_not_called()
+        g._dismiss.assert_called_once()
         assert core.speak.call_args_list[-1].args[0] == "I couldn't move the pointer."
 
     def test_unknown_move_never_clicks(self, monkeypatch, core):
@@ -1044,6 +1407,36 @@ class TestModeDispatch:
         core.listen_modal = Mock(return_value=iter(["double click"]))
         g._run_mode(core)
         assert seen == [("move", 450, 300), ("double_click",), ("dismiss",)]
+
+    def test_a_double_click_with_a_failed_half_speaks_the_uncertain_line(
+        self, monkeypatch, core
+    ):
+        """protects: a "double click" whose second click did not run still ends
+        the mode with the uncertain line, through the real aggregation - silence
+        would leave the user guessing whether the gesture landed, and the
+        definite failure line would claim a refusal that only half happened.
+        fails_when: `_fire_click` reads a partial `double_click` outcome as
+        success (no speech at all) or swaps in the move's outcome instead of
+        the pair's.
+        no_claim: does not claim where the pointer sat after the first click,
+        nor what the desktop received.
+        seam: none
+        """
+        monkeypatch.setattr(g, "move_to", Mock(return_value="ran"))
+        answers = iter(["ran", "errored"])
+        monkeypatch.setattr(
+            g, "click", lambda button="click", answers=answers: next(answers)
+        )
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        g._bounds = (0, 0, 900, 600)
+        g._last_bounds = None
+        core.listen_modal = Mock(return_value=iter(["double click"]))
+        g._run_mode(core)
+        g._dismiss.assert_called_once()
+        assert (
+            core.speak.call_args_list[-1].args[0]
+            == "I tried, but I'm not sure it worked."
+        )
 
     def test_click_without_bounds_does_nothing(self, monkeypatch, core):
         monkeypatch.setattr(g, "move_to", Mock())
@@ -1186,12 +1579,14 @@ class TestHelperLifecycle:
 
     def _ready_script(self):
         """A helper that stays up for the session, like the real one does: it
-        reads stdin until EOF, so the loop-top liveness check sees it alive and
-        the teardown paths are what end it."""
+        announces `presented` once (the first frame is on the glass the moment
+        the fake surface maps) and then reads stdin until EOF, so the loop-top
+        liveness check sees it alive and the teardown paths are what end it."""
         return (
             "import json, sys\n"
             "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 900, 600]}),"
             " flush=True)\n"
+            "print(json.dumps({'event': 'presented'}), flush=True)\n"
             "for _ in sys.stdin:\n"
             "    pass\n"
         )

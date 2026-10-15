@@ -16,7 +16,9 @@ import re
 import select
 import shutil
 import socket
+import stat
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -92,6 +94,17 @@ WORD_TO_NUM = {
     "nein": 9,
 }
 
+# One compiled scan for the whole word table. Longest-first matters: Python's
+# `re` tries alternatives in order at each position, so "three" must precede
+# "tree"-shaped shorter rivals ("to" before "too"/"two" would turn "two" into
+# "2wo"). Sorting by length is the order that matches the per-word loop this
+# replaced, where every full word got its own whole-string pass.
+_NUM_RE = re.compile(
+    r"\b("
+    + "|".join(sorted(map(re.escape, WORD_TO_NUM), key=len, reverse=True))
+    + r")\b"
+)
+
 ZONE_MAP = {
     1: (0, 0),
     2: (1, 0),
@@ -131,10 +144,15 @@ def parse_number_sequence(text):
     `"3 7 5"` and `"three seven five"` both give `[3, 7, 5]`; the word table
     carries Whisper's usual mishearings, mirroring mousegrid's parser so the same
     utterance chains the same zooms on either backend.
+
+    The table compiles to one alternation scanned once per utterance, instead of
+    one pass per word over the whole string. Alternatives are ordered longest
+    first, which is what keeps the result identical to the sequential loop it
+    replaced: at a shared start position the longest word wins, as the per-word
+    passes did implicitly (a shorter word never survived where a longer one also
+    matched, because the longer pass had already consumed the token).
     """
-    lowered = text.lower()
-    for word, num in WORD_TO_NUM.items():
-        lowered = re.sub(rf"\b{word}\b", str(num), lowered)
+    lowered = _NUM_RE.sub(lambda m: str(WORD_TO_NUM[m[0]]), text.lower())
     return [int(char) for char in lowered if char.isdigit() and char != "0"]
 
 
@@ -144,6 +162,10 @@ def parse_number_sequence(text):
 PROBE_TIMEOUT = 5.0
 INJECT_TIMEOUT = 2.0
 REAP_GRACE = 2.0
+# The first-frame wait after `ready`: usually answered in milliseconds (the
+# surface maps right away), bounded so a compositor that never frames cannot
+# stall the session open.
+PRESENT_TIMEOUT = 2.0
 YDTOOL_SOCKET = "/tmp/.ydotool_socket"  # noqa: S108 -- 0.1.8's hardcoded path
 YDTOOL_SOCKET_NAME = ".ydotool_socket"  # 1.0.x defaults to $XDG_RUNTIME_DIR/that
 # What the two daemons speak: 0.1.8's ydotoold listens on a stream socket, 1.0.x's
@@ -195,10 +217,8 @@ YDTOOL_ABSOLUTE_FLAG = "--absolute"
 YDTOOL_NOOP_LEGACY = ("ydotool", "type", "", "--delay", "0")
 YDTOOL_NOOP_MODERN = ("ydotool", "type", "")
 
-_core = None
 _active = False
 _bounds = None
-_monitor = None
 _monitor_origin = (0, 0)
 _grid_open = False
 _last_bounds = None
@@ -266,16 +286,60 @@ def ydotool_socket_candidates():
     return list(dict.fromkeys(candidates))
 
 
+def _socket_owned(path):
+    """True when `path` is a socket this user owns, and safe to talk to.
+
+    A connectable socket is not automatically our daemon: every candidate but
+    the `XDG_RUNTIME_DIR` and `/run/user` ones lives in a directory other users
+    can write, and the `/tmp` fallback is 0.1.8's hardcoded path in the
+    world-writable one. A socket planted there by someone else would accept our
+    connection, pass the gate, and receive every coordinate we inject while
+    injecting nothing. Ownership is the cheap authentication a unix socket
+    cannot do for itself, so a candidate that exists but is not our socket —
+    wrong type, or owned by another uid — is skipped, never trusted.
+    """
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return False
+    if not stat.S_ISSOCK(st.st_mode):
+        return False
+    if st.st_uid != os.getuid():
+        logger.warning(
+            "grid: skipping %s (a socket owned by uid %s, not ours)",
+            path,
+            st.st_uid,
+        )
+        return False
+    return True
+
+
+# The candidate that answered last time. Probing it first keeps the per-use
+# rediscovery honest (a daemon that stopped is not an injector any more) while
+# sparing the common path the full four-path, two-socket-type fan-out on every
+# injection.
+_socket_last_good = None
+
+
 def injector_socket():
     """Return the daemon socket that answers, or None when none does.
 
-    Asked afresh before each use rather than cached: a daemon that stopped is not
-    an injector any more, and one that started is, and the answer is what decides
-    both the gate's mode line and whether the gate opens at all on a client that
-    cannot inject without one.
+    Asked afresh before each use rather than cached blindly: a daemon that
+    stopped is not an injector any more, and one that started is, and the answer
+    is what decides both the gate's mode line and whether the gate opens at all
+    on a client that cannot inject without one. The last path that answered is
+    re-probed first, so the steady state costs one connect instead of the full
+    fan-out.
     """
-    for candidate in ydotool_socket_candidates():
-        if _socket_accepts(candidate):
+    global _socket_last_good
+    candidates = ydotool_socket_candidates()
+    if _socket_last_good and _socket_last_good in candidates:
+        if _socket_owned(_socket_last_good) and _socket_accepts(_socket_last_good):
+            return _socket_last_good
+        _socket_last_good = None
+    for candidate in candidates:
+        if _socket_owned(candidate) and _socket_accepts(candidate):
+            _socket_last_good = candidate
             return candidate
     return None
 
@@ -317,11 +381,13 @@ def _run_bounded(args, timeout=INJECT_TIMEOUT):
     the argv-shaped code for a build that forwards Exec's return. The three
     outcomes are what the rest of the module reasons about.
 
-    "Clean stderr" is what makes that reading safe, which is why a rejected argv
+    "Clean output" is what makes that reading safe, which is why a rejected argv
     is an error signature: 1.0.4 answers `click: unrecognized option '--delay'`
     on stderr, emits nothing, and exits 0, so a seam reading only the code would
     call a no-op `ran` — and the same argv on `mousemove` dies with SIGABRT (134)
-    instead. `--delay 0` was 0.1.8's flag; see the dialect block above.
+    instead. Both streams are scanned, like the probe seams, so a build that
+    moves its refusals cannot silence them. `--delay 0` was 0.1.8's flag; see
+    the dialect block above.
 
     `timeout` bounds the process, which is what keeps a wedged ydotool (or
     ydotoold) from freezing the modal loop with the overlay on screen.
@@ -337,10 +403,13 @@ def _run_bounded(args, timeout=INJECT_TIMEOUT):
     except OSError as exc:
         logger.warning("ydotool could not start: %s", exc)
         return "unknown"
-    if any(sig in result.stderr for sig in ERROR_SIGNATURES):
-        logger.warning("ydotool refused: %s", result.stderr.strip())
+    # Both streams are scanned, matching the probe seams: a build that moves a
+    # refusal from stderr to stdout must not turn a rejection into a `ran`.
+    output = f"{result.stdout or ''}\n{result.stderr or ''}"
+    if any(sig in output for sig in ERROR_SIGNATURES):
+        logger.warning("ydotool refused: %s", output.strip())
         return "errored"
-    if FALLBACK_NOTICE in result.stderr:
+    if FALLBACK_NOTICE in output:
         # 0.1.8 with no daemon: the client built a device for this invocation and
         # said so. The VM measured that path working — the notice names a latency
         # caveat, not a capability gap — so the invocation still counts, and this
@@ -349,8 +418,14 @@ def _run_bounded(args, timeout=INJECT_TIMEOUT):
         logger.info("grid: per-invocation device (ydotoold unavailable)")
     # The argv-shaped code (`["ydotool", "mousemove", "0", "0"]` → 3) is what
     # Exec returns and what a build forwarding it would report; the 0.1.8
-    # client discards it, so the zero is the measured success code.
-    if result.returncode == 0 or result.returncode == len(args) - 1:
+    # client discards it, so the zero is the measured success code. The
+    # argv-shaped acceptance is legacy-only: on the modern dialect exit 2 is
+    # `failed to connect socket` — a real failure — and a click argv's length
+    # minus one is also 2, so accepting the shape there would call a daemon-less
+    # click `ran` the moment a signature drifts.
+    if result.returncode == 0 or (
+        dialect() == YDTOOL_DIALECT_LEGACY and result.returncode == len(args) - 1
+    ):
         return "ran"
     if result.returncode < 0:
         logger.warning("ydotool was killed by signal %s", -result.returncode)
@@ -460,6 +535,15 @@ def helper_env(base=None):
     return env
 
 
+# The interpreter the gate's probe found, and whether it found one. A `None`
+# answer is never cached: the probe costs a fresh interpreter import each call
+# (100-500 ms on the interactive open path), so a positive is remembered for the
+# daemon's lifetime, while a negative keeps re-probing in case the box grows a
+# working interpreter later.
+_grid_python = None
+_grid_python_found = False
+
+
 def grid_python():
     """Return an interpreter that can run the helper, or None.
 
@@ -468,8 +552,13 @@ def grid_python():
     candidate is probed with the helper's own import chain. The probe runs in
     `helper_env()`, so an interpreter that only finds the typelib through
     `EASYSPEAK_GRID_TYPELIB` counts. Bounded, because a startup hang is
-    invisible in a way an exception is not.
+    invisible in a way an exception is not. The first candidate that answers is
+    cached — the answer does not go stale the way a socket does, and every
+    grid open would otherwise pay the import probe again.
     """
+    global _grid_python, _grid_python_found
+    if _grid_python_found:
+        return _grid_python
     override = os.environ.get("EASYSPEAK_GRID_PYTHON")
     candidates = (override,) if override else GRID_PYTHON_CANDIDATES
     for candidate in candidates:
@@ -484,6 +573,8 @@ def grid_python():
         except (OSError, subprocess.TimeoutExpired):
             continue
         if probe.returncode == 0:
+            _grid_python = candidate
+            _grid_python_found = True
             return candidate
     return None
 
@@ -652,10 +743,11 @@ def noop_argv():
     return YDTOOL_NOOP_LEGACY
 
 
-def setup(core):
-    """Resolve the gate once, at daemon startup, and remember the core."""
-    global _core, _active
-    _core = core
+def setup(core):  # noqa: ARG001 — unused since the dead `_core` global went away;
+    # the loader's positional contract and the harness's `setup(core=None)`
+    # pin the parameter name, so it stays.
+    """Resolve the gate once, at daemon startup."""
+    global _active
     forced = os.environ.get("EASYSPEAK_GRID_BACKEND")
     if forced == "uinput":
         # A deliberate override: it short-circuits the probes, because asking for
@@ -668,8 +760,30 @@ def setup(core):
         _active = False
         logger.info("grid: forced inert by EASYSPEAK_GRID_BACKEND=gnome")
     else:
-        overlay = _probe_overlay()
-        injector = _probe_injector() if overlay else False
+        # The two probes are independent until the conjunction, so they run
+        # side by side: each is bounded individually, and a host where both
+        # would hang pays the bound once instead of twice at daemon startup.
+        # Both always run when nothing is forced — skipping the injector probe
+        # on an overlay failure would save one bounded connect and cost the
+        # concurrency.
+        outcome = {}
+
+        def _run(name, probe):
+            outcome[name] = probe()
+
+        threads = [
+            threading.Thread(target=_run, args=(name, probe), name=f"grid-probe-{name}")
+            for name, probe in (
+                ("overlay", _probe_overlay),
+                ("injector", _probe_injector),
+            )
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(PROBE_TIMEOUT + INJECT_TIMEOUT)
+        overlay = bool(outcome.get("overlay"))
+        injector = bool(outcome.get("injector"))
         _active = overlay and injector
     logger.info("grid backend %s", "active" if _active else "inert")
 
@@ -690,16 +804,32 @@ def _open_session(core, bounds=None):
     """Open the overlay, take its geometry, and drive the mode until it ends.
 
     `bounds` is the cell to reopen at (the "again" path) and defaults to the
-    whole output. Returns the mode's exit reason so the caller can decide what
-    to say.
+    whole output. Returns the mode's exit reason for the unit tests to assert
+    on; the caller never reads it, because this function already speaks on
+    every failure path itself.
     """
-    global _monitor, _monitor_origin, _bounds, _grid_open
+    global _monitor_origin, _bounds, _grid_open
     geometry = _start_helper()
     if geometry is None:
         core.speak(_("I couldn't show the grid."))
         return None
-    _monitor = geometry
     _monitor_origin = (geometry[0], geometry[1])
+    if bounds:
+        left, top, width, height = bounds
+        fits = (
+            left >= 0
+            and top >= 0
+            and left + width <= geometry[2]
+            and top + height <= geometry[3]
+        )
+        if not fits:
+            # The remembered cell came from a previous session's geometry: a
+            # resolution change or a dock swap between sessions would draw it
+            # clipped and aim its clicks at the edge of the output. The fresh
+            # full rectangle is the only shape the containment invariant
+            # guarantees, so a cell that no longer fits reopens as one.
+            logger.info("grid: the remembered cell does not fit; reopening full")
+            bounds = None
     _bounds = tuple(bounds) if bounds else (0, 0, geometry[2], geometry[3])
     # The first show goes out before the mode starts listening: without it the
     # grid is never drawn and the session looks like a dead daemon.
@@ -804,8 +934,9 @@ def _run_mode(core):
             core.speak(_("Grid closed"))
             return
 
-        if _click_kind(text, words):
-            _fire_click(_click_kind(text, words), core)
+        kind = _click_kind(text, words)
+        if kind:
+            _fire_click(kind, core)
             return
 
         zones = parse_number_sequence(text)
@@ -907,6 +1038,16 @@ def _start_helper():
         logger.warning("grid: the ready event carried no usable geometry")
         stop_helper("bad geometry")
         return None
+    # Consume the `presented` announcement so the protocol's promise is kept:
+    # the helper says when its first real frame reached the glass, and the log
+    # is where that answer lands. A compositor that never frames (or a helper
+    # that died between ready and draw) must not stall the session open, so a
+    # missing announcement only lowers the log's confidence.
+    announcement = read_until(_helper.stdout, time.monotonic() + PRESENT_TIMEOUT)
+    if announcement and announcement.get("event") == "presented":
+        logger.info("grid: first frame on screen")
+    else:
+        logger.debug("grid: no presented announcement inside PRESENT_TIMEOUT")
     return tuple(monitor)
 
 
