@@ -166,6 +166,10 @@ REAP_GRACE = 2.0
 # surface maps right away), bounded so a compositor that never frames cannot
 # stall the session open.
 PRESENT_TIMEOUT = 2.0
+# The per-injection rediscovery bound: a daemon that is alive but wedged must
+# cost a fraction of a second between a move and its click, not the startup
+# bound (which stays at PROBE_TIMEOUT, where hanging is invisible).
+PROBE_TIMEOUT_PER_USE = 0.25
 YDTOOL_SOCKET = "/tmp/.ydotool_socket"  # noqa: S108 -- 0.1.8's hardcoded path
 YDTOOL_SOCKET_NAME = ".ydotool_socket"  # 1.0.x defaults to $XDG_RUNTIME_DIR/that
 # What the two daemons speak: 0.1.8's ydotoold listens on a stream socket, 1.0.x's
@@ -332,7 +336,7 @@ def _socket_env_key():
     )
 
 
-def injector_socket():
+def injector_socket(timeout=PROBE_TIMEOUT):
     """Return the daemon socket that answers, or None when none does.
 
     Asked afresh before each use rather than cached blindly: a daemon that
@@ -341,6 +345,11 @@ def injector_socket():
     on a client that cannot inject without one. The last path that answered —
     under the same resolution environment — is re-probed first, so the steady
     state costs one connect instead of the full fan-out.
+
+    `timeout` bounds each connect. The per-injection callers pass the short
+    per-use bound: a daemon that is alive but wedged answers no connect, and
+    the voice thread must not sit through the startup bound between a move and
+    its click.
     """
     global _socket_last_good, _socket_last_good_env
     candidates = ydotool_socket_candidates()
@@ -350,11 +359,13 @@ def injector_socket():
         and _socket_last_good_env == env_key
         and _socket_last_good in candidates
     ):
-        if _socket_owned(_socket_last_good) and _socket_accepts(_socket_last_good):
+        if _socket_owned(_socket_last_good) and _socket_accepts(
+            _socket_last_good, timeout
+        ):
             return _socket_last_good
         _socket_last_good = None
     for candidate in candidates:
-        if _socket_owned(candidate) and _socket_accepts(candidate):
+        if _socket_owned(candidate) and _socket_accepts(candidate, timeout):
             _socket_last_good = candidate
             _socket_last_good_env = env_key
             return candidate
@@ -368,9 +379,11 @@ def _client_env():
     answers (0.1.8 then builds its own device, and 1.0.x refuses on its own). When
     one does answer, the path is exported explicitly, because the client's own
     discovery is relative to `XDG_RUNTIME_DIR` and this process may be looking at
-    a different one than the daemon's owner.
+    a different one than the daemon's owner. The probe uses the short per-use
+    bound: this runs between the move and the click of every utterance, and a
+    wedged daemon must cost a fraction of a second, not the startup bound.
     """
-    path = injector_socket()
+    path = injector_socket(timeout=PROBE_TIMEOUT_PER_USE)
     if path is None:
         return None
     return {**os.environ, "YDOTOOL_SOCKET": path}
@@ -433,15 +446,18 @@ def _run_bounded(args, timeout=INJECT_TIMEOUT):
         # line states which mode was in use. 1.0.x has no such mode, and says so
         # with "failed to connect socket" instead, which is an error signature.
         logger.info("grid: per-invocation device (ydotoold unavailable)")
-    # The argv-shaped code (`["ydotool", "mousemove", "0", "0"]` → 3) is what
-    # Exec returns and what a build forwarding it would report; the 0.1.8
-    # client discards it, so the zero is the measured success code. The
-    # argv-shaped acceptance is legacy-only: on the modern dialect exit 2 is
-    # `failed to connect socket` — a real failure — and a click argv's length
-    # minus one is also 2, so accepting the shape there would call a daemon-less
-    # click `ran` the moment a signature drifts.
+    # The argv-shaped code is what Exec returns and what a build forwarding it
+    # would report — measured both ways on the draft's own table (`type ""`
+    # forwarding reports the full argc, `click 1` reports one less), so the
+    # legacy tolerance accepts either. The 0.1.8 client discards the value, so
+    # the zero is the measured success code. The argv-shaped acceptance is
+    # legacy-only: on the modern dialect exit 2 is `failed to connect socket`
+    # — a real failure — and a click argv's length minus one is also 2, so
+    # accepting the shape there would call a daemon-less click `ran` the
+    # moment a signature drifts.
     if result.returncode == 0 or (
-        dialect() == YDTOOL_DIALECT_LEGACY and result.returncode == len(args) - 1
+        dialect() == YDTOOL_DIALECT_LEGACY
+        and result.returncode in (len(args) - 1, len(args))
     ):
         return "ran"
     if result.returncode < 0:
@@ -628,7 +644,7 @@ def _probe_overlay():
     return True
 
 
-def _socket_accepts(sock_path=YDTOOL_SOCKET):
+def _socket_accepts(sock_path=YDTOOL_SOCKET, timeout=PROBE_TIMEOUT):
     """True when the ydotoold socket at `sock_path` takes a connection.
 
     Both socket types are tried, in this order: 1.0.x's daemon speaks
@@ -642,11 +658,16 @@ def _socket_accepts(sock_path=YDTOOL_SOCKET):
     No injection, no side effect. The daemon holds an already-recognised device,
     so injections through it carry no per-invocation latency caveat — which is
     the whole difference on 0.1.8, and the only working path on 1.0.x.
+
+    `timeout` bounds each connect. The startup probes keep the full
+    `PROBE_TIMEOUT`; the per-injection path passes the short per-use bound,
+    because a daemon that is alive but wedged would otherwise hold the voice
+    thread for the full bound on every move and click.
     """
     for sock_type in YDTOOL_SOCKET_TYPES:
         conn = socket.socket(socket.AF_UNIX, sock_type)
         try:
-            conn.settimeout(PROBE_TIMEOUT)
+            conn.settimeout(timeout)
             conn.connect(sock_path)
         except OSError:
             continue
@@ -826,6 +847,9 @@ def setup(core):  # noqa: ARG001 — unused since the dead `_core` global went a
 
 
 DISMISS_WORDS = {"close", "cancel", "stop", "hide", "escape", "exit", "done", "quit"}
+# The show/dismiss guard at the claim boundary is mousegrid's own pair, no
+# wider: parity there is the module's core invariant (see handle's guard).
+_SHOW_BLOCK_WORDS = {"close", "hide"}
 AGAIN_WORDS = {"again", "repeat", "reopen"}
 
 
@@ -889,6 +913,8 @@ def _open_session(core, bounds=None):
         stop_helper("show refused")
         core.speak(_("I couldn't show the grid."))
         return None
+    elif announcement and announcement.get("event") == "_eof":
+        logger.warning("grid: the helper exited right after ready")
     else:
         logger.debug("grid: no presented announcement inside PRESENT_TIMEOUT")
     _grid_open = True
@@ -922,14 +948,21 @@ def handle(cmd, core):
         _open_session(core, bounds=_last_bounds)
         return True
 
+    # The show guard mirrors mousegrid's exactly ("close"/"hide", nothing
+    # more): the module promises one utterance lands the same on whichever
+    # backend answers, so a phrase like "grid quit" must open here when the
+    # gate passed and open there when it did not. The wider DISMISS_WORDS set
+    # stays in charge inside an open session, where no parity question exists.
     if any(word in words for word in GRID_TRIGGERS) and not (
-        DISMISS_WORDS & set(words)
+        _SHOW_BLOCK_WORDS & set(words)
     ):
         _bounds = None
         _open_session(core)
         return True
 
-    if (_grid_open or (GRID_TRIGGERS & set(words))) and (DISMISS_WORDS & set(words)):
+    if (_grid_open or (GRID_TRIGGERS & set(words))) and (
+        _SHOW_BLOCK_WORDS & set(words)
+    ):
         # A phrase that names the grid and asks to close it is a dismissal, never
         # an open — and it is ours even when no session is tracked, so mousegrid
         # is not offered the same words twice.
@@ -976,7 +1009,15 @@ def _run_mode(core):
             # unplugged). A click is never injected against geometry that no
             # longer exists: end the mode through the dismissal path, which
             # discards the bounds too. No speech - the spec asks for the log
-            # line and the end of the mode, not a new reply string.
+            # line and the end of the mode, not a new reply string. The
+            # helper's last words, though, are read: a refusal that arrived
+            # mid-mode (the click-through region failed on a redraw, say) is
+            # the diagnostic for the vanish, and EOF answers immediately.
+            last_words = read_until(_helper.stdout, time.monotonic() + PRESENT_TIMEOUT)
+            if last_words and last_words.get("event") == "error":
+                logger.warning(
+                    "grid: the helper's last words: %s", last_words.get("message")
+                )
             logger.warning(
                 "grid: the helper exited with the grid open; ending the mode"
             )
@@ -984,6 +1025,7 @@ def _run_mode(core):
             return
 
         text = spoken.lower()
+        logger.debug("grid: heard %r", spoken)
         words = set(text.split())
 
         if words & DISMISS_WORDS:
@@ -1077,6 +1119,10 @@ def _start_helper():
             stop_helper("no ready inside PROBE_TIMEOUT")
             return None
         event = message.get("event")
+        if event == "_eof":
+            logger.warning("grid: the helper exited before reporting ready")
+            stop_helper("helper exited before ready")
+            return None
         if event == "ready":
             logger.info(
                 "grid: ready on %s (scale %s)",
@@ -1091,7 +1137,18 @@ def _start_helper():
         logger.debug("grid: %s", event)
 
     monitor = message.get("monitor")
-    if not monitor or len(monitor) != 4:
+    if (
+        not monitor
+        or len(monitor) != 4
+        or not all(
+            isinstance(value, int) and not isinstance(value, bool) for value in monitor
+        )
+        or monitor[2] <= 0
+        or monitor[3] <= 0
+    ):
+        # Length alone is not sanity: a broken compositor report with a zero or
+        # negative width would pass the length check and later aim every click
+        # at (0, 0) or off the output, spoken as success.
         logger.warning("grid: the ready event carried no usable geometry")
         stop_helper("bad geometry")
         return None
@@ -1107,8 +1164,10 @@ def read_until(stream, deadline):
     reads ahead: a line that layer holds is invisible to `select`, and a chunk
     read here would strand every line after the one returned. One byte at a
     time is what leaves the unread protocol in the one place `select` can see
-    it. Anything that does not parse is logged and skipped, and EOF reads as
-    None.
+    it. Anything that does not parse is logged and skipped. EOF returns the
+    `_eof` event rather than None — a helper that died instantly and a helper
+    that said nothing are different failures, and the callers log them
+    differently.
     """
     pending = b""
     while True:
@@ -1132,8 +1191,7 @@ def read_until(stream, deadline):
             return None
         chunk = os.read(stream.fileno(), 1)
         if not chunk:
-            logger.warning("grid: the helper closed its output")
-            return None
+            return {"event": "_eof"}
         pending += chunk
 
 

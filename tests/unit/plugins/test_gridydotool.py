@@ -240,6 +240,18 @@ class TestOutcomeClassification:
         monkeypatch.setattr(g, "_spawn", lambda *a, **k: self._result(2))
         assert g._run_bounded(["ydotool", "click", "0xC0"]) == "errored"
 
+    def test_legacy_accepts_both_argc_shapes(self, monkeypatch):
+        """The draft's own forwarding table disagrees with itself by one: the
+        noop row reports the full argc, the click row one less. A legacy build
+        that forwards either shape still classifies as `ran`."""
+        monkeypatch.setattr(g, "_dialect", g.YDTOOL_DIALECT_LEGACY)
+        noop = ["ydotool", "type", "", "--delay", "0"]
+        monkeypatch.setattr(g, "_spawn", lambda *a, **k: self._result(len(noop)))
+        assert g._run_bounded(noop) == "ran"
+        click = ["ydotool", "click", "1"]
+        monkeypatch.setattr(g, "_spawn", lambda *a, **k: self._result(len(click) - 1))
+        assert g._run_bounded(click) == "ran"
+
     def test_a_refusal_on_stdout_refuses_too(self, monkeypatch):
         """Both streams are scanned, like the probe seams: a build that moves
         its refusal from stderr to stdout must not turn a rejection into a
@@ -470,7 +482,9 @@ class TestSocketDiscovery:
         monkeypatch.setattr(Path, "stat", lambda self, **_kwargs: foreign)
         asked = []
         monkeypatch.setattr(
-            g, "_socket_accepts", lambda path: asked.append(path) or True
+            g,
+            "_socket_accepts",
+            lambda path, timeout=g.PROBE_TIMEOUT: asked.append(path) or True,
         )
         assert g.injector_socket() is None
         assert asked == []
@@ -500,7 +514,11 @@ class TestSocketDiscovery:
         # First call: the highest-priority candidate is dead, the second one
         # answers — and becomes the cache.
         monkeypatch.setattr(
-            g, "_socket_accepts", lambda path: asked.append(path) or path == order[1]
+            g,
+            "_socket_accepts",
+            lambda path, timeout=g.PROBE_TIMEOUT: (
+                asked.append(path) or path == order[1]
+            ),
         )
         assert g.injector_socket() == order[1]
         assert asked == [order[0], order[1]]
@@ -527,13 +545,17 @@ class TestSocketDiscovery:
             g, "ydotool_socket_candidates", lambda: ["/dead", "/alive", "/tmp/.x"]
         )
         monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
-        monkeypatch.setattr(g, "_socket_accepts", lambda path: path == "/alive")
+        monkeypatch.setattr(
+            g, "_socket_accepts", lambda path, timeout=g.PROBE_TIMEOUT: path == "/alive"
+        )
         assert g.injector_socket() == "/alive"
 
     def test_no_answer_is_none_not_a_guess(self, monkeypatch):
         monkeypatch.setattr(g, "ydotool_socket_candidates", lambda: ["/dead"])
         monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
-        monkeypatch.setattr(g, "_socket_accepts", lambda path: False)
+        monkeypatch.setattr(
+            g, "_socket_accepts", lambda path, timeout=g.PROBE_TIMEOUT: False
+        )
         assert g.injector_socket() is None
 
 
@@ -541,19 +563,44 @@ class TestClientEnv:
     """A spawned client is told which socket to use, when one answers."""
 
     def test_a_found_socket_is_exported_to_the_client(self, monkeypatch):
-        monkeypatch.setattr(g, "injector_socket", lambda: "/alive.sock")
+        monkeypatch.setattr(
+            g, "injector_socket", lambda timeout=g.PROBE_TIMEOUT: "/alive.sock"
+        )
         env = g._client_env()
         assert env["YDOTOOL_SOCKET"] == "/alive.sock"
         assert env["PATH"] == os.environ["PATH"]
 
+    def test_the_client_probe_uses_the_short_per_use_bound(self, monkeypatch):
+        """protects: the rediscovery that runs between a move and its click is
+        bounded by the per-use fraction, not the startup bound — a daemon that
+        is alive but wedged would otherwise hold the voice thread for five
+        seconds per connect, ~30-40s across move plus click, with the grid
+        frozen on screen.
+        fails_when: `_client_env` calls `injector_socket` without the short
+        timeout (or with the startup bound).
+        no_claim: does not claim the socket answers; the resolver is stubbed.
+        seam: none
+        """
+        seen = {}
+
+        def spy(timeout=g.PROBE_TIMEOUT):
+            seen["timeout"] = timeout
+            return "/alive.sock"
+
+        monkeypatch.setattr(g, "injector_socket", spy)
+        assert g._client_env()["YDOTOOL_SOCKET"] == "/alive.sock"
+        assert seen["timeout"] == g.PROBE_TIMEOUT_PER_USE
+
     def test_with_no_socket_the_environment_is_inherited(self, monkeypatch):
-        monkeypatch.setattr(g, "injector_socket", lambda: None)
+        monkeypatch.setattr(g, "injector_socket", lambda timeout=g.PROBE_TIMEOUT: None)
         assert g._client_env() is None
 
     def test_the_spawn_is_the_thing_that_carries_it(self, monkeypatch):
         """`_spawn` is the only place a client starts, so it is the only place
         that needs to know: `_run_bounded` and the probe stay unchanged."""
-        monkeypatch.setattr(g, "injector_socket", lambda: "/alive.sock")
+        monkeypatch.setattr(
+            g, "injector_socket", lambda timeout=g.PROBE_TIMEOUT: "/alive.sock"
+        )
         seen = {}
         monkeypatch.setattr(
             g.subprocess,
@@ -816,7 +863,9 @@ class TestAdapterArgv:
             lambda cmd, timeout: Mock(returncode=1, stdout="", stderr=UBUNTU_HELP),
         )
         monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
-        monkeypatch.setattr(g, "_socket_accepts", lambda path=None: False)
+        monkeypatch.setattr(
+            g, "_socket_accepts", lambda path=None, timeout=g.PROBE_TIMEOUT: False
+        )
         g._monitor_origin = (0, 0)
         g.move_to(10, 20)
         g.click("right")
@@ -968,7 +1017,9 @@ class TestGate:
         """The 0.1.8 shape: Ubuntu's five verbs, no ydotoold, a no-op that reports
         `ran` — there the socket is a logged mode, not a gate condition."""
         monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
-        monkeypatch.setattr(g, "_socket_accepts", lambda path=None: False)
+        monkeypatch.setattr(
+            g, "_socket_accepts", lambda path=None, timeout=g.PROBE_TIMEOUT: False
+        )
         monkeypatch.setattr(g, "_spawn", lambda cmd, timeout: _help_result())
         seen = []
         monkeypatch.setattr(
@@ -987,7 +1038,9 @@ class TestGate:
             g, "ydotool_socket_candidates", lambda: ["/run/user/1000/.ydotool_socket"]
         )
         monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
-        monkeypatch.setattr(g, "_socket_accepts", lambda path=None: True)
+        monkeypatch.setattr(
+            g, "_socket_accepts", lambda path=None, timeout=g.PROBE_TIMEOUT: True
+        )
         monkeypatch.setattr(g, "_spawn", lambda cmd, timeout: _help_result())
         monkeypatch.setattr(g, "_run_bounded", lambda args, **k: "ran")
         with caplog.at_level("INFO"):
@@ -1003,7 +1056,9 @@ class TestGate:
         with `mousegrid`. The no-op is not even attempted — there is nothing it
         could prove."""
         monkeypatch.setattr(g.shutil, "which", lambda name: f"/usr/bin/{name}")
-        monkeypatch.setattr(g, "_socket_accepts", lambda path=None: False)
+        monkeypatch.setattr(
+            g, "_socket_accepts", lambda path=None, timeout=g.PROBE_TIMEOUT: False
+        )
         monkeypatch.setattr(g, "_spawn", _modern_client)
         monkeypatch.setattr(g, "_run_bounded", Mock(side_effect=AssertionError))
         with caplog.at_level("INFO"):
@@ -1020,7 +1075,9 @@ class TestGate:
             g, "ydotool_socket_candidates", lambda: ["/run/user/1000/.ydotool_socket"]
         )
         monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
-        monkeypatch.setattr(g, "_socket_accepts", lambda path=None: True)
+        monkeypatch.setattr(
+            g, "_socket_accepts", lambda path=None, timeout=g.PROBE_TIMEOUT: True
+        )
         monkeypatch.setattr(g, "_spawn", _modern_client)
         seen = []
         monkeypatch.setattr(
@@ -1230,6 +1287,42 @@ class TestRouting:
 
         assert drawn == [(0, 0, 900, 600)]
         assert g._bounds == (0, 0, 900, 600)
+
+    def test_a_wider_dismiss_word_no_longer_blocks_the_show(
+        self, monkeypatch, core, fake_helper
+    ):
+        """protects: the claim-boundary guard is mousegrid's own pair
+        ("close"/"hide"), no wider — "grid quit" must OPEN the grid here when
+        the gate passed, exactly as mousegrid opens it when the gate did not,
+        or the parity promise ("one utterance lands the same whichever backend
+        answers") breaks at the claim boundary.
+        fails_when: the show guard excludes the whole DISMISS_WORDS set, so
+        "grid quit" is answered with a spoken "Grid closed" and no grid.
+        no_claim: does not claim the in-session dismissal set — the wider
+        DISMISS_WORDS stays in charge inside an open session, where mousegrid
+        is not listening.
+        seam: none
+        """
+        fake_helper(
+            "import json, sys\n"
+            "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 900, 600]}),"
+            " flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    if 'show' in line:\n"
+            "        print(json.dumps({'event': 'presented'}), flush=True)\n"
+        )
+        monkeypatch.setattr(g, "_active", True)
+        opened = []
+        monkeypatch.setattr(
+            g, "_open_session", lambda core: opened.append(True) or None
+        )
+        dismissed = []
+        monkeypatch.setattr(g, "_dismiss", lambda: dismissed.append(True))
+
+        assert g.handle("grid quit", core) is True
+
+        assert opened == [True]
+        assert dismissed == []
 
     def test_a_subdivide_only_session_leaves_again_nothing_to_reopen(
         self, monkeypatch, core, fake_helper
@@ -1590,6 +1683,33 @@ class TestHelperChannel:
         assert g._start_helper() == (1, 2, 3, 4)
         g.stop_helper("test")
 
+    def test_degenerate_geometry_is_refused_not_aimed(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """protects: a ready event whose width or height is zero (a broken
+        compositor report) is refused at the handshake — subdivide would carve
+        degenerate cells out of it and every click would aim at (0, 0), spoken
+        as success.
+        fails_when: only the length is checked and the degenerate rectangle
+        becomes the session's bounds.
+        no_claim: does not claim fractional or non-int elements are refused
+        separately; the same all-int check rejects them.
+        seam: none
+        """
+        helper = self._fake_helper(
+            tmp_path,
+            "import json, sys\n"
+            "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 0, 600]}),"
+            " flush=True)\n"
+            "sys.stdin.readline()\n",
+        )
+        monkeypatch.setattr(g, "HELPER", helper)
+        monkeypatch.setattr(g, "grid_python", lambda: "python3")
+        with caplog.at_level("WARNING"):
+            assert g._start_helper() is None
+        assert g._helper is None
+        assert any("no usable geometry" in r.message for r in caplog.records)
+
 
 @pytest.fixture
 def fake_helper(monkeypatch, tmp_path):
@@ -1699,6 +1819,42 @@ class TestHelperLifecycle:
         assert any("grid open" in r.message for r in caplog.records)
         # Logged, not spoken: no new reply string for this path.
         assert [call.args[0] for call in core.speak.call_args_list] == [g._("Grid")]
+
+    def test_a_refusal_that_arrived_before_the_death_is_read_as_the_last_words(
+        self, monkeypatch, core, fake_helper, caplog
+    ):
+        """protects: a refusal that arrived mid-mode — the click-through region
+        failing on a redraw, say — is the diagnostic for the vanish, and the
+        death branch reads it instead of ending the mode silently.
+        fails_when: the death branch checks only `poll()` and returns, leaving
+        the error line unread in the pipe (the diagnostic is lost).
+        no_claim: does not claim the helper's stderr, only its structured
+        protocol line; the speech stays the spec's none-for-this-path.
+        seam: none
+        """
+        fake_helper(
+            "import json, sys\n"
+            "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 900, 600]}),"
+            " flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    if 'show' in line:\n"
+            "        print(json.dumps({'event': 'presented'}), flush=True)\n"
+            "        print(json.dumps({'event': 'error', 'message':"
+            " 'no click-through'}), flush=True)\n"
+            "        sys.exit(1)\n"
+        )
+        monkeypatch.setattr(g, "move_to", Mock())
+        monkeypatch.setattr(g, "click", Mock())
+
+        def utterances():
+            assert g._helper.wait(timeout=5) is not None
+            yield "click"
+
+        core.listen_modal = Mock(return_value=utterances())
+        with caplog.at_level("WARNING"):
+            assert g._open_session(core) == "done"
+        assert any("last words" in r.message for r in caplog.records)
+        assert any("no click-through" in r.message for r in caplog.records)
 
     def test_closing_twice_reaps_once_and_survives_the_second_call(self, start_helper):
         assert start_helper(
