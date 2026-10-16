@@ -387,11 +387,30 @@ BUTTONS = {"click": 1, "right": 2, "middle": 3}
 MODERN_BUTTONS = {"click": "0xC0", "right": "0xC1", "middle": "0xC2"}
 
 
+def legacy_delay_args():
+    """Return the legacy dialect's delay arguments, or nothing when daemonless.
+
+    ydotool 0.1.8 sleeps `--delay` ms before emitting anything (MouseMove.cpp:
+    `usleep(time_delay * 1000)`, and a delay of 0 skips even that), while
+    daemonless mode creates a fresh uinput device per invocation: with
+    `--delay 0` the events are written into a device the compositor has not
+    yet enumerated and are simply lost — kernel uinput.rst documents the
+    ordering requirement, and a live COSMIC session measured it (delay 0
+    delivers nothing; the default 100ms delivers). The daemon path holds one
+    persistent device, so there `--delay 0` stays: a double-click pair needs
+    the saved sleeps to stay inside the desktop's double-click window.
+    """
+    if injector_socket() is None:
+        return ()
+    return ("--delay", "0")
+
+
 def move_to(x, y):
     """Move the pointer to a monitor-local point.
 
     The move is issued in the global space ydotool works in, in whichever argv
-    the installed client understands: positional with `--delay 0` on 0.1.8,
+    the installed client understands: positional on 0.1.8 (with the daemonless
+    settle delay from [`legacy_delay_args`][_ydotool.legacy_delay_args]),
     `--absolute -x/-y` on 1.0.x, where bare `-x`/`-y` would move *relatively*
     from wherever the pointer happens to be.
     """
@@ -409,7 +428,7 @@ def move_to(x, y):
             ]
         )
     return run_ydotool(
-        ["ydotool", "mousemove", str(global_x), str(global_y), "--delay", "0"]
+        ["ydotool", "mousemove", str(global_x), str(global_y), *legacy_delay_args()]
     )
 
 
@@ -417,7 +436,7 @@ def click(button="click"):
     """Click a button at the current pointer position."""
     if dialect() == YDTOOL_DIALECT_MODERN:
         return run_ydotool(["ydotool", "click", MODERN_BUTTONS[button]])
-    return run_ydotool(["ydotool", "click", str(BUTTONS[button]), "--delay", "0"])
+    return run_ydotool(["ydotool", "click", str(BUTTONS[button]), *legacy_delay_args()])
 
 
 def double_click():

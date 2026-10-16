@@ -19,6 +19,10 @@ from easyspeak.plugins import mousegrid
 from easyspeak.plugins.mousegrid import _common, _extension
 from easyspeak.plugins.mousegrid import _ydotool as g
 
+# The fixture pins this daemonless; tests that exercise the real resolver
+# re-pin it to the function captured here at import time.
+_real_injector_socket = g.injector_socket
+
 # What Ubuntu 25.10's ydotool 0.1.8 prints for `ydotool help`, read off the VM:
 # the five verbs are the whole surface there, and `mousemove_relative` is not
 # one of them — that absence is what the portable probe exists for.
@@ -105,7 +109,10 @@ def _fresh_client_state(monkeypatch):
     """The dialect and the session state are cached module state; every test
     starts from the plugin's own import-time shape, so no test inherits
     another's gate decision or session leftovers (an earlier version reset
-    only `_dialect`, which made the inert-plugin test depend on file order)."""
+    only `_dialect`, which made the inert-plugin test depend on file order).
+    The daemon resolver is pinned daemonless so argv expectations are
+    deterministic — a host with a running ydotoold would otherwise flip the
+    legacy delay arguments mid-suite; daemon-mode tests override it."""
     monkeypatch.setattr(g, "_dialect", None)
     monkeypatch.setattr(g, "_monitor_origin", (0, 0))
     monkeypatch.setattr(g, "_active", False)
@@ -115,6 +122,7 @@ def _fresh_client_state(monkeypatch):
     monkeypatch.setattr(g, "_grid_python", None)
     monkeypatch.setattr(g, "_grid_python_override", None)
     monkeypatch.setattr(g, "_grid_python_found", False)
+    monkeypatch.setattr(g, "injector_socket", lambda *a, **k: None)
     monkeypatch.setattr(g, "_socket_last_good", None)
     monkeypatch.setattr(g, "_socket_last_good_env", None)
 
@@ -538,6 +546,7 @@ class TestSocketDiscovery:
         """
         asked = []
         monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
+        monkeypatch.setattr(g, "injector_socket", _real_injector_socket)
         monkeypatch.delenv("YDOTOOL_SOCKET", raising=False)
         monkeypatch.setenv("XDG_RUNTIME_DIR", "/xdg")
         order = [
@@ -580,6 +589,7 @@ class TestSocketDiscovery:
             g, "ydotool_socket_candidates", lambda: ["/dead", "/alive", "/tmp/.x"]
         )
         monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
+        monkeypatch.setattr(g, "injector_socket", _real_injector_socket)
         monkeypatch.setattr(
             g, "_socket_accepts", lambda path, timeout=g.PROBE_TIMEOUT: path == "/alive"
         )
@@ -588,6 +598,7 @@ class TestSocketDiscovery:
     def test_no_answer_is_none_not_a_guess(self, monkeypatch):
         monkeypatch.setattr(g, "ydotool_socket_candidates", lambda: ["/dead"])
         monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
+        monkeypatch.setattr(g, "injector_socket", _real_injector_socket)
         monkeypatch.setattr(
             g, "_socket_accepts", lambda path, timeout=g.PROBE_TIMEOUT: False
         )
@@ -842,6 +853,22 @@ class TestAdapterArgv:
         monkeypatch.setattr(g, "_dialect", g.YDTOOL_DIALECT_LEGACY)
         g._monitor_origin = (1920, 0)
         g.move_to(1351, 280)
+        # Daemonless: no --delay, so ydotool's default settle runs before the
+        # events — 0.1.8 creates its uinput device per invocation and delay 0
+        # delivers into a device the compositor has not enumerated yet.
+        assert seen == [["ydotool", "mousemove", "3271", "280"]]
+
+    def test_move_with_a_daemon_keeps_the_zero_delay(self, monkeypatch):
+        """Through a daemon the device is persistent, so --delay 0 is safe and
+        a double-click pair keeps its timing headroom."""
+        monkeypatch.setattr(g, "injector_socket", lambda *a, **k: "/tmp/sock")
+        seen = []
+        monkeypatch.setattr(
+            g, "_run_bounded", lambda args, **k: seen.append(args) or "ran"
+        )
+        monkeypatch.setattr(g, "_dialect", g.YDTOOL_DIALECT_LEGACY)
+        g._monitor_origin = (1920, 0)
+        g.move_to(1351, 280)
         assert seen == [["ydotool", "mousemove", "3271", "280", "--delay", "0"]]
 
     def test_click_buttons(self, monkeypatch):
@@ -854,9 +881,9 @@ class TestAdapterArgv:
         g.click("right")
         g.click("middle")
         assert seen == [
-            ["ydotool", "click", "1", "--delay", "0"],
-            ["ydotool", "click", "2", "--delay", "0"],
-            ["ydotool", "click", "3", "--delay", "0"],
+            ["ydotool", "click", "1"],
+            ["ydotool", "click", "2"],
+            ["ydotool", "click", "3"],
         ]
 
     def test_the_modern_move_is_absolute_and_positional_is_not_used(self, monkeypatch):
@@ -1134,6 +1161,7 @@ class TestGate:
             g, "ydotool_socket_candidates", lambda: ["/run/user/1000/.ydotool_socket"]
         )
         monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
+        monkeypatch.setattr(g, "injector_socket", _real_injector_socket)
         monkeypatch.setattr(
             g, "_socket_accepts", lambda path=None, timeout=g.PROBE_TIMEOUT: True
         )
@@ -1171,6 +1199,7 @@ class TestGate:
             g, "ydotool_socket_candidates", lambda: ["/run/user/1000/.ydotool_socket"]
         )
         monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
+        monkeypatch.setattr(g, "injector_socket", _real_injector_socket)
         monkeypatch.setattr(
             g, "_socket_accepts", lambda path=None, timeout=g.PROBE_TIMEOUT: True
         )
