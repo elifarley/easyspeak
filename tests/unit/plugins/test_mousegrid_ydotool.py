@@ -116,7 +116,6 @@ def _fresh_client_state(monkeypatch):
     monkeypatch.setattr(g, "_dialect", None)
     monkeypatch.setattr(g, "_monitor_origin", (0, 0))
     monkeypatch.setattr(g, "_active", False)
-    monkeypatch.setattr(g, "_grid_open", False)
     monkeypatch.setattr(g, "_bounds", None)
     monkeypatch.setattr(g, "_last_bounds", None)
     monkeypatch.setattr(g, "_grid_python", None)
@@ -172,11 +171,12 @@ class TestParityWithExtension:
     """One phrase surface, two backends: both must land on the same pixel.
 
     Driven through the extension backend's own `update_grid` path. Since the
-    consolidation that path delegates to the same `_common.subdivide` this
-    class compares against, so the run is a regression net rather than an
-    independent oracle: what it pins is that the extension wrapper's own
-    arithmetic (the stale-bounds clamp, the zone guard) still agrees with
-    the shared function for every one of the 729 zone sequences.
+    consolidation, that path delegates to the same `_common.subdivide` this
+    class compares against — the run is a regression net, not an independent
+    oracle, and its on-screen starts and valid zones never fire the
+    wrapper's clamp or zone guard: what the 729 sequences pin is the happy
+    path. The clamp and the guard have their own rows in test_mousegrid.py's
+    update_grid tests.
     """
 
     @staticmethod
@@ -2017,7 +2017,6 @@ class TestHelperLifecycle:
         core.listen_modal = Mock(return_value=iter([]))
         assert g._open_session(core) == "done"
         assert g._helper is None
-        assert g._grid_open is False
         assert [call.args[0] for call in core.speak.call_args_list] == [g._("Grid")]
 
     def test_a_real_session_dismisses_then_closes_again(self, core, fake_helper):
@@ -2027,7 +2026,6 @@ class TestHelperLifecycle:
         core.listen_modal = Mock(return_value=iter(["close"]))
         assert g._open_session(core) == "done"
         assert g._helper is None
-        assert g._grid_open is False
         assert [call.args[0] for call in core.speak.call_args_list] == [
             g._("Grid"),
             g._("Grid closed"),
@@ -2065,7 +2063,6 @@ class TestHelperLifecycle:
         move_to.assert_not_called()
         click.assert_not_called()
         assert g._helper is None
-        assert g._grid_open is False
         assert g._bounds is None
         assert any("grid open" in r.message for r in caplog.records)
         # Logged, not spoken: no new reply string for this path.

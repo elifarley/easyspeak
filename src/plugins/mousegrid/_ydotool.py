@@ -124,7 +124,6 @@ YDTOOL_NOOP_MODERN = ("ydotool", "type", "")
 _active = False
 _bounds = None
 _monitor_origin = (0, 0)
-_grid_open = False
 _last_bounds = None
 _helper = None
 _dialect = None
@@ -791,9 +790,8 @@ def resolve_active():
 
 def _dismiss():
     """Hide the grid and end whatever session is open."""
-    global _grid_open, _bounds
+    global _bounds
     _close_session()
-    _grid_open = False
     _bounds = None
 
 
@@ -805,7 +803,7 @@ def _open_session(core, bounds=None):
     on; the caller never reads it, because this function already speaks on
     every failure path itself.
     """
-    global _monitor_origin, _bounds, _grid_open
+    global _monitor_origin, _bounds
     geometry = _start_helper()
     if geometry is None:
         core.speak(_("I couldn't show the grid."))
@@ -854,13 +852,11 @@ def _open_session(core, bounds=None):
         logger.warning("grid: the helper exited right after ready")
     else:
         logger.debug("grid: no presented announcement inside PRESENT_TIMEOUT")
-    _grid_open = True
     core.speak(_("Grid"))
     try:
         _run_mode(core)
     finally:
         _close_session()
-        _grid_open = False
     return "done"
 
 
