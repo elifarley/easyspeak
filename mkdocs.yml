@@ -51,13 +51,9 @@ extra_javascript:
 
 # These assets live under docs/media/ but are not referenced by any page, so
 # keep them out of the built site (the demo video is a 23 MB LFS object).
-# The superpowers/ records and the upstream issue draft are dated design-phase
-# documents for this repository's own history, not user documentation.
 exclude_docs: |
   media/demo.mp4
   media/log.txt
-  superpowers/
-  upstream-issue-draft.md
 
 nav:
 - Home: index.md
