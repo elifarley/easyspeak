@@ -109,6 +109,30 @@ def _rounded_rect(cr, x, y, w, h, radius):
     cr.close_path()
 
 
+def _transparent_background(gtk, window):
+    """Make the window itself transparent, so the desktop shows through.
+
+    The extension's actors float over the live desktop: grid.js paints a
+    0.15 wash over the bounds and nothing else. A GTK window, though, paints
+    its theme background under everything its content leaves unpainted -
+    opaque, and light on this session's theme - which showed up on the glass
+    as a full-monitor white sheet carrying the grid (measured live,
+    2026-10-16: the offscreen render was correct and the compositor shot was
+    white). A transparent window background restores the extension's
+    compositing: only what we draw reaches the glass, and the wash, badges
+    and crosshair composite over the real desktop exactly as the
+    extension's actors do over the shell.
+    """
+    from gi.repository import Gdk
+
+    provider = gtk.CssProvider()
+    provider.load_from_data(b"window, drawingarea { background: transparent; }")
+    display = window.get_display() or Gdk.Display.get_default()
+    gtk.StyleContext.add_provider_for_display(
+        display, provider, gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    )
+
+
 def parse_command(line):
     """Return the command object on a protocol line, or None if there is none."""
     line = line.strip()
@@ -335,6 +359,7 @@ class Overlay:  # pragma: no cover - needs GTK; run live
         # the application's lifecycle (activate, quit, and the stdin watch that
         # ends the process) is written for.
         self.window = gtk.Window(application=app)
+        _transparent_background(gtk, self.window)
         self.area = gtk.DrawingArea()
         self.bounds = None
         self.presented = False
