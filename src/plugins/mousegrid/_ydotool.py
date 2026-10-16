@@ -400,7 +400,7 @@ def legacy_delay_args():
     persistent device, so there `--delay 0` stays: a double-click pair needs
     the saved sleeps to stay inside the desktop's double-click window.
     """
-    if injector_socket() is None:
+    if injector_socket(timeout=PROBE_TIMEOUT_PER_USE) is None:
         return ()
     return ("--delay", "0")
 

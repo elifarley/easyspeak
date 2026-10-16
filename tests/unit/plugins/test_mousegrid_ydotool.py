@@ -871,6 +871,24 @@ class TestAdapterArgv:
         g.move_to(1351, 280)
         assert seen == [["ydotool", "mousemove", "3271", "280", "--delay", "0"]]
 
+    def test_delay_probe_uses_the_short_per_use_bound(self, monkeypatch):
+        """protects: the delay decision resolves the daemon on the voice
+        thread, mid-mode, so it must carry the short per-use bound — the
+        startup bound here can stall every move and click for seconds
+        against a wedged listener (the exact freeze the per-use constant
+        exists to prevent).
+        fails_when: legacy_delay_args calls injector_socket without the
+        per-use timeout.
+        no_claim: does not claim which candidate a real daemon binds.
+        seam: none
+        """
+        seen = []
+        monkeypatch.setattr(
+            g, "injector_socket", lambda *a, **k: seen.append(k) or None
+        )
+        assert g.legacy_delay_args() == ()
+        assert seen == [{"timeout": g.PROBE_TIMEOUT_PER_USE}]
+
     def test_click_buttons(self, monkeypatch):
         seen = []
         monkeypatch.setattr(
