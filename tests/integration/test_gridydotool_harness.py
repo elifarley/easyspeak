@@ -6,16 +6,30 @@ socket lets it inject (ydotool 1.0.x has no per-invocation fallback, so there a
 socket is the only injector there is; 0.1.8 also works daemonless), the gate
 fails closed on 1.0.x when no socket answers, the overlay renders and the argv
 is exact under a forced backend (the dry-run arm, which is the arm CI can run),
-and, only when EASYSPEAK_GRID_LIVE is set, that a click lands where the grid
-aimed it.
+and, only when EASYSPEAK_GRID_LIVE=click is set, that a click lands where the
+grid aimed it.
+
+Prerequisites, in one place: `sway`, `ydotool` and `grim` on `PATH`; an
+interpreter with PyGObject and the gtk4-layer-shell typelib for the helper and
+the probe window — the packaged library (`libgtk4-layer-shell0` with
+`gir1.2-gtk4layershell-1.0`) is all a distro that carries it needs to offer,
+and where it does not, `EASYSPEAK_GRID_TYPELIB` names an uninstalled build
+tree's `src` directory (the harness exports it as both `GI_TYPELIB_PATH` and
+`LD_LIBRARY_PATH`) or `EASYSPEAK_GRID_PYTHON` an interpreter that already has
+the stack; and a running `ydotoold` for the gate's passing shape on 1.0.x
+(where the daemon ships inside the `ydotool` package), while 0.1.8 works
+daemonless. Setup and daemon installation: docs/troubleshooting.md. The other
+variable the harness reads is `EASYSPEAK_GRID_BACKEND=uinput`, which the
+harness sets itself to force the backend active without probing a daemon.
 
 The literal in the live arm is hand-computed. Deriving it with the same algorithm
 the plugin uses would make the assertion agree with any shared off-by-one, so the
 premise (a pinned 1920x1080 output) is asserted first and the algorithmic
 prediction is kept only as a cross-check.
 
-Injection is kernel-global: even inside this session, arm B moves the real
-cursor and clicks wherever it aims on the live desktop. That is why it is opt-in.
+The live arm injects through `ydotool`, which is kernel-global: even inside
+this session, arm B moves the real cursor and clicks wherever it aims on the
+live desktop. That is why it is opt-in.
 
 A failing live arm attributes itself. It proves the probe window rendered before
 anything is injected, and a press that never arrives is reported together with

@@ -34,39 +34,9 @@ conftest.py                    # stubs heavy deps; skip fixtures for audio/syste
 
 ## The gridydotool harness
 
-`test_gridydotool_harness.py` asserts a failed injector probe keeps `mousegrid`
-in charge, that the injector gate passes on a real ydotool where an answered
-daemon socket lets it inject (ydotool 1.0.x has no per-invocation fallback, so
-there a socket is the only injector there is; 0.1.8 also works daemonless), and
-that the gate fails closed on 1.0.x when no socket answers. It observes the
-overlay geometry and the exact ydotool argv under a forced backend, and — only
-when opted in — proves that a click lands in the cell the utterance aimed at, by
-watching `grid_probe_window.py` inside a headless sway session the harness
-starts and tears down itself. When a prerequisite is absent the file skips,
-naming what is missing.
-
-Its prerequisites, in one place:
-
-- `sway`, `ydotool` and `grim` on `PATH` (Debian/Ubuntu:
-  `sudo apt install sway ydotool grim`).
-- An interpreter with PyGObject and the gtk4-layer-shell typelib. Where the
-  distro packages the library — Ubuntu 25.10 and 26.04 carry
-  `libgtk4-layer-shell0` with `gir1.2-gtk4layershell-1.0`, and the system
-  interpreter picks them up — that is all it needs: the helper resolves the
-  library by soname, not through the `-dev` package's unversioned symlink. Where
-  the library is not packaged, the reference setup is an uninstalled build tree:
-  point `EASYSPEAK_GRID_TYPELIB` at its `src` directory (the harness exports it
-  as both `GI_TYPELIB_PATH` and `LD_LIBRARY_PATH`), or `EASYSPEAK_GRID_PYTHON`
-  at an interpreter that already has the library and the typelib.
-- A running `ydotoold` for the gate's passing shape: on ydotool 1.0.x (Ubuntu
-  26.04's dialect, whose client has no per-invocation fallback) it is what makes
-  a working injector, and that test skips by name when no socket answers; on
-  0.1.8 it removes the per-invocation latency caveat the client names when it is
-  absent, and the daemonless path is measured working. On 26.04 the daemon ships
-  in the `ydotool` package; on 25.10 it was a package of its own.
-
-Two environment variables the harness reads: `EASYSPEAK_GRID_LIVE=click` opts
-into the live click arm, and `EASYSPEAK_GRID_BACKEND=uinput` (set by the harness
-itself) forces the plugin active without probing a daemon. The live arm injects
-through `ydotool`, which is kernel-global, so it stays opt-in even though it runs
-inside the harness's own session.
+`test_gridydotool_harness.py` runs the grid conversation end to end in a
+headless sway session it starts and tears down itself: gate behaviour, overlay
+rendering, exact injection argv, and — only when opted in — a click landing in
+the aimed cell. Its prerequisites, its environment variables, and why the live
+arm is opt-in are in the module docstring; machine setup lives in
+docs/troubleshooting.md.
