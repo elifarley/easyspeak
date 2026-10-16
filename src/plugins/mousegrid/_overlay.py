@@ -25,6 +25,7 @@ without mapping anything.
 """
 
 import json
+import math
 import os
 import sys
 import time
@@ -32,35 +33,80 @@ from pathlib import Path
 
 DEFAULT_NAMESPACE = "mousegrid"
 
+# The grid's face is the GNOME extension's face: a user must not be able to
+# tell which backend is answering by eye. Every constant below translates one
+# CSS declaration from `src/gnome@easyspeak.dev/grid.js` (cited inline), and
+# `grid_metrics` mirrors that file's `gridGeometry()` from
+# `extension-helpers.js`. The extension is JavaScript and this helper is
+# Python, so identity is impossible across the boundary — the duplication is
+# confined to this block plus that one pure function, and the unit suite pins
+# `grid_metrics`' computed values against the JS's own outputs (and against
+# `_common.center`, which shares the centre formula), so a divergence is a
+# test failure away instead of a screenshot surprise.
+BACKGROUND = (0.0, 0.0, 0.0, 0.15)  # 'background-color: rgba(0,0,0,0.15)'
+LINE = (1.0, 1.0, 1.0, 0.8)  # 'background-color: rgba(255,255,255,0.8)'
+LINE_THICKNESS = 3  # the divider bars' width/height
+LINE_INSET = 1  # the bars' -1 offset: their centre sits on the third
+DIGIT = (1.0, 0.902, 0.0, 1.0)  # 'color: #ffe600'
+BADGE = (0.0, 0.0, 0.0, 0.8)  # 'background-color: rgba(0,0,0,0.8)'
+BADGE_RADIUS = 8  # 'border-radius: 8px'
+BADGE_PADDING = (8, 16)  # 'padding: 8px 16px' (vertical, horizontal)
+CROSS = (1.0, 0.0, 0.0, 1.0)  # 'background-color: #ff0000'
+CROSS_OUTLINE = (1.0, 1.0, 1.0, 1.0)  # 'background-color: #ffffff'
+CROSS_THICKNESS = 4  # crossThick
+CROSS_OUTLINE_MARGIN = 2  # the white bars' 2px underlay on every side
 
-def cell_rects(bounds):
-    """Return the nine cell rectangles of a 3x3 grid over `bounds`, row-major."""
-    x, y, w, h = bounds
-    cell_w, cell_h = w // 3, h // 3
-    return [
-        (x + col * cell_w, y + row * cell_h, cell_w, cell_h)
-        for row in range(3)
-        for col in range(3)
-    ]
 
+def grid_metrics(bounds):
+    """Mirror `gridGeometry()` (extension-helpers.js) for the drawing code.
 
-def surface_rects(bounds, origin):
-    """Map monitor-local bounds into the surface's own coordinate space.
-
-    The plugin computes monitor-local rects and adds the monitor's
-    compositor-global origin only at injection time (design D6). The layer
-    surface covers exactly the monitor it is anchored to, so its own drawing
-    space *is* the monitor-local space, and `origin` — the compositor-global
-    origin `report_monitor` puts on the `ready` event for the plugin's
-    arithmetic — must never shift a cell here. An earlier revision subtracted
-    it, which slid the grid and its digits off the visible surface on any
-    output whose origin was not (0, 0) while the click still landed correctly;
-    the parameter stays in the signature so a unit test can pin the identity
-    mapping against a non-zero origin instead of leaving it to be re-derived
-    by eye.
+    Cell size is integer thirds, the digit font is the cell's third clamped
+    to [24, 72], each label's top-left sits half a font left/up of the cell
+    centre (the position the extension's St.Label receives), and the centre
+    crosshair is capped at 50px. The centre formula is deliberately the same
+    as `_common.center`'s — this helper must stay import-standalone (the file
+    runs as a script under an interpreter without the package), so the
+    equality is enforced by a test instead of by an import. D6 note, carried
+    from the drawing it replaced: the plugin computes monitor-local bounds
+    and adds the compositor-global origin only at injection time, so nothing
+    here may shift by the origin — an earlier revision subtracted it and slid
+    the whole grid off the surface.
     """
-    del origin  # D6: monitor-local bounds are drawn in the surface's own space
-    return cell_rects(bounds)
+    bx, by, bw, bh = bounds
+    cell_w, cell_h = bw // 3, bh // 3
+    font_size = max(24, min(72, min(cell_w, cell_h) // 3))
+    cells = []
+    for num in range(1, 10):
+        row, col = divmod(num - 1, 3)
+        zone_x = bx + col * cell_w
+        zone_y = by + row * cell_h
+        cells.append(
+            (
+                num,
+                zone_x + cell_w / 2 - font_size / 2,
+                zone_y + cell_h / 2 - font_size / 2,
+            )
+        )
+    center = (bx + bw // 2, by + bh // 2)
+    cross_size = min(50, min(bw, bh) // 3)
+    return {
+        "cell_w": cell_w,
+        "cell_h": cell_h,
+        "font_size": font_size,
+        "cells": cells,
+        "center": center,
+        "cross_size": cross_size,
+    }
+
+
+def _rounded_rect(cr, x, y, w, h, radius):
+    """Add a rounded rectangle to `cr`'s path (cairo has no native one)."""
+    cr.new_sub_path()
+    cr.arc(x + w - radius, y + radius, radius, -math.pi / 2, 0)
+    cr.arc(x + w - radius, y + h - radius, radius, 0, math.pi / 2)
+    cr.arc(x + radius, y + h - radius, radius, math.pi / 2, math.pi)
+    cr.arc(x + radius, y + radius, radius, math.pi, 3 * math.pi / 2)
+    cr.close_path()
 
 
 def parse_command(line):
@@ -291,7 +337,6 @@ class Overlay:  # pragma: no cover - needs GTK; run live
         self.window = gtk.Window(application=app)
         self.area = gtk.DrawingArea()
         self.bounds = None
-        self.origin = (0, 0)
         self.presented = False
         self.window.set_child(self.area)
         self.area.set_draw_func(self._draw)
@@ -313,27 +358,85 @@ class Overlay:  # pragma: no cover - needs GTK; run live
         self.click_through_surface = None
 
     def _draw(self, area, cr, width, height):
-        """Paint the nine cells with their digits.
+        """Paint the grid exactly as the GNOME extension paints it (grid.js).
 
-        PyGObject calls a `set_draw_func` callback with exactly these four
-        arguments - it does not pass the C callback's trailing user_data - and a
-        five-argument signature raises TypeError on every frame, which loses
-        both the grid and the `presented` event.
+        Same wash over the bounds, same divider bars, same yellow-on-dark
+        badges, same centre crosshair — every constant cites the CSS it
+        translates (see the block at the top of this file), and the numeric
+        layout comes from `grid_metrics`. The drawing is bounds-local by
+        construction: the plugin adds the monitor's compositor-global origin
+        only at injection time (design D6), so nothing here may shift by it —
+        an earlier revision subtracted it and slid the whole grid off the
+        surface. PyGObject calls a `set_draw_func` callback with exactly these
+        four arguments - it does not pass the C callback's trailing user_data -
+        and a five-argument signature raises TypeError on every frame, which
+        loses both the grid and the `presented` event.
         """
+        del area, width, height
         if not self.bounds:
             return
-        cr.set_source_rgba(0.05, 0.05, 0.08, 0.55)
-        cr.paint()
-        cr.set_source_rgba(0.95, 0.95, 0.95, 0.95)
-        cr.set_font_size(28)
-        for index, (left, top, w, h) in enumerate(
-            surface_rects(self.bounds, self.origin), start=1
-        ):
-            cr.rectangle(left, top, w, h)
-            cr.stroke()
-            cr.move_to(left + w / 2 - 8, top + h / 2 + 8)
-            cr.show_text(str(index))
-        del area, width, height
+        import cairo
+
+        bx, by, bw, bh = self.bounds
+        metrics = grid_metrics(self.bounds)
+
+        cr.set_source_rgba(*BACKGROUND)
+        cr.rectangle(bx, by, bw, bh)
+        cr.fill()
+        cr.set_source_rgba(*LINE)
+        for i in (1, 2):
+            cr.rectangle(
+                bx + i * metrics["cell_w"] - LINE_INSET, by, LINE_THICKNESS, bh
+            )
+        for i in (1, 2):
+            cr.rectangle(
+                bx, by + i * metrics["cell_h"] - LINE_INSET, bw, LINE_THICKNESS
+            )
+        cr.fill()
+
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(metrics["font_size"])
+        for num, x, y in metrics["cells"]:
+            extents = cr.text_extents(str(num))
+            cr.set_source_rgba(*BADGE)
+            _rounded_rect(
+                cr,
+                x,
+                y,
+                extents.width + 2 * BADGE_PADDING[1],
+                extents.height + 2 * BADGE_PADDING[0],
+                BADGE_RADIUS,
+            )
+            cr.fill()
+            cr.set_source_rgba(*DIGIT)
+            cr.move_to(
+                x + BADGE_PADDING[1] - extents.x_bearing,
+                y + BADGE_PADDING[0] - extents.y_bearing,
+            )
+            cr.show_text(str(num))
+
+        center_x, center_y = metrics["center"]
+        size = metrics["cross_size"]
+        half, half_thick = size / 2, CROSS_THICKNESS / 2
+        cr.set_source_rgba(*CROSS_OUTLINE)
+        cr.rectangle(
+            center_x - half - CROSS_OUTLINE_MARGIN,
+            center_y - half_thick - CROSS_OUTLINE_MARGIN,
+            size + 2 * CROSS_OUTLINE_MARGIN,
+            CROSS_THICKNESS + 2 * CROSS_OUTLINE_MARGIN,
+        )
+        cr.rectangle(
+            center_x - half_thick - CROSS_OUTLINE_MARGIN,
+            center_y - half - CROSS_OUTLINE_MARGIN,
+            CROSS_THICKNESS + 2 * CROSS_OUTLINE_MARGIN,
+            size + 2 * CROSS_OUTLINE_MARGIN,
+        )
+        cr.fill()
+        cr.set_source_rgba(*CROSS)
+        cr.rectangle(center_x - half, center_y - half_thick, size, CROSS_THICKNESS)
+        cr.rectangle(center_x - half_thick, center_y - half, CROSS_THICKNESS, size)
+        cr.fill()
+
         if not self.presented:
             # The first frame of an actual grid is on the glass now; the plugin
             # reads this as "it is on screen", once, never per redraw.
@@ -380,13 +483,12 @@ def report_monitor(overlay):  # pragma: no cover - needs a live surface
     this report is the plugin's only source of screen size. The origin is the
     compositor-global one and rides along for the plugin's injection
     arithmetic; the drawing must stay in the surface's own space and never
-    apply it (see `surface_rects`).
+    apply it (see `grid_metrics`).
     """
     surface = overlay.window.get_surface()
     display = surface.get_display()
     monitor = display.get_monitor_at_surface(surface)
     geometry = monitor.get_geometry()
-    overlay.origin = (geometry.x, geometry.y)
     emit(
         {
             "event": "ready",

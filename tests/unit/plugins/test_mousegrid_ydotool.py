@@ -2340,12 +2340,14 @@ def _overlay_module():
 
 
 class TestOverlayPureParts:
-    def test_cell_rects_are_the_nine_thirds(self):
+    def test_grid_metrics_mirrors_the_extension_helper(self):
         overlay = _overlay_module()
-        rects = overlay.cell_rects((0, 0, 900, 600))
-        assert rects[0] == (0, 0, 300, 200)
-        assert rects[8] == (600, 400, 300, 200)
-        assert len(rects) == 9
+        m = overlay.grid_metrics((0, 0, 900, 600))
+        assert m["cell_w"] == 300 and m["cell_h"] == 200
+        assert m["font_size"] == 66
+        assert m["cells"][0] == (1, 117.0, 67.0)
+        assert m["cells"][8] == (9, 717.0, 467.0)
+        assert len(m["cells"]) == 9
 
     def test_parse_command_accepts_show_and_hide(self):
         overlay = _overlay_module()
@@ -2409,34 +2411,117 @@ class TestOverlaySurfaceSpace:
     at injection time. An earlier revision also subtracted that origin when
     painting, which moved the grid and its digits off the visible surface on
     any output whose origin was not (0, 0) - clicks still landed correctly, so
-    a single-output render could never show it.
+    a single-output render could never show it. The drawing is bounds-local by
+    construction and the helper carries no origin state at all; the draw test
+    pins what actually reaches cairo.
     """
 
-    def test_surface_rects_keep_the_monitor_local_cells(self):
-        overlay = _overlay_module()
-        assert overlay.surface_rects((0, 0, 900, 600), (0, 0)) == overlay.cell_rects(
-            (0, 0, 900, 600)
-        )
-
-    def test_a_non_zero_monitor_origin_never_shifts_the_cells(self):
-        overlay = _overlay_module()
-        cells = overlay.surface_rects((0, 0, 900, 600), (1920, 0))
-        assert cells[0] == (0, 0, 300, 200)
-        assert cells[8] == (600, 400, 300, 200)
-
-    def test_the_draw_callback_strokes_in_the_surface_space(self):
-        """The production callback, with the origin a secondary output reports
-        on `ready`: the rectangles handed to cairo are the surface-local ones,
-        not shifted by -origin."""
+    def test_the_draw_callback_paints_the_bounds_not_the_monitor(self, monkeypatch):
+        """The production callback: the first rectangle is the wash over the
+        bounds (never the monitor's size), the divider bars sit on the thirds,
+        and the last four rectangles are the centre crosshair - white outline
+        pair, then red pair."""
         overlay = _overlay_module()
         cr = Mock()
+        cr.text_extents.return_value = types.SimpleNamespace(
+            width=10.0, height=24.0, x_bearing=1.0, y_bearing=2.0
+        )
+        # The host venv has no pycairo (the daemon's doesn't either - the file
+        # documents that); _draw only reads the font-weight constants from it.
+        monkeypatch.setitem(
+            sys.modules,
+            "cairo",
+            types.SimpleNamespace(FONT_SLANT_NORMAL=0, FONT_WEIGHT_BOLD=1),
+        )
         drawer = object.__new__(overlay.Overlay)
         drawer.bounds = (0, 0, 900, 600)
-        drawer.origin = (1920, 0)
         drawer.presented = True  # no `presented` emit: this is not a live run
+        assert not hasattr(drawer, "origin")  # D6: no origin state left to misuse
         drawer._draw(Mock(), cr, 1920, 1080)
-        assert cr.rectangle.call_args_list[0].args == (0, 0, 300, 200)
-        assert cr.rectangle.call_args_list[8].args == (600, 400, 300, 200)
+
+        rects = [call.args for call in cr.rectangle.call_args_list]
+        assert rects[0] == (0, 0, 900, 600)  # the wash covers the bounds only
+        assert rects[1:5] == [
+            (299, 0, 3, 600),
+            (599, 0, 3, 600),
+            (0, 199, 900, 3),
+            (0, 399, 900, 3),
+        ]
+        assert rects[-4:] == [
+            (423, 296, 54, 8),  # white outline, horizontal
+            (446, 273, 8, 54),  # white outline, vertical
+            (425, 298, 50, 4),  # red cross, horizontal
+            (448, 275, 4, 50),  # red cross, vertical
+        ]
+
+        alphas = [call.args for call in cr.set_source_rgba.call_args_list]
+        assert alphas[0] == (0.0, 0.0, 0.0, 0.15)  # the extension's faint wash
+        assert (0.05, 0.05, 0.08, 0.55) not in alphas  # the old full dim is gone
+        assert alphas.count((0.0, 0.0, 0.0, 0.8)) == 9  # one badge per cell
+        assert alphas[-2:] == [(1.0, 1.0, 1.0, 1.0), (1.0, 0.0, 0.0, 1.0)]
+
+        assert cr.set_font_size.call_args.args == (66,)  # floor(200/3), unclamped
+        # ("Sans", FONT_SLANT_NORMAL, FONT_WEIGHT_BOLD) in cairo's own constants
+        assert cr.select_font_face.call_args.args == ("Sans", 0, 1)
+        assert [call.args[0] for call in cr.show_text.call_args_list] == [
+            str(num) for num in range(1, 10)
+        ]
+        # First badge baseline: label (117, 67) offset by padding minus bearing
+        assert cr.move_to.call_args_list[0].args == (132.0, 73.0)
+
+
+class TestOverlayGridFace:
+    """The numeric face of the grid, pinned against the extension's JavaScript.
+
+    `grid_metrics` mirrors `gridGeometry()` (extension-helpers.js) and the
+    drawing constants mirror grid.js's CSS. The two implementations live on
+    opposite sides of a language boundary, so identity is impossible — these
+    literals ARE the contract: when the extension's face changes, recompute
+    them from the JS and the mirror follows.
+    """
+
+    def test_grid_geometry_matches_the_extension_helper(self):
+        overlay = _overlay_module()
+        m = overlay.grid_metrics((0, 0, 1920, 1080))
+        assert (m["cell_w"], m["cell_h"]) == (640, 360)
+        assert m["font_size"] == 72  # floor(360/3) = 120, clamped to 72
+        assert m["center"] == (960, 540)
+        assert m["cross_size"] == 50  # min(50, 360)
+        assert m["cells"][0] == (1, 284.0, 144.0)  # 0 + 320 - 36, 0 + 180 - 36
+        assert m["cells"][8] == (9, 1564.0, 864.0)
+
+    def test_the_experiment_rect_maps_like_the_extension(self):
+        overlay = _overlay_module()
+        m = overlay.grid_metrics((318, 239, 387, 290))
+        assert (m["cell_w"], m["cell_h"]) == (129, 96)
+        assert m["font_size"] == 32
+        assert m["center"] == (511, 384)
+        assert m["cross_size"] == 50  # min(50, 96)
+        assert m["cells"][0] == (1, 366.5, 271.0)
+
+    def test_the_centre_formula_never_drifts_from_common(self):
+        """`_overlay` must stay import-standalone (it runs as a bare script
+        under an interpreter without the package), so the centre is mirrored
+        rather than imported — this pins the mirror to the original."""
+        overlay = _overlay_module()
+        for bounds in [
+            (0, 0, 900, 600),
+            (318, 239, 387, 290),
+            (0, 0, 1919, 1079),
+            (5, 7, 101, 53),
+            (1, 1, 2, 2),
+        ]:
+            assert overlay.grid_metrics(bounds)["center"] == _common.center(bounds)
+
+    def test_the_cell_thirds_match_common_subdivide(self):
+        """The overlay's cell thirds and the plugin's zoom thirds must stay
+        the same thirds: one utterance has to land on the same pixel whose
+        badge the user aimed at."""
+        overlay = _overlay_module()
+        for bounds in [(0, 0, 900, 600), (318, 239, 387, 290)]:
+            m = overlay.grid_metrics(bounds)
+            _, _, width, height = _common.subdivide(bounds, 9)
+            assert (m["cell_w"], m["cell_h"]) == (width, height)
 
 
 class TestOverlayLibraryLookup:
