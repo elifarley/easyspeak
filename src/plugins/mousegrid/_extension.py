@@ -57,13 +57,16 @@ DIRECTIONS = {
 KIND = "gnome"
 
 # The spoken confirmation per click flavour, keyed by `_common.click_kind`'s
-# answer. "Holding" stays in the drag branch: grid mode keeps listening and
-# a reply containing "mark" would start a second drag.
+# answer. The strings are translated here at import (the same extraction the
+# COMMANDS list relies on): a plain string dict would vanish from the
+# gettext catalogs, and `just translations` strips entries the extractor can
+# no longer see. "Holding" stays in the drag branch: grid mode keeps
+# listening and a reply containing "mark" would start a second drag.
 CLICK_REPLIES = {
-    "double": "Double clicked",
-    "middle": "Middle clicked",
-    "right": "Right clicked",
-    "click": "Clicked",
+    "double": _("Double clicked"),
+    "middle": _("Middle clicked"),
+    "right": _("Right clicked"),
+    "click": _("Clicked"),
 }
 
 
