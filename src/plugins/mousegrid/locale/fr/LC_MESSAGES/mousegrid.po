@@ -36,6 +36,9 @@ msgstr "Grille fermée"
 msgid "Holding"
 msgstr "Je maintiens"
 
+msgid "I couldn't click."
+msgstr "Je n'ai pas pu cliquer."
+
 msgid "I couldn't move the pointer."
 msgstr "Je n'ai pas pu déplacer le pointeur."
 

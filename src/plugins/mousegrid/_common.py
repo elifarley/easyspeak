@@ -127,12 +127,12 @@ def click_kind(text):
     right, click), and the words match as substrings so "doubleclick" and
     "clicks" resolve too.
 
-    A flavour needs the click word itself attached: bare "right" is a
-    direction (a nudge on the backend that has one), never a right-click.
-    When each backend owned its grammar, that bare form right-clicked under
-    ydotool and nudged under the extension — one utterance, two actions —
-    which is exactly the divergence this shared resolver exists to make
-    impossible.
+    The direction word "right" needs the click word itself attached: bare
+    "right" is a nudge on the backend that has one, never a right-click.
+    "double" and "middle" name no direction and click on their own. When each
+    backend owned its grammar, that bare "right" right-clicked under ydotool
+    and nudged under the extension — one utterance, two actions — which is
+    exactly the divergence this shared resolver exists to make impossible.
     """
     has_click = any(word in text for word in CLICK_WORDS)
     if "double" in text:

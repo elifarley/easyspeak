@@ -36,6 +36,9 @@ msgstr "Cuadrícula cerrada"
 msgid "Holding"
 msgstr "Manteniendo"
 
+msgid "I couldn't click."
+msgstr "No he podido hacer clic."
+
 msgid "I couldn't move the pointer."
 msgstr "No he podido mover el puntero."
 

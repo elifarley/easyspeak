@@ -36,6 +36,9 @@ msgstr "Raster geschlossen"
 msgid "Holding"
 msgstr "Halte"
 
+msgid "I couldn't click."
+msgstr "Ich konnte nicht klicken."
+
 msgid "I couldn't move the pointer."
 msgstr "Ich konnte den Zeiger nicht bewegen."
 

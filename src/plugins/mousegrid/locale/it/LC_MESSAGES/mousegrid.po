@@ -36,6 +36,9 @@ msgstr "Griglia chiusa"
 msgid "Holding"
 msgstr "Tengo premuto"
 
+msgid "I couldn't click."
+msgstr "Non sono riuscito a fare clic."
+
 msgid "I couldn't move the pointer."
 msgstr "Non sono riuscito a spostare il puntatore."
 

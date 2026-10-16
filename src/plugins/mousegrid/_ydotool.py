@@ -950,17 +950,25 @@ def _fire_click(kind, core):
         return
     x, y = center(_bounds)
     _last_bounds = _bounds
-    outcome = move_to(x, y)
-    if outcome == "ran":
+    moved = move_to(x, y)
+    clicked = None
+    if moved == "ran":
         # `ran` is the only positive signal the seam can produce: the move was
         # emitted through an already-recognised device. A move left `unknown`
         # leaves the pointer's position no more proven than a refusal, and a
         # click lands wherever the pointer happens to be — so it is not fired.
-        outcome = double_click() if kind == "double" else click(kind)
+        clicked = double_click() if kind == "double" else click(kind)
     _dismiss()
-    if outcome == "errored":
+    # The click's outcome is spoken first: once the move ran, a click failure
+    # reported as "couldn't move the pointer" would name an action that
+    # succeeded and hide the one that didn't.
+    if clicked == "errored":
+        core.speak(_("I couldn't click."))
+    elif clicked == "unknown":
+        core.speak(_("I tried, but I'm not sure it worked."))
+    elif moved == "errored":
         core.speak(_("I couldn't move the pointer."))
-    elif outcome == "unknown":
+    elif moved == "unknown":
         core.speak(_("I tried, but I'm not sure it worked."))
 
 

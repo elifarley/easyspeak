@@ -163,8 +163,12 @@ class TestContainmentInvariant:
 class TestParityWithExtension:
     """One phrase surface, two backends: both must land on the same pixel.
 
-    Driven against the extension backend's own implementation, which is the
-    only independent oracle available for this arithmetic.
+    Driven through the extension backend's own `update_grid` path. Since the
+    consolidation that path delegates to the same `_common.subdivide` this
+    class compares against, so the run is a regression net rather than an
+    independent oracle: what it pins is that the extension wrapper's own
+    arithmetic (the stale-bounds clamp, the zone guard) still agrees with
+    the shared function for every one of the 729 zone sequences.
     """
 
     @staticmethod
@@ -1542,6 +1546,27 @@ class TestModeDispatch:
         core.listen_modal = Mock(return_value=iter(["click"]))
         g._run_mode(core)
         assert core.speak.call_args_list[-1].args[0] == "I couldn't move the pointer."
+
+    def test_errored_click_after_a_ran_move_is_not_blamed_on_the_move(
+        self, monkeypatch, core
+    ):
+        """protects: once the move ran, a click refusal is spoken as a click
+        failure - "I couldn't move the pointer" named the action that
+        succeeded and hid the one that didn't.
+        fails_when: the click's outcome is folded back into the move's
+        variable and the move failure line is spoken for a move that ran.
+        no_claim: does not claim which of the two invocations the injector
+        refused, only what the user is told.
+        seam: none
+        """
+        monkeypatch.setattr(g, "move_to", Mock(return_value="ran"))
+        monkeypatch.setattr(g, "click", Mock(return_value="errored"))
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        g._bounds = (0, 0, 900, 600)
+        core.listen_modal = Mock(return_value=iter(["click"]))
+        g._run_mode(core)
+        g.click.assert_called_once_with("click")
+        assert core.speak.call_args_list[-1].args[0] == "I couldn't click."
 
     def test_errored_move_does_not_click(self, monkeypatch, core):
         """protects: a move that errored is not followed by a click, the same
