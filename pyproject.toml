@@ -188,7 +188,6 @@ packages = [
   "easyspeak.plugins.browser",
   "easyspeak.plugins.dictation",
   "easyspeak.plugins.files",
-  "easyspeak.plugins.gridydotool",
   "easyspeak.plugins.headtrack",
   "easyspeak.plugins.media",
   "easyspeak.plugins.mousegrid",

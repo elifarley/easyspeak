@@ -37,8 +37,8 @@ replacement for that extension that doesn't exist yet.
 [^settings]: "Start at Login" is in the tray icon's menu; there are no other
     settings yet. System Settings → Autostart shows the same entry.
 [^grid]: GNOME's grid is the bundled Shell extension. Elsewhere (KDE Plasma,
-    COSMIC, wlroots) EasySpeak uses the `gridydotool` backend when its stack is
-    installed: a compositor with layer-shell support, `ydotool` with write
+    COSMIC, wlroots) the mousegrid plugin uses its ydotool backend when that
+    stack is installed: a compositor with layer-shell support, `ydotool` with write
     access to `/dev/uinput`, and an interpreter with PyGObject and the
     gtk4-layer-shell typelib. That access is input-injection grade — the same
     class as the `input` group hold-to-dictate needs — and on ydotool 1.0.x

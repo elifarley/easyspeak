@@ -28,8 +28,8 @@ rm -rf ~/.local/share/gnome-shell/extensions/gnome@easyspeak.dev
 
 ## Mouse grid: the grid never appears on a non-GNOME desktop
 
-The grid needs either the Shell extension (GNOME 47+) or the `gridydotool`
-backend, which needs `ydotool` installed (its own tool list must offer
+The grid needs either the Shell extension (GNOME 47+) or the mousegrid
+plugin's ydotool backend, which needs `ydotool` installed (its own tool list must offer
 `mousemove`, `click` and `type`), a compositor with layer-shell support (COSMIC,
 wlroots, KDE) and an interpreter with PyGObject, the cairo bindings
 (`python3-gi-cairo` — the click-through input region is built from a

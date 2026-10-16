@@ -112,10 +112,6 @@ exit.
 
 ::: plugins.mousegrid
 
-## gridydotool
-
-::: plugins.gridydotool
-
 ## headtrack
 
 ::: plugins.headtrack

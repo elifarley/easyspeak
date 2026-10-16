@@ -14,13 +14,9 @@ echo "The wheel ships the core module and the plugins"
 has core
 has core/statusnotifier.xml
 has plugins
-has plugins/gridydotool/__init__.py
-has plugins/gridydotool/_overlay.py
+has plugins/mousegrid/__init__.py
+has plugins/mousegrid/_overlay.py
 has locale/de/LC_MESSAGES/dictation.po
-has locale/de/LC_MESSAGES/gridydotool.po
-has locale/es/LC_MESSAGES/gridydotool.po
-has locale/fr/LC_MESSAGES/gridydotool.po
-has locale/it/LC_MESSAGES/gridydotool.po
 has locale/de/vocabulary.toml
 
 echo "The wheel ships the launcher data and the GNOME extension"

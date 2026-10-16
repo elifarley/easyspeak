@@ -127,10 +127,10 @@ usually lacks, so candidate interpreters are probed with the helper's real impor
 chain and the first that works is kept. Set the variable to point straight at one
 (the Nix flake does).
 
-### [`plugins.gridydotool`][plugins.gridydotool]
+### [`plugins.mousegrid`][plugins.mousegrid]
 
 The mouse grid is served by the GNOME Shell extension on GNOME and by the
-`gridydotool` backend elsewhere. The backend activates only where the stack
+plugin's ydotool backend elsewhere. The backend activates only where the stack
 works — a compositor with layer-shell support (COSMIC, wlroots, KDE), `ydotool`
 with write access to `/dev/uinput`, and, on ydotool 1.0.x, a running `ydotoold`
 (0.1.8 works without one, at the cost of the latency its own notice names)

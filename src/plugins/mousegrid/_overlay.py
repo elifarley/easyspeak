@@ -1,4 +1,4 @@
-"""Standalone GTK4 layer-shell overlay for the gridydotool plugin.
+"""Standalone GTK4 layer-shell overlay for the mousegrid plugin's ydotool backend.
 
 Runs as a script in an interpreter that has PyGObject with its cairo bindings
 (the click-through input region is a `cairo.Region`, which PyGObject only
@@ -30,7 +30,7 @@ import sys
 import time
 from pathlib import Path
 
-DEFAULT_NAMESPACE = "gridydotool"
+DEFAULT_NAMESPACE = "mousegrid"
 
 
 def cell_rects(bounds):
@@ -385,7 +385,7 @@ def run(gtk, layer_shell):  # pragma: no cover - drives the GTK loop
 
     GLib = gi.repository.GLib
 
-    app = gtk.Application(application_id="dev.easyspeak.gridydotool.overlay")
+    app = gtk.Application(application_id="dev.easyspeak.mousegrid.overlay")
     overlay = None
     fatal = None
 

@@ -1,5 +1,6 @@
-"""Tests for the gridydotool plugin: the zone math, its parity with mousegrid,
-and the parser that turns an utterance into zone numbers."""
+"""Tests for the mousegrid plugin's ydotool backend: the zone math, its parity
+with the extension backend, and the parser that turns an utterance into zone
+numbers."""
 
 import ctypes
 import ctypes.util
@@ -14,8 +15,9 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
-from easyspeak.plugins import gridydotool, mousegrid
-from easyspeak.plugins import gridydotool as g
+from easyspeak.plugins import mousegrid
+from easyspeak.plugins.mousegrid import _common, _extension
+from easyspeak.plugins.mousegrid import _ydotool as g
 
 # What Ubuntu 25.10's ydotool 0.1.8 prints for `ydotool help`, read off the VM:
 # the five verbs are the whole surface there, and `mousemove_relative` is not
@@ -132,15 +134,15 @@ class TestZoneMath:
             9: (600, 400, 300, 200),
         }
         for zone, want in expected.items():
-            assert gridydotool.subdivide(bounds, zone) == want
+            assert g.subdivide(bounds, zone) == want
 
     def test_subdivide_truncates_like_the_extension_backend(self):
         # 1000 // 3 == 333, and the same recursion must produce the same cell on
         # both backends or the parity invariant is gone.
-        assert gridydotool.subdivide((0, 0, 1000, 1000), 9) == (666, 666, 333, 333)
+        assert g.subdivide((0, 0, 1000, 1000), 9) == (666, 666, 333, 333)
 
     def test_center(self):
-        assert gridydotool.center((1351, 280, 71, 40)) == (1386, 300)
+        assert g.center((1351, 280, 71, 40)) == (1386, 300)
 
 
 class TestContainmentInvariant:
@@ -152,52 +154,56 @@ class TestContainmentInvariant:
                 for c in range(1, 10):
                     bounds = (0, 0, monitor[0], monitor[1])
                     for zone in (a, b, c):
-                        bounds = gridydotool.subdivide(bounds, zone)
+                        bounds = g.subdivide(bounds, zone)
                     x, y, w, h = bounds
                     assert x + w <= monitor[0], (a, b, c)
                     assert y + h <= monitor[1], (a, b, c)
 
 
-class TestParityWithMousegrid:
-    """The gate shadows mousegrid's words, so both must land on the same pixel.
+class TestParityWithExtension:
+    """One phrase surface, two backends: both must land on the same pixel.
 
-    Driven against mousegrid's own implementation, which is the only
-    independent oracle available for this arithmetic.
+    Driven against the extension backend's own implementation, which is the
+    only independent oracle available for this arithmetic.
     """
 
     @staticmethod
-    def _mousegrid_bounds(sequence, monitor, monkeypatch):
-        monkeypatch.setattr(mousegrid, "dbus_call", lambda *args: True)
-        monkeypatch.setattr(mousegrid, "screen_size", monitor)
-        monkeypatch.setattr(mousegrid, "grid_active", True)
-        monkeypatch.setattr(mousegrid, "grid_bounds", (0, 0, monitor[0], monitor[1]))
+    def _extension_bounds(sequence, monitor, monkeypatch):
+        monkeypatch.setattr(_extension, "dbus_call", lambda *args: True)
+        monkeypatch.setattr(_extension, "screen_size", monitor)
+        monkeypatch.setattr(_extension, "grid_active", True)
+        monkeypatch.setattr(_extension, "grid_bounds", (0, 0, monitor[0], monitor[1]))
         for zone in sequence:
-            mousegrid.update_grid(zone)
-        return mousegrid.grid_bounds
+            _extension.update_grid(zone)
+        return _extension.grid_bounds
 
     def test_all_sequences_agree(self, monkeypatch):
         monitor = (1920, 1080)
         for a in range(1, 10):
             for b in range(1, 10):
                 for c in range(1, 10):
-                    theirs = self._mousegrid_bounds((a, b, c), monitor, monkeypatch)
+                    theirs = self._extension_bounds((a, b, c), monitor, monkeypatch)
                     bounds = (0, 0, monitor[0], monitor[1])
                     for zone in (a, b, c):
-                        bounds = gridydotool.subdivide(bounds, zone)
+                        bounds = g.subdivide(bounds, zone)
                     assert bounds == theirs, (a, b, c)
-                    assert gridydotool.center(bounds) == mousegrid.get_center()
+                    assert g.center(bounds) == _extension.get_center()
 
-    def test_trigger_words_equal(self):
-        assert gridydotool.GRID_TRIGGERS == mousegrid.GRID_TRIGGERS
+    def test_trigger_words_are_one_shared_table(self):
+        """A divergence used to be caught by comparing two maintained copies;
+        the consolidation replaced the copies with one `_common` table, so the
+        assertion becomes identity — a backend that stops importing it is the
+        failure."""
+        assert g.GRID_TRIGGERS is _extension.GRID_TRIGGERS
 
-    def test_number_words_equal(self):
-        assert gridydotool.WORD_TO_NUM == mousegrid.WORD_TO_NUM
+    def test_number_words_are_one_shared_table(self):
+        """The ydotool backend reaches the table only through the shared
+        parser (it never reads `WORD_TO_NUM` directly), so the identity is
+        asserted between `_common` and the extension backend's import of it."""
+        assert _extension.WORD_TO_NUM is _common.WORD_TO_NUM
 
-    def test_parser_agrees_on_a_sample(self):
-        for text in ("3 7 5", "three seven five", "tree ate nein", "one two"):
-            assert gridydotool.parse_number_sequence(text) == (
-                mousegrid.parse_number_sequence(text)
-            )
+    def test_parser_is_the_shared_implementation(self):
+        assert g.parse_number_sequence is _extension.parse_number_sequence
 
 
 @pytest.fixture
@@ -993,24 +999,32 @@ class TestGate:
         monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "uinput")
         monkeypatch.setattr(g, "_probe_overlay", Mock(side_effect=AssertionError))
         monkeypatch.setattr(g, "_probe_injector", Mock(side_effect=AssertionError))
-        g.setup(core)
+        mousegrid.setup(core)
         assert g.active() is True
+        assert mousegrid._backend is g
 
-    def test_forced_gnome_is_inert(self, monkeypatch, core):
+    def test_forced_gnome_selects_the_extension_backend(self, monkeypatch, core):
         monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "gnome")
-        g.setup(core)
+        mousegrid.setup(core)
         assert g.active() is False
+        assert mousegrid._backend is _extension
 
     def test_needs_both_halves(self, monkeypatch, core):
         monkeypatch.delenv("EASYSPEAK_GRID_BACKEND", raising=False)
         monkeypatch.setattr(g, "_probe_overlay", lambda: True)
         monkeypatch.setattr(g, "_probe_injector", lambda: False)
-        g.setup(core)
+        mousegrid.setup(core)
         assert g.active() is False
+        assert mousegrid._backend is _extension
         monkeypatch.setattr(g, "_probe_overlay", lambda: False)
         monkeypatch.setattr(g, "_probe_injector", lambda: True)
-        g.setup(core)
+        mousegrid.setup(core)
         assert g.active() is False
+        assert mousegrid._backend is _extension
+        monkeypatch.setattr(g, "_probe_overlay", lambda: True)
+        mousegrid.setup(core)
+        assert g.active() is True
+        assert mousegrid._backend is g
 
     def test_socket_check_is_a_bare_connect_that_cannot_raise(self, monkeypatch):
         stub = Mock()
@@ -1258,11 +1272,25 @@ class TestRouting:
         monkeypatch.setattr(g, "_active", True)
         assert g.handle("greatest", core) is None
 
-    def test_close_after_a_trigger_is_a_dismissal(self, monkeypatch, core):
+    def test_close_outside_a_session_is_nobodys_phrase(self, monkeypatch, core):
+        """protects: dismissal lives inside an open session's loop; outside
+        one, a phrase that names the grid and asks to close it claims nothing.
+        The old backend answered such phrases with a spoken "Grid closed" —
+        parity insurance, so the two plugins never offered the same words
+        twice. One plugin has no double claim to insure against, and
+        confirming a closure when nothing is open would be a lie, so the
+        branch is gone.
+        fails_when: handle claims "close the grid" outside a session, or the
+        show guard fails and the phrase opens the grid instead.
+        no_claim: does not claim anything about in-session dismissals —
+        TestModeDispatch's subject.
+        seam: none
+        """
         monkeypatch.setattr(g, "_active", True)
-        monkeypatch.setattr(g, "_dismiss", Mock())
-        assert g.handle("close the grid", core) is True
-        g._dismiss.assert_called_once()
+        opened = Mock(side_effect=AssertionError("a dismissal must not open"))
+        monkeypatch.setattr(g, "_open_session", opened)
+        assert g.handle("close the grid", core) is None
+        opened.assert_not_called()
 
     def test_again_reopens_at_the_remembered_cell(self, monkeypatch, core, fake_helper):
         """protects: "again" reopens the grid on the cell a click was dispatched

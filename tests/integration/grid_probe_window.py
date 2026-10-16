@@ -41,7 +41,7 @@ def main():
         window.add_controller(click)
         window.present()
 
-    app = Gtk.Application(application_id="dev.easyspeak.gridydotool.probe")
+    app = Gtk.Application(application_id="dev.easyspeak.mousegrid.probe")
     app.connect("activate", on_activate)
     return app.run([])
 

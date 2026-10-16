@@ -1,0 +1,142 @@
+"""Data and geometry shared by the mousegrid backends.
+
+One grid feature serves several desktops, and the phrase surface must not
+depend on which backend answers: an utterance that opens and zooms the grid on
+GNOME has to open and zoom it identically under ydotool. The trigger words,
+the number table and the zone math therefore live here, and both backends
+import them.
+
+The ydotool backend formerly carried its own copies of these tables, kept
+equal only by test assertion — the price of a cross-plugin boundary, where
+one plugin may not reach into another's namespace. Inside one package a
+shared module does the same job without the ceremony: a divergence is now an
+ImportError away from being impossible instead of a test failure away from
+being shipped.
+"""
+
+import re
+
+# Whisper mishears "grid" as any of these often enough that the extension
+# backend tunes a whole set, and a backend that hears fewer words than the
+# other is a regression in the user's eyes, not a simplification.
+GRID_TRIGGERS = {
+    "grid",
+    "grit",
+    "grip",
+    "great",
+    "greed",
+    "grade",
+    "grad",
+    "grill",
+    "guild",
+    "greet",
+    "grin",
+    "green",
+    "grey",
+    "gray",
+    "grab",
+    "grand",
+    "greek",
+    "grew",
+    "mouse",
+    "pointer",
+    "cursor",
+    "crosshair",
+}
+
+# Number parsing - word to digit (carries Whisper's usual mishearings).
+WORD_TO_NUM = {
+    "one": 1,
+    "won": 1,
+    "wan": 1,
+    "two": 2,
+    "to": 2,
+    "too": 2,
+    "tu": 2,
+    "three": 3,
+    "tree": 3,
+    "free": 3,
+    "four": 4,
+    "for": 4,
+    "fore": 4,
+    "five": 5,
+    "six": 6,
+    "sex": 6,
+    "seven": 7,
+    "eight": 8,
+    "ate": 8,
+    "nine": 9,
+    "nein": 9,
+}
+
+# One compiled scan for the whole word table. Longest-first matters: Python's
+# `re` tries alternatives in order at each position, so "three" must precede
+# "tree"-shaped shorter rivals ("to" before "too"/"two" would turn "two" into
+# "2wo"). Sorting by length is the order that matches the per-word loop this
+# replaced, where every full word got its own whole-string pass.
+_NUM_RE = re.compile(
+    r"\b("
+    + "|".join(sorted(map(re.escape, WORD_TO_NUM), key=len, reverse=True))
+    + r")\b"
+)
+
+ZONE_MAP = {
+    1: (0, 0),
+    2: (1, 0),
+    3: (2, 0),
+    4: (0, 1),
+    5: (1, 1),
+    6: (2, 1),
+    7: (0, 2),
+    8: (1, 2),
+    9: (2, 2),
+}
+
+# Words that end a grid session inside an open mode.
+DISMISS_WORDS = {"close", "cancel", "stop", "hide", "escape", "exit", "done", "quit"}
+# Words that reopen the grid at the cell of the last click.
+AGAIN_WORDS = {"again", "repeat", "reopen"}
+# The show/dismiss guard at the claim boundary, no wider than the original
+# plugin's pair: a phrase that names the grid and asks to close it must not
+# OPEN the grid.
+SHOW_BLOCK_WORDS = {"close", "hide"}
+
+
+def subdivide(bounds, zone):
+    """Return the ninth of `bounds` named by `zone` (1-9, row-major).
+
+    Integer thirds, including the original backend's truncation: `w // 3` of a
+    1000-wide cell is 333, not 333.33, and both backends must agree on that —
+    one utterance has to land on the same pixel whichever backend answers. The
+    off-monitor safety clamp the first implementation carried is absent because
+    it cannot fire: x + w stays inside the monitor by construction.
+    """
+    x, y, w, h = bounds
+    zone_w, zone_h = w // 3, h // 3
+    col, row = ZONE_MAP[zone]
+    return (x + col * zone_w, y + row * zone_h, zone_w, zone_h)
+
+
+def center(bounds):
+    """Return the (x, y) centre of `bounds`."""
+    x, y, w, h = bounds
+    return (x + w // 2, y + h // 2)
+
+
+def parse_number_sequence(text):
+    """Extract every zone number from an utterance, in order.
+
+    `"3 7 5"` and `"three seven five"` both give `[3, 7, 5]`; the word table
+    carries Whisper's usual mishearings, so the same utterance chains the same
+    zooms on whichever backend answers.
+
+    The table compiles to one alternation scanned once per utterance, instead
+    of one pass per word over the whole string. Alternatives are ordered
+    longest first, which is what keeps the result identical to the sequential
+    loop it replaced: at a shared start position the longest word wins, as the
+    per-word passes did implicitly (a shorter word never survived where a
+    longer one also matched, because the longer pass had already consumed the
+    token).
+    """
+    lowered = _NUM_RE.sub(lambda m: str(WORD_TO_NUM[m[0]]), text.lower())
+    return [int(char) for char in lowered if char.isdigit() and char != "0"]

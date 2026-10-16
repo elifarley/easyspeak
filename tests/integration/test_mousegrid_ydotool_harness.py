@@ -1,4 +1,4 @@
-"""The gridydotool end-to-end loop, in a headless sway session.
+"""The mousegrid ydotool backend's end-to-end loop, in a headless sway session.
 
 Checks: a failed injector probe keeps `mousegrid` in charge (no privileges
 needed), the injector gate passes on a real ydotool where an answered daemon
@@ -45,7 +45,8 @@ import time
 from pathlib import Path
 
 import pytest
-from easyspeak.plugins import gridydotool
+from easyspeak.plugins import mousegrid
+from easyspeak.plugins.mousegrid import _ydotool as backend
 
 SWAY_CONFIG = """\
 output HEADLESS-1 mode 1920x1080
@@ -77,7 +78,7 @@ def _missing_prerequisite():
     missing = [name for name in ("sway", "ydotool", "grim") if not shutil.which(name)]
     if missing:
         return f"sway, ydotool and grim are needed; missing here: {', '.join(missing)}"
-    if gridydotool.grid_python() is None:
+    if backend.grid_python() is None:
         return (
             "no interpreter with PyGObject and the gtk4-layer-shell typelib "
             "(set EASYSPEAK_GRID_TYPELIB to the build tree's src directory, "
@@ -304,20 +305,25 @@ def _reap_leaked_helper():
     either; the unit suite reaps with exactly this fixture.
     """
     yield
-    if gridydotool._helper is not None:
-        gridydotool.stop_helper("harness cleanup")
+    if backend._helper is not None:
+        backend.stop_helper("harness cleanup")
 
 
 class TestGate:
-    def test_a_failed_injector_probe_keeps_mousegrid_in_charge(self, monkeypatch):
+    def test_a_failed_injector_probe_keeps_the_extension_backend_in_charge(
+        self, monkeypatch
+    ):
         """The fail-closed property, asserted where it needs no privileges and
-        no display: a probe that cannot inject leaves the words to mousegrid."""
+        no display: a probe that cannot inject leaves the ydotool backend
+        inert, and the plugin's gate routes the words to the extension
+        backend."""
         monkeypatch.delenv("EASYSPEAK_GRID_BACKEND", raising=False)
-        monkeypatch.setattr(gridydotool, "_probe_overlay", lambda: True)
-        monkeypatch.setattr(gridydotool, "_probe_injector", lambda: False)
-        gridydotool.setup(core=None)
-        assert gridydotool.active() is False
-        assert gridydotool.handle("grid", core=None) is None
+        monkeypatch.setattr(backend, "_probe_overlay", lambda: True)
+        monkeypatch.setattr(backend, "_probe_injector", lambda: False)
+        mousegrid.setup(core=None)
+        assert backend.active() is False
+        assert mousegrid._backend is mousegrid._extension
+        assert backend.handle("grid", core=None) is None
 
     def test_the_injector_gate_passes_with_an_injector_to_reach(
         self, monkeypatch, caplog
@@ -336,18 +342,19 @@ class TestGate:
         """
         if shutil.which("ydotool") is None:
             pytest.skip("ydotool is not installed")
-        if gridydotool.injector_socket() is None:
+        if backend.injector_socket() is None:
             pytest.skip(
                 "no ydotoold socket answers (Ubuntu packages one as a user unit); "
                 "without a daemon a 1.0.x client has nothing to inject through"
             )
         monkeypatch.delenv("EASYSPEAK_GRID_BACKEND", raising=False)
         with caplog.at_level("INFO"):
-            assert gridydotool._probe_injector() is True
+            assert backend._probe_injector() is True
         assert any("injections " in r.message for r in caplog.records)
-        monkeypatch.setattr(gridydotool, "_probe_overlay", lambda: True)
-        gridydotool.setup(core=None)
-        assert gridydotool.active() is True
+        monkeypatch.setattr(backend, "_probe_overlay", lambda: True)
+        mousegrid.setup(core=None)
+        assert backend.active() is True
+        assert mousegrid._backend is backend
 
     def test_the_injector_gate_fails_closed_without_a_socket(
         self, monkeypatch, tmp_path, caplog
@@ -359,16 +366,14 @@ class TestGate:
         on there and the case skips by name."""
         if shutil.which("ydotool") is None:
             pytest.skip("ydotool is not installed")
-        if gridydotool.dialect() != gridydotool.YDTOOL_DIALECT_MODERN:
+        if backend.dialect() != backend.YDTOOL_DIALECT_MODERN:
             pytest.skip(
                 "0.1.8's client emits without a daemon; nothing to fail closed on"
             )
         dead = tmp_path / ".ydotool_socket"
-        monkeypatch.setattr(
-            gridydotool, "ydotool_socket_candidates", lambda: [str(dead)]
-        )
+        monkeypatch.setattr(backend, "ydotool_socket_candidates", lambda: [str(dead)])
         with caplog.at_level("INFO"):
-            assert gridydotool._probe_injector() is False
+            assert backend._probe_injector() is False
         assert any("no injector here" in r.message for r in caplog.records)
 
 
@@ -389,7 +394,7 @@ class TestForcedBackendArm:
         """
         monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "uinput")
         monkeypatch.setenv("EASYSPEAK_GRID_DRY_RUN", "1")
-        modern = gridydotool.dialect() == gridydotool.YDTOOL_DIALECT_MODERN
+        modern = backend.dialect() == backend.YDTOOL_DIALECT_MODERN
         expected_move = (
             "mousemove --absolute -x 1386 -y 300" if modern else "mousemove 1386 300"
         )
@@ -409,9 +414,9 @@ class TestForcedBackendArm:
 
         with caplog.at_level("INFO"):
             core = FakeCore()
-            gridydotool.setup(core)
-            assert gridydotool.active() is True
-            gridydotool.handle(commands[0], core)
+            mousegrid.setup(core)
+            assert backend.active() is True
+            mousegrid.handle(commands[0], core)
 
         ready = [r for r in caplog.records if "ready on" in r.message]
         assert ready, "the helper never reported ready"
@@ -419,7 +424,7 @@ class TestForcedBackendArm:
         dry = [r for r in caplog.records if "dry run:" in r.message]
         assert any(expected_move in r.message for r in dry), [r.message for r in dry]
         assert any(expected_click in r.message for r in dry), [r.message for r in dry]
-        assert gridydotool._helper is None
+        assert backend._helper is None
 
 
 @pytest.mark.skipif(
@@ -429,14 +434,14 @@ class TestForcedBackendArm:
 class TestLiveArm:
     def test_the_click_lands_in_the_expected_cell(self, session, tmp_path, monkeypatch):
         monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "uinput")
-        repo_root = Path(gridydotool.__file__).parents[3]
+        repo_root = Path(backend.__file__).parents[3]
         # The probe window runs under the system interpreter, not the venv the
         # test itself runs in: grid_python() is the plugin's own resolver for
         # "an interpreter with PyGObject and Gtk 4", which is exactly the probe
         # window's requirement, and under `just integration` python3 resolves to
         # the daemon venv (no PyGObject), so a bare `python3` here would die on
         # import while everything else worked.
-        python = gridydotool.grid_python()
+        python = backend.grid_python()
         assert python, "no interpreter can run the GTK4 probe window"
 
         # The bare session is captured before the probe window exists, and the
@@ -464,15 +469,15 @@ class TestLiveArm:
             "scene"
         )
 
-        monkeypatch.setattr(gridydotool, "PROBE_TIMEOUT", 8.0)
-        gridydotool.setup(core=None)
-        assert gridydotool._start_helper() == (0, 0, 1920, 1080)
-        gridydotool._bounds = (0, 0, 1920, 1080)
+        monkeypatch.setattr(backend, "PROBE_TIMEOUT", 8.0)
+        mousegrid.setup(core=None)
+        assert backend._start_helper() == (0, 0, 1920, 1080)
+        backend._bounds = (0, 0, 1920, 1080)
         for zone in (3, 7, 5):
-            gridydotool._bounds = gridydotool.subdivide(gridydotool._bounds, zone)
-            gridydotool._redraw(gridydotool._bounds)
+            backend._bounds = backend.subdivide(backend._bounds, zone)
+            backend._redraw(backend._bounds)
         time.sleep(0.5)
-        assert gridydotool._bounds == EXPECTED_CELL
+        assert backend._bounds == EXPECTED_CELL
 
         after = tmp_path / "after.png"
         _grim(session, after)
@@ -501,12 +506,12 @@ class TestLiveArm:
         # probe's press can prove it. The two screenshots keep a failed
         # re-present from passing silently, because a click would sail through
         # an absent overlay anyway.
-        gridydotool._send({"cmd": "hide"})
+        backend._send({"cmd": "hide"})
         time.sleep(0.5)
         hidden = tmp_path / "hidden.png"
         _grim(session, hidden)
         assert hidden.read_bytes() != after.read_bytes(), "the overlay did not hide"
-        gridydotool._redraw(gridydotool._bounds)
+        backend._redraw(backend._bounds)
         time.sleep(0.5)
         shown_again = tmp_path / "shown-again.png"
         _grim(session, shown_again)
@@ -514,10 +519,10 @@ class TestLiveArm:
             "the overlay did not come back"
         )
 
-        x, y = gridydotool.center(EXPECTED_CELL)
+        x, y = backend.center(EXPECTED_CELL)
         print(f"about to click at {x},{y}")  # noqa: T201
-        gridydotool.move_to(x, y)
-        gridydotool.click("click")
+        backend.move_to(x, y)
+        backend.click("click")
         time.sleep(0.5)
 
         probe.terminate()

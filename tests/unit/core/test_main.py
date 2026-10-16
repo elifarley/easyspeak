@@ -1,14 +1,11 @@
 """Tests for the core main module."""
 
-import importlib
 import subprocess
-import sys
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, call, patch
 
 import numpy as np
 import pytest
-from easyspeak.core import main as main_module
 from easyspeak.core.config import MISUNDERSTAND_GRACE
 from easyspeak.core.main import EasySpeak
 from easyspeak.core.tray import STATE_MUTED, TrayAction
@@ -122,34 +119,6 @@ class TestEasySpeakUtilities:
         easy.deactivate()
 
         easy.tray.request_sleep.assert_called_once()
-
-
-def _inert_gridydotool(monkeypatch):
-    """Patch the grid plugin's layer-shell probe where the loader calls it.
-
-    `load_plugins` puts `src/` on `sys.path` and imports each plugin as
-    top-level `plugins.<stem>`. That module object is *not* the
-    `easyspeak.plugins.<stem>` the suite imports elsewhere: both names resolve
-    the same file through different package names, so patching one never
-    reaches `setup()` on the other and the real probes still spawn. This
-    imports the loader's own namespace first and patches it there; the returned
-    list records the call the loader makes, and is what fails if the patch ever
-    drifts back off that namespace.
-
-    Returns the probe calls; an empty list means the real probe ran.
-    """
-    src = Path(main_module.__file__).resolve().parent.parent
-    if str(src) not in sys.path:
-        sys.path.insert(0, str(src))
-    module = importlib.import_module("plugins.gridydotool")
-    probes = []
-
-    def reject_probe():
-        probes.append(True)
-        return False
-
-    monkeypatch.setattr(module, "_probe_overlay", reject_probe)
-    return probes
 
 
 class TestEasySpeakPlugins:
@@ -310,12 +279,15 @@ class TestEasySpeakPlugins:
         """All shipped plugins are discovered against the real filesystem layout."""
         easy = EasySpeak()
 
-        # setup() runs for real here: the patch keeps a loader test from spawning
-        # probes and injecting anything, and the probe record it returns is the
-        # proof it bound to the namespace the loader calls (_inert_gridydotool).
-        probes = _inert_gridydotool(monkeypatch)
+        # setup() runs for real here: forcing the grid plugin's extension
+        # backend keeps a loader test from spawning the ydotool gate's probes.
+        # The env var is the gate's own override, so it reaches the loader's
+        # module instance without any patching gymnastics — `load_plugins`
+        # imports plugins as top-level `plugins.<stem>`, whose module object is
+        # NOT the `easyspeak.plugins.<stem>` the suite imports elsewhere, and
+        # patching one never reaches the other.
+        monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "gnome")
         easy.load_plugins()
-        assert probes == [True]
         loaded = {module.__name__.rsplit(".", 1)[-1] for module in easy.plugins}
 
         assert loaded == {
@@ -324,7 +296,6 @@ class TestEasySpeakPlugins:
             "browser",
             "dictation",
             "files",
-            "gridydotool",
             "headtrack",
             "media",
             "mousegrid",
@@ -336,18 +307,14 @@ class TestEasySpeakPlugins:
         """Commands reach the modes first and the help/exit catch-all last."""
         easy = EasySpeak()
 
-        # Same binding as above: the routing order is only meaningful when
-        # gridydotool loaded through the patched probe rather than a real one.
-        probes = _inert_gridydotool(monkeypatch)
+        # See the roster test: setup() must not probe during a loader test.
+        monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "gnome")
         easy.load_plugins()
-        assert probes == [True]
         names = [module.NAME for module in easy.plugins]
 
-        # The grid backend loads ahead of mousegrid: it shadows the same words,
-        # and the loader's order is what decides who is offered them first.
-        assert names[:3] == ["gridydotool", "headtrack", "mousegrid"]
+        assert names[:2] == ["headtrack", "mousegrid"]
         assert names[-1] == "base"
-        assert names[3:-1] == sorted(names[3:-1])
+        assert names[2:-1] == sorted(names[2:-1])
 
     @patch("importlib.import_module")
     @patch("sys.path")

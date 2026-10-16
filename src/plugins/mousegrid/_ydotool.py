@@ -1,18 +1,24 @@
-"""Grid mouse control through ydotool, without the GNOME Shell extension.
+"""The ydotool backend: the grid conversation without GNOME Shell.
 
 Routes the grid conversation, computes cell bounds, and delegates rendering to
 `_overlay.py` (a GTK4 layer-shell surface in a gi-capable interpreter) while
-`ydotool` moves and clicks the pointer at kernel level. The zone math, the
-trigger words and the number tables mirror `mousegrid` on purpose: this plugin
-shadows the same phrases, so one utterance must land on the same pixel whichever
-backend answers.
+`ydotool` moves and clicks the pointer at kernel level. It is the backend that
+makes the grid usable on compositors where no GNOME Shell can run (COSMIC,
+sway, KDE Wayland, Hyprland).
+
+A startup gate decides whether this backend may claim the grid words at all:
+it is active only where a layer-shell-capable compositor AND a functional
+injector are both present, and fails closed — a grid that takes the words
+without being able to click is worse than one that stays with the extension
+backend. Scroll and drag are not part of this backend's surface: ydotool
+0.1.8 has no wheel verb, and a hold-drag needs a timing design its
+one-invocation press+release cannot express.
 """
 
 import contextlib
 import json
 import logging
 import os
-import re
 import select
 import shutil
 import socket
@@ -26,147 +32,30 @@ from easyspeak.core.i18n import translator
 
 # Module-scope import is safe: `_overlay` imports only stdlib at its own module
 # scope (gi is imported inside its functions), so the daemon's gi-less venv can
-# import the plugin. The explicit binding is what `helper_env` reads for the
+# import the backend. The explicit binding is what `helper_env` reads for the
 # LD_PRELOAD probe below — a `from . import _overlay as alias` form would leave
 # the plain name working only through the import machinery's implicit
 # package-attribute side effect, which reads like a typo.
 from . import _overlay
+from ._common import (
+    AGAIN_WORDS,
+    DISMISS_WORDS,
+    GRID_TRIGGERS,
+    SHOW_BLOCK_WORDS,
+    center,
+    parse_number_sequence,
+    subdivide,
+)
 
 logger = logging.getLogger(__name__)
 
 _ = translator(__file__)
 
-NAME = "gridydotool"
-DESCRIPTION = "Voice-controlled mouse grid (overlay + kernel-level injection)"
-PRIORITY = 0
+KIND = "ydotool"
 
-COMMANDS = [
-    _("grid/mouse/pointer/cursor - show mouse grid"),
-    _("1-9 or chains like '3 7 5' - zoom to zone(s)"),
-    _("click - left click"),
-    _("right click / double click / middle click"),
-    _("close/cancel - hide the grid"),
-    _("again - reopen at the last spot"),
-]
-
-# Recognition data copied from mousegrid (asserted equal by the test suite):
-# Whisper mishears "grid" as any of these often enough that the extension
-# backend tunes a whole set, and a backend that hears fewer words than the one
-# it shadows is a regression in the user's eyes, not a simplification.
-GRID_TRIGGERS = {
-    "grid",
-    "grit",
-    "grip",
-    "great",
-    "greed",
-    "grade",
-    "grad",
-    "grill",
-    "guild",
-    "greet",
-    "grin",
-    "green",
-    "grey",
-    "gray",
-    "grab",
-    "grand",
-    "greek",
-    "grew",
-    "mouse",
-    "pointer",
-    "cursor",
-    "crosshair",
-}
-
-WORD_TO_NUM = {
-    "one": 1,
-    "won": 1,
-    "wan": 1,
-    "two": 2,
-    "to": 2,
-    "too": 2,
-    "tu": 2,
-    "three": 3,
-    "tree": 3,
-    "free": 3,
-    "four": 4,
-    "for": 4,
-    "fore": 4,
-    "five": 5,
-    "six": 6,
-    "sex": 6,
-    "seven": 7,
-    "eight": 8,
-    "ate": 8,
-    "nine": 9,
-    "nein": 9,
-}
-
-# One compiled scan for the whole word table. Longest-first matters: Python's
-# `re` tries alternatives in order at each position, so "three" must precede
-# "tree"-shaped shorter rivals ("to" before "too"/"two" would turn "two" into
-# "2wo"). Sorting by length is the order that matches the per-word loop this
-# replaced, where every full word got its own whole-string pass.
-_NUM_RE = re.compile(
-    r"\b("
-    + "|".join(sorted(map(re.escape, WORD_TO_NUM), key=len, reverse=True))
-    + r")\b"
-)
-
-ZONE_MAP = {
-    1: (0, 0),
-    2: (1, 0),
-    3: (2, 0),
-    4: (0, 1),
-    5: (1, 1),
-    6: (2, 1),
-    7: (0, 2),
-    8: (1, 2),
-    9: (2, 2),
-}
-
-
-def subdivide(bounds, zone):
-    """Return the ninth of `bounds` named by `zone` (1-9, row-major).
-
-    Integer thirds, exactly as `mousegrid.update_grid` computes them, including
-    its truncation: `w // 3` of a 1000-wide cell is 333, not 333.33, and the two
-    backends must agree on that. mousegrid's off-monitor safety clamp is absent
-    here because it cannot fire: x + w stays inside the monitor by construction.
-    """
-    x, y, w, h = bounds
-    zone_w, zone_h = w // 3, h // 3
-    col, row = ZONE_MAP[zone]
-    return (x + col * zone_w, y + row * zone_h, zone_w, zone_h)
-
-
-def center(bounds):
-    """Return the (x, y) centre of `bounds`."""
-    x, y, w, h = bounds
-    return (x + w // 2, y + h // 2)
-
-
-def parse_number_sequence(text):
-    """Extract every zone number from an utterance, in order.
-
-    `"3 7 5"` and `"three seven five"` both give `[3, 7, 5]`; the word table
-    carries Whisper's usual mishearings, mirroring mousegrid's parser so the same
-    utterance chains the same zooms on either backend.
-
-    The table compiles to one alternation scanned once per utterance, instead of
-    one pass per word over the whole string. Alternatives are ordered longest
-    first, which is what keeps the result identical to the sequential loop it
-    replaced: at a shared start position the longest word wins, as the per-word
-    passes did implicitly (a shorter word never survived where a longer one also
-    matched, because the longer pass had already consumed the token).
-    """
-    lowered = _NUM_RE.sub(lambda m: str(WORD_TO_NUM[m[0]]), text.lower())
-    return [int(char) for char in lowered if char.isdigit() and char != "0"]
-
-
-# The gate's probes run inside setup(), during daemon startup, where a hang is
-# worse than a failure: the loader guards setup() with try/except Exception
-# (core/main.py), which catches a raise but not a wait.
+# The gate's probes run inside resolve_active(), during daemon startup, where a
+# hang is worse than a failure: the loader guards setup() with
+# try/except Exception (core/main.py), which catches a raise but not a wait.
 PROBE_TIMEOUT = 5.0
 INJECT_TIMEOUT = 2.0
 REAP_GRACE = 2.0
@@ -180,14 +69,16 @@ PRESENT_TIMEOUT = 2.0
 PROBE_TIMEOUT_PER_USE = 0.25
 YDTOOL_SOCKET = "/tmp/.ydotool_socket"  # noqa: S108 -- 0.1.8's hardcoded path
 YDTOOL_SOCKET_NAME = ".ydotool_socket"  # 1.0.x defaults to $XDG_RUNTIME_DIR/that
-# What the two daemons speak: 0.1.8's ydotoold listens on a stream socket, 1.0.x's
-# on a datagram one. Connecting with the wrong type answers EPROTOTYPE rather
-# than ECONNREFUSED, which would read as "no daemon" on a host that runs one.
+# What the two daemons speak: 0.1.8's ydotoold listens on a stream socket,
+# 1.0.x's on a datagram one. Connecting with the wrong type answers EPROTOTYPE
+# rather than ECONNREFUSED, which would read as "no daemon" on a host that
+# runs one.
 YDTOOL_SOCKET_TYPES = (socket.SOCK_STREAM, socket.SOCK_DGRAM)
 # `unrecognized option` is in here because a rejected argv is not an emission:
-# 1.0.x's client prints `click: unrecognized option '--delay'` and still exits 0,
-# which would otherwise be read as `ran` by a seam that trusts the exit code.
-# `mousemove` with the same argv aborts instead (SIGABRT after the same line).
+# 1.0.x's client prints `click: unrecognized option '--delay'` and still exits
+# 0, which would otherwise be read as `ran` by a seam that trusts the exit
+# code. `mousemove` with the same argv aborts instead (SIGABRT after the same
+# line).
 ERROR_SIGNATURES = (
     "error:",
     "Which coordinate",
@@ -196,10 +87,10 @@ ERROR_SIGNATURES = (
     "unrecognized option",
 )
 FALLBACK_NOTICE = "backend unavailable"
-# The verbs the plugin's argv is allowed to use, read off the binary's own list:
+# The verbs the argv is allowed to use, read off the binary's own list:
 # `mousemove` and `click` are the injections, and `type` is the probe's no-op.
 # Ubuntu 25.10's 0.1.8 build offers exactly {type, recorder, mousemove, key,
-# click} — no `mousemove_relative` — so a hard-coded verb gates the plugin off
+# click} — no `mousemove_relative` — so a hard-coded verb gates the backend off
 # there; 26.04's 1.0.4 adds debug and bakers to the same five.
 YDTOOL_VERBS = ("mousemove", "click", "type")
 
@@ -211,18 +102,18 @@ YDTOOL_VERBS = ("mousemove", "click", "type")
 # invocation and says so on stderr — a measured working path, hence a mode.
 #
 # 1.0.x (Ubuntu 26.04) dropped `--delay`, made the position explicit options
-# (`mousemove --absolute -x 100 -y 200`, where `-x`/`-y` alone are *relative*),
-# and spells buttons as hex selectors plus press/release mask bits: `0xC0` is a
-# left click, `0xC1` right, `0xC2` middle, and `click 1` — 0.1.8's left click —
-# is a right *selector* with no mask, which emits nothing at all. It also
-# removed the per-invocation fallback: with no daemon socket the client exits 2
-# with "failed to connect socket" and injects nothing, so on that dialect the
-# daemon is a capability, not a mode.
+# (`mousemove --absolute -x 100 -y 200`, where `-x`/`-y` alone are
+# *relative*), and spells buttons as hex selectors plus press/release mask
+# bits: `0xC0` is a left click, `0xC1` right, `0xC2` middle, and `click 1` —
+# 0.1.8's left click — is a right *selector* with no mask, which emits nothing
+# at all. It also removed the per-invocation fallback: with no daemon socket
+# the client exits 2 with "failed to connect socket" and injects nothing, so
+# on that dialect the daemon is a capability, not a mode.
 #
 # The dialect is read from the binary: 1.0.x's own `mousemove --help` names
-# `--absolute`, and 0.1.8's offers no such option. Anything else — an unreadable
-# help, a build this plugin has never met — keeps the legacy argv, which is the
-# argv this plugin shipped first.
+# `--absolute`, and 0.1.8's offers no such option. Anything else — an
+# unreadable help, a build this backend has never met — keeps the legacy argv,
+# which is the argv this backend shipped first.
 YDTOOL_DIALECT_MODERN = "modern"
 YDTOOL_DIALECT_LEGACY = "legacy"
 YDTOOL_ABSOLUTE_FLAG = "--absolute"
@@ -239,7 +130,7 @@ _dialect = None
 
 
 def active():
-    """Return whether the gate let this plugin claim the grid words."""
+    """Return whether the gate let this backend claim the grid words."""
     return _active
 
 
@@ -249,8 +140,9 @@ def _probe_dialect():
     `ydotool mousemove --help` is the binary's own answer about the move verb:
     1.0.x's usage line names `--absolute`, 0.1.8's has no such option. A build
     that cannot answer at all keeps the legacy argv rather than guessing at the
-    modern one — the legacy argv is what this plugin shipped first, and the
-    functional half of the gate still has to report `ran` before the gate opens.
+    modern one — the legacy argv is what this backend shipped first, and the
+    functional half of the gate still has to report `ran` before the gate
+    opens.
     """
     try:
         result = _spawn(["ydotool", "mousemove", "--help"], PROBE_TIMEOUT)
@@ -265,9 +157,9 @@ def _probe_dialect():
 def dialect():
     """Return the installed client's argv dialect, resolved once, on demand.
 
-    On demand rather than in `setup()` because the forced-backend path
-    (`EASYSPEAK_GRID_BACKEND=uinput`) short-circuits the probes, and the argv the
-    seam builds still has to match the client that will run it.
+    On demand rather than in `resolve_active()` because the forced-backend path
+    (`EASYSPEAK_GRID_BACKEND=uinput`) short-circuits the probes, and the argv
+    the seam builds still has to match the client that will run it.
     """
     global _dialect
     if _dialect is None:
@@ -279,12 +171,13 @@ def ydotool_socket_candidates():
     """Return the paths a ydotool client may find its daemon on, best first.
 
     `YDOTOOL_SOCKET` is the client's own override and wins outright. Past that,
-    the daemon's default path is build-dependent (`$XDG_RUNTIME_DIR/.ydotool_socket`
-    for 1.0.x, `/tmp/.ydotool_socket` for 0.1.8) and `XDG_RUNTIME_DIR` is not
-    always the login session's: the grid runs inside whatever session started the
-    daemon, and a nested compositor or a test harness repoints it. The login
-    session's own `/run/user/<uid>` path is therefore always considered, with the
-    old hardcoded path last so a 0.1.8 daemon is still found.
+    the daemon's default path is build-dependent
+    (`$XDG_RUNTIME_DIR/.ydotool_socket` for 1.0.x, `/tmp/.ydotool_socket` for
+    0.1.8) and `XDG_RUNTIME_DIR` is not always the login session's: the grid
+    runs inside whatever session started the daemon, and a nested compositor or
+    a test harness repoints it. The login session's own `/run/user/<uid>` path
+    is therefore always considered, with the old hardcoded path last so a 0.1.8
+    daemon is still found.
     """
     candidates = []
     override = os.environ.get("YDOTOOL_SOCKET")
@@ -327,12 +220,12 @@ def _socket_owned(path):
 
 
 # The candidate that answered last time, under the resolution environment it
-# answered for. Probing it first keeps the per-use rediscovery honest (a daemon
-# that stopped is not an injector any more) while sparing the common path the
-# full four-path, two-socket-type fan-out on every injection — and keying the
-# entry to `YDOTOOL_SOCKET`/`XDG_RUNTIME_DIR` keeps an env repoint (a nested
-# compositor, the harness) in charge of priority: the override candidate is
-# probed before any still-alive default.
+# answered for. Probing it first keeps the per-use rediscovery honest (a
+# daemon that stopped is not an injector any more) while sparing the common
+# path the full four-path, two-socket-type fan-out on every injection — and
+# keying the entry to `YDOTOOL_SOCKET`/`XDG_RUNTIME_DIR` keeps an env repoint
+# (a nested compositor, the harness) in charge of priority: the override
+# candidate is probed before any still-alive default.
 _socket_last_good = None
 _socket_last_good_env = None
 
@@ -348,11 +241,11 @@ def injector_socket(timeout=PROBE_TIMEOUT):
     """Return the daemon socket that answers, or None when none does.
 
     Asked afresh before each use rather than cached blindly: a daemon that
-    stopped is not an injector any more, and one that started is, and the answer
-    is what decides both the gate's mode line and whether the gate opens at all
-    on a client that cannot inject without one. The last path that answered —
-    under the same resolution environment — is re-probed first, so the steady
-    state costs one connect instead of the full fan-out.
+    stopped is not an injector any more, and one that started is, and the
+    answer is what decides both the gate's mode line and whether the gate
+    opens at all on a client that cannot inject without one. The last path
+    that answered — under the same resolution environment — is re-probed
+    first, so the steady state costs one connect instead of the full fan-out.
 
     `timeout` bounds each connect. The per-injection callers pass the short
     per-use bound: a daemon that is alive but wedged answers no connect, and
@@ -384,12 +277,13 @@ def _client_env():
     """The environment a ydotool client needs to reach the injector it must use.
 
     `None` inherits this process's environment, which is right while no socket
-    answers (0.1.8 then builds its own device, and 1.0.x refuses on its own). When
-    one does answer, the path is exported explicitly, because the client's own
-    discovery is relative to `XDG_RUNTIME_DIR` and this process may be looking at
-    a different one than the daemon's owner. The probe uses the short per-use
-    bound: this runs between the move and the click of every utterance, and a
-    wedged daemon must cost a fraction of a second, not the startup bound.
+    answers (0.1.8 then builds its own device, and 1.0.x refuses on its own).
+    When one does answer, the path is exported explicitly, because the client's
+    own discovery is relative to `XDG_RUNTIME_DIR` and this process may be
+    looking at a different one than the daemon's owner. The probe uses the
+    short per-use bound: this runs between the move and the click of every
+    utterance, and a wedged daemon must cost a fraction of a second, not the
+    startup bound.
     """
     path = injector_socket(timeout=PROBE_TIMEOUT_PER_USE)
     if path is None:
@@ -414,18 +308,18 @@ def _run_bounded(args, timeout=INJECT_TIMEOUT):
 
     `MouseMove::Exec` and `Click::Exec` do `return argc`, but the 0.1.8 client
     discards that value in `main()`: a dispatched tool exits **0** whatever its
-    argv length (measured on Ubuntu 25.10 — `ydotool click 1` exits 0). The seam
-    therefore reads a zero exit with a clean stderr as `ran`, and still accepts
-    the argv-shaped code for a build that forwards Exec's return. The three
-    outcomes are what the rest of the module reasons about.
+    argv length (measured on Ubuntu 25.10 — `ydotool click 1` exits 0). The
+    seam therefore reads a zero exit with a clean stderr as `ran`, and still
+    accepts the argv-shaped code for a build that forwards Exec's return. The
+    three outcomes are what the rest of the module reasons about.
 
-    "Clean output" is what makes that reading safe, which is why a rejected argv
-    is an error signature: 1.0.4 answers `click: unrecognized option '--delay'`
-    on stderr, emits nothing, and exits 0, so a seam reading only the code would
-    call a no-op `ran` — and the same argv on `mousemove` dies with SIGABRT (134)
-    instead. Both streams are scanned, like the probe seams, so a build that
-    moves its refusals cannot silence them. `--delay 0` was 0.1.8's flag; see
-    the dialect block above.
+    "Clean output" is what makes that reading safe, which is why a rejected
+    argv is an error signature: 1.0.4 answers `click: unrecognized option
+    '--delay'` on stderr, emits nothing, and exits 0, so a seam reading only
+    the code would call a no-op `ran` — and the same argv on `mousemove` dies
+    with SIGABRT (134) instead. Both streams are scanned, like the probe seams,
+    so a build that moves its refusals cannot silence them. `--delay 0` was
+    0.1.8's flag; see the dialect block above.
 
     `timeout` bounds the process, which is what keeps a wedged ydotool (or
     ydotoold) from freezing the modal loop with the overlay on screen.
@@ -448,11 +342,12 @@ def _run_bounded(args, timeout=INJECT_TIMEOUT):
         logger.warning("ydotool refused: %s", output.strip())
         return "errored"
     if FALLBACK_NOTICE in output:
-        # 0.1.8 with no daemon: the client built a device for this invocation and
-        # said so. The VM measured that path working — the notice names a latency
-        # caveat, not a capability gap — so the invocation still counts, and this
-        # line states which mode was in use. 1.0.x has no such mode, and says so
-        # with "failed to connect socket" instead, which is an error signature.
+        # 0.1.8 with no daemon: the client built a device for this invocation
+        # and said so. The VM measured that path working — the notice names a
+        # latency caveat, not a capability gap — so the invocation still
+        # counts, and this line states which mode was in use. 1.0.x has no such
+        # mode, and says so with "failed to connect socket" instead, which is
+        # an error signature.
         logger.info("grid: per-invocation device (ydotoold unavailable)")
     # The argv-shaped code is what Exec returns and what a build forwarding it
     # would report — measured both ways on the draft's own table (`type ""`
@@ -670,9 +565,9 @@ def _socket_accepts(sock_path=YDTOOL_SOCKET, timeout=PROBE_TIMEOUT):
     one. A stale path cannot hide behind the datagram half: the daemon is only
     trusted once the functional probe has also reported `ran` through it.
 
-    No injection, no side effect. The daemon holds an already-recognised device,
-    so injections through it carry no per-invocation latency caveat — which is
-    the whole difference on 0.1.8, and the only working path on 1.0.x.
+    No injection, no side effect. The daemon holds an already-recognised
+    device, so injections through it carry no per-invocation latency caveat —
+    which is the whole difference on 0.1.8, and the only working path on 1.0.x.
 
     `timeout` bounds each connect. The startup probes keep the full
     `PROBE_TIMEOUT`; the per-injection path passes the short per-use bound,
@@ -698,9 +593,10 @@ def parse_tool_list(text):
     The list is the indented lines after the "Available commands:" header, one
     verb per line; the usage line before it is not a verb, and neither is the
     trailing sentence 1.0.4 prints after the list ("Use environment variable
-    YDOTOOL_SOCKET ..."). Capability is read from this list because the verb set
-    is build-dependent: Ubuntu 25.10's ydotool 0.1.8 offers `type`, `recorder`,
-    `mousemove`, `key` and `click` — and no `mousemove_relative` at all.
+    YDOTOOL_SOCKET ..."). Capability is read from this list because the verb
+    set is build-dependent: Ubuntu 25.10's ydotool 0.1.8 offers `type`,
+    `recorder`, `mousemove`, `key` and `click` — and no `mousemove_relative`
+    at all.
     """
     lines = text.splitlines()
     start = None
@@ -733,7 +629,7 @@ def _probe_tools():
 
 
 def _probe_injector():
-    """True when ydotool offers the plugin's verbs and a no-op reports `ran`.
+    """True when ydotool offers the verbs and a no-op reports `ran`.
 
     Capability is read from the binary's own tool list, never assumed: Ubuntu
     25.10's ydotool 0.1.8 has no `mousemove_relative`, so a probe built on that
@@ -743,14 +639,15 @@ def _probe_injector():
     binary reported for itself, so what the probe exercises is exactly the argv
     the seam will later emit.
 
-    The daemon decides on 1.0.x what it only described on 0.1.8. 0.1.8 falls back
-    to a per-invocation uinput device and calls that a latency caveat, so there
-    the socket is the mode this line logs, not a condition. 1.0.x removed the
-    fallback: with no socket it exits 2 with "failed to connect socket" and emits
-    nothing at all, so on that dialect "no daemon answering" means "no injector",
-    and the probe fails closed — the words go back to `mousegrid` rather than a
-    grid that cannot click. Every other half still fails closed the same way: no
-    binary, no verbs, or a probe that does not report `ran`.
+    The daemon decides on 1.0.x what it only described on 0.1.8. 0.1.8 falls
+    back to a per-invocation uinput device and calls that a latency caveat, so
+    there the socket is the mode this line logs, not a condition. 1.0.x removed
+    the fallback: with no socket it exits 2 with "failed to connect socket" and
+    emits nothing at all, so on that dialect "no daemon answering" means "no
+    injector", and the probe fails closed — the words stay with the extension
+    backend rather than a grid that cannot click. Every other half still fails
+    closed the same way: no binary, no verbs, or a probe that does not report
+    `ran`.
     """
     if shutil.which("ydotool") is None:
         logger.info("grid: ydotool is not installed")
@@ -801,71 +698,65 @@ def noop_argv():
     return YDTOOL_NOOP_LEGACY
 
 
-def setup(core):  # noqa: ARG001 — unused since the dead `_core` global went away;
-    # the loader's positional contract and the harness's `setup(core=None)`
-    # pin the parameter name, so it stays.
-    """Resolve the gate once, at daemon startup."""
+def activate():
+    """Force the backend active without probing.
+
+    A deliberate override: asking for this backend explicitly through
+    `EASYSPEAK_GRID_BACKEND=uinput` is the one case where a probe's answer is
+    not the point (the harness uses it to observe the overlay without a daemon
+    and without a real injector).
+    """
     global _active
-    forced = os.environ.get("EASYSPEAK_GRID_BACKEND")
-    if forced == "uinput":
-        # A deliberate override: it short-circuits the probes, because asking for
-        # this backend explicitly is the one case where a probe's answer is not
-        # the point (the harness uses it to observe the overlay without a daemon
-        # and without a real injector).
-        _active = True
-        logger.info("grid: forced active by EASYSPEAK_GRID_BACKEND=uinput")
-    elif forced == "gnome":
-        _active = False
-        logger.info("grid: forced inert by EASYSPEAK_GRID_BACKEND=gnome")
-    else:
-        # The two probes are independent until the conjunction, so they run
-        # side by side: one common deadline covers both, and a host where both
-        # would hang pays the longest probe bound once, not the serial sum, at
-        # daemon startup. Both always run when nothing is forced — skipping
-        # the injector probe on an overlay failure would save one bounded
-        # connect and cost the concurrency.
-        #
-        # The deadline is sized to the larger worst case: the overlay probe may
-        # try three interpreter candidates plus the helper probe. The injector
-        # probe's own worst case is not fully accountable (a wedged ydotoold
-        # socket burns its settimeout per connect, per candidate, per type), so
-        # overshoot fails closed by design: past the deadline the gate shuts
-        # even though the probe would still answer. The threads are daemons so
-        # a wedged probe can never hold the daemon shut-down hostage; a late
-        # result lands in `outcome` unread.
-        outcome = {}
+    _active = True
+    logger.info("grid: forced active by EASYSPEAK_GRID_BACKEND=uinput")
 
-        def _run(name, probe):
-            outcome[name] = probe()
 
-        threads = [
-            threading.Thread(
-                target=_run,
-                args=(name, probe),
-                name=f"grid-probe-{name}",
-                daemon=True,
-            )
-            for name, probe in (
-                ("overlay", _probe_overlay),
-                ("injector", _probe_injector),
-            )
-        ]
-        deadline = time.monotonic() + (len(GRID_PYTHON_CANDIDATES) + 1) * PROBE_TIMEOUT
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(max(0.0, deadline - time.monotonic()))
-        overlay = bool(outcome.get("overlay"))
-        injector = bool(outcome.get("injector"))
-        _active = overlay and injector
+def resolve_active():
+    """Resolve the gate once, at daemon startup; True when both halves pass.
+
+    The two probes are independent until the conjunction, so they run side by
+    side: one common deadline covers both, and a host where both would hang
+    pays the longest probe bound once, not the serial sum, at daemon startup.
+    Both always run when nothing is forced — skipping the injector probe on an
+    overlay failure would save one bounded connect and cost the concurrency.
+
+    The deadline is sized to the larger worst case: the overlay probe may try
+    three interpreter candidates plus the helper probe. The injector probe's
+    own worst case is not fully accountable (a wedged ydotoold socket burns
+    its settimeout per connect, per candidate, per type), so overshoot fails
+    closed by design: past the deadline the gate shuts even though the probe
+    would still answer. The threads are daemons so a wedged probe can never
+    hold the daemon shut-down hostage; a late result lands in `outcome`
+    unread.
+    """
+    global _active
+    outcome = {}
+
+    def _run(name, probe):
+        outcome[name] = probe()
+
+    threads = [
+        threading.Thread(
+            target=_run,
+            args=(name, probe),
+            name=f"grid-probe-{name}",
+            daemon=True,
+        )
+        for name, probe in (
+            ("overlay", _probe_overlay),
+            ("injector", _probe_injector),
+        )
+    ]
+    deadline = time.monotonic() + (len(GRID_PYTHON_CANDIDATES) + 1) * PROBE_TIMEOUT
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    overlay = bool(outcome.get("overlay"))
+    injector = bool(outcome.get("injector"))
+    _active = overlay and injector
     logger.info("grid backend %s", "active" if _active else "inert")
-
-
-DISMISS_WORDS = {"close", "cancel", "stop", "hide", "escape", "exit", "done", "quit"}
-# The show/dismiss guard at the claim boundary is mousegrid's own pair, no
-# wider: parity there is the module's core invariant (see handle's guard).
-_SHOW_BLOCK_WORDS = {"close", "hide"}
-AGAIN_WORDS = {"again", "repeat", "reopen"}
+    return _active
 
 
 def _dismiss():
@@ -922,8 +813,9 @@ def _open_session(core, bounds=None):
     elif announcement and announcement.get("event") == "error":
         # The same read is the first consumer of a show-triggered refusal: the
         # helper emits `error` and quits when the surface went up but the
-        # click-through region could not be applied. Mirroring `_start_helper`'s
-        # refusal path keeps the helper's contract whole on this side too.
+        # click-through region could not be applied. Mirroring
+        # `_start_helper`'s refusal path keeps the helper's contract whole on
+        # this side too.
         logger.warning("grid: helper refused the show: %s", announcement.get("message"))
         stop_helper("show refused")
         core.speak(_("I couldn't show the grid."))
@@ -945,9 +837,10 @@ def _open_session(core, bounds=None):
 def handle(cmd, core):
     """Claim the grid words when the gate passed, and only then.
 
-    Returns None when inert (so mousegrid keeps the words) or when the utterance
-    is not ours; True whenever the phrase was claimed and answered, failures
-    included, because the plugin has already spoken by then.
+    Returns None when inert (so the plugin falls back to the extension
+    backend's phrase surface) or when the utterance is not ours; True whenever
+    the phrase was claimed and answered, failures included, because the backend
+    has already spoken by then.
     """
     global _bounds, _last_bounds
     if not _active:
@@ -957,32 +850,23 @@ def handle(cmd, core):
         return None
 
     if any(word in words for word in AGAIN_WORDS) and _last_bounds:
-        # Reopen on the remembered cell. It is passed in rather than assigned to
-        # the global first: _open_session overwrites the bounds with the whole
-        # output otherwise, which is what a fresh open wants and a reopen does not.
+        # Reopen on the remembered cell. It is passed in rather than assigned
+        # to the global first: _open_session overwrites the bounds with the
+        # whole output otherwise, which is what a fresh open wants and a
+        # reopen does not.
         _open_session(core, bounds=_last_bounds)
         return True
 
-    # The show guard mirrors mousegrid's exactly ("close"/"hide", nothing
-    # more): the module promises one utterance lands the same on whichever
-    # backend answers, so a phrase like "grid quit" must open here when the
-    # gate passed and open there when it did not. The wider DISMISS_WORDS set
-    # stays in charge inside an open session, where no parity question exists.
+    # The show guard mirrors the extension backend's exactly ("close"/"hide",
+    # nothing more): one utterance must land the same on whichever backend
+    # answers, so a phrase like "grid quit" opens here when the gate passed
+    # and there when it did not. Dismissals live inside an open session's
+    # loop, where the mode owns the microphone.
     if any(word in words for word in GRID_TRIGGERS) and not (
-        _SHOW_BLOCK_WORDS & set(words)
+        SHOW_BLOCK_WORDS & set(words)
     ):
         _bounds = None
         _open_session(core)
-        return True
-
-    if (_grid_open or (GRID_TRIGGERS & set(words))) and (
-        _SHOW_BLOCK_WORDS & set(words)
-    ):
-        # A phrase that names the grid and asks to close it is a dismissal, never
-        # an open — and it is ours even when no session is tracked, so mousegrid
-        # is not offered the same words twice.
-        _dismiss()
-        core.speak(_("Grid closed"))
         return True
 
     return None
@@ -1074,8 +958,8 @@ def _fire_click(kind, core):
     """Move to the cell centre, click, remember the cell, and hide the grid.
 
     The cell is remembered here rather than on every subdivision, mirroring
-    mousegrid: "again" means "back to where I last clicked", not "back to the
-    last cell I walked past".
+    the extension backend: "again" means "back to where I last clicked", not
+    "back to the last cell I walked past".
     """
     global _last_bounds
     if not _bounds:
@@ -1103,10 +987,10 @@ def _start_helper():
     the process exits, and this process must stay up and keep rendering. It
     runs under `helper_env()`, which is where a gtk4-layer-shell build tree
     named by `EASYSPEAK_GRID_TYPELIB` becomes visible to the helper. The
-    `ready` wait is a read on a live child's pipe, so it is bounded by a `select`
-    deadline rather than a subprocess timeout, which cannot reach a pipe read. A
-    helper that stays alive and writes nothing is the case that distinction
-    exists for.
+    `ready` wait is a read on a live child's pipe, so it is bounded by a
+    `select` deadline rather than a subprocess timeout, which cannot reach a
+    pipe read. A helper that stays alive and writes nothing is the case that
+    distinction exists for.
     """
     global _helper
     python = grid_python()
@@ -1231,10 +1115,10 @@ def _send(payload):
 def stop_helper(reason):
     """Stop and reap the helper, escalating when it will not go.
 
-    `terminate()`, a bounded wait, then `kill()`, logging which rung was needed:
-    an unbounded `wait()` would freeze the mode at exactly the point this
-    function exists to make safe, and a process that cannot be scheduled to
-    handle SIGTERM still takes a kill from the kernel.
+    `terminate()`, a bounded wait, then `kill()`, logging which rung was
+    needed: an unbounded `wait()` would freeze the mode at exactly the point
+    this function exists to make safe, and a process that cannot be scheduled
+    to handle SIGTERM still takes a kill from the kernel.
     """
     global _helper
     helper, _helper = _helper, None
@@ -1248,6 +1132,11 @@ def stop_helper(reason):
         logger.warning("grid: helper ignored SIGTERM (%s); killing", reason)
         helper.kill()
         helper.wait(timeout=REAP_GRACE)
+
+
+def cleanup():
+    """Backend teardown for the plugin's exit path; delegates to the session."""
+    _close_session()
 
 
 def _close_session():
