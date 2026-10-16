@@ -838,10 +838,11 @@ def _open_session(core, bounds=None):
 def handle(cmd, core):
     """Claim the grid words when the gate passed, and only then.
 
-    Returns None when inert (so the plugin falls back to the extension
-    backend's phrase surface) or when the utterance is not ours; True whenever
-    the phrase was claimed and answered, failures included, because the backend
-    has already spoken by then.
+    Returns None when inert or when the utterance is not ours; True whenever
+    the phrase was claimed and answered, failures included, because the
+    backend has already spoken by then. Which backend serves the words was
+    decided once at setup: an inert gate here means setup selected the
+    extension backend, not that this module delegates mid-conversation.
     """
     global _bounds, _last_bounds
     if not _active:

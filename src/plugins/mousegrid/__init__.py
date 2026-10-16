@@ -77,6 +77,13 @@ def setup(core):
         _backend = _extension
         logger.info("grid: forced extension backend by EASYSPEAK_GRID_BACKEND=gnome")
     else:
+        if forced is not None:
+            # A typo'd value ("uinpt") would otherwise silently degrade to the
+            # probes, and the user would never learn their override did
+            # nothing.
+            logger.warning(
+                "grid: ignoring unknown EASYSPEAK_GRID_BACKEND=%r; probing", forced
+            )
         _backend = _ydotool if _ydotool.resolve_active() else _extension
     logger.info("grid backend: %s", _backend.KIND)
 

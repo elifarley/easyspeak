@@ -1026,6 +1026,18 @@ class TestGate:
         assert g.active() is True
         assert mousegrid._backend is g
 
+    def test_an_unknown_forced_value_is_named_and_probes_run(self, monkeypatch, caplog):
+        """A typo'd override ("uinpt") must not silently degrade to probing:
+        the discarded value is named in the log, and the probes still decide
+        the backend (the unforced path)."""
+        monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "uinpt")
+        monkeypatch.setattr(g, "_probe_overlay", lambda: False)
+        monkeypatch.setattr(g, "_probe_injector", lambda: False)
+        with caplog.at_level("WARNING"):
+            mousegrid.setup(core)
+        assert any("uinpt" in r.message for r in caplog.records)
+        assert mousegrid._backend is _extension
+
     def test_socket_check_is_a_bare_connect_that_cannot_raise(self, monkeypatch):
         stub = Mock()
         stub.connect.side_effect = OSError("connection refused")
