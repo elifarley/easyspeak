@@ -2262,12 +2262,13 @@ class TestOverlayPureParts:
         assert overlay.usable_bounds({"cmd": "show"}) is None
         assert overlay.usable_bounds({"cmd": "show", "bounds": [1, 2, 3]}) is None
         assert overlay.usable_bounds({"cmd": "show", "bounds": "1024x768"}) is None
-        assert overlay.usable_bounds(
-            {"cmd": "show", "bounds": [1, 2, 3, True]}
-        ) is None
-        assert overlay.usable_bounds(
-            {"cmd": "show", "bounds": [1, 2, 3, 4]}
-        ) == [1, 2, 3, 4]
+        assert overlay.usable_bounds({"cmd": "show", "bounds": [1, 2, 3, True]}) is None
+        assert overlay.usable_bounds({"cmd": "show", "bounds": [1, 2, 3, 4]}) == [
+            1,
+            2,
+            3,
+            4,
+        ]
 
     def test_take_lines_splits_every_complete_line_of_one_chunk(self):
         """A `stop` behind another command in the same write must arrive too."""
