@@ -300,3 +300,63 @@ def test_the_claim_boundary_claims_alike(utterance, expected, monkeypatch):
     monkeypatch.setattr(yd, "_open_session", Mock())
     monkeypatch.setattr(yd, "_last_bounds", None)
     assert yd.handle(utterance, core) is expected
+
+
+@pytest.mark.parametrize(
+    ["screen", "remembered", "expected_bounds"],
+    [
+        # The remembered cell still fits: both backends redraw it verbatim.
+        ((900, 600), (100, 200, 300, 400), (100, 200, 300, 400)),
+        # The geometry changed between sessions: a clipped rectangle must not
+        # survive on either backend — both reopen the whole output. This is
+        # the PR's headline claim (one utterance, one pixel) holding on the
+        # reopen path, not only on a fresh open.
+        ((900, 600), (500, 400, 700, 500), (0, 0, 900, 600)),
+    ],
+)
+def test_again_reopens_at_one_rectangle_per_utterance(
+    screen, remembered, expected_bounds, monkeypatch
+):
+    """The "again" path must land on the same rectangle on whichever backend
+    answers: a remembered cell that no longer fits the fresh geometry reopens
+    as the full output on both, and a cell that still fits reopens verbatim
+    on both. `_ydotool._open_session` has carried the fit check from the
+    start; this row pins `_extension.handle` to the same rule."""
+    monkeypatch.setattr(ext, "last_bounds", remembered)
+    monkeypatch.setattr(ext, "get_screen_size", lambda: screen)
+    calls = []
+
+    def dbus(method, *args):
+        calls.append((method, args))
+        return True
+
+    monkeypatch.setattr(ext, "dbus_call", dbus)
+    core = Mock()
+    core.listen_modal = Mock(return_value=iter([]))
+    assert ext.handle("again", core) is True
+    # The trailing Hide is the extension's mode-exit teardown, the same tail
+    # every battery row carries.
+    assert calls == [
+        ("Show", screen),
+        ("Update", expected_bounds),
+        ("Hide", ()),
+    ]
+    assert ext.last_bounds == expected_bounds
+    assert [call.args[0] for call in core.speak.call_args_list] == ["Grid"]
+
+    monkeypatch.setattr(yd, "_active", True)
+    monkeypatch.setattr(yd, "_last_bounds", remembered)
+    # `_open_session` reads `_helper.stdout` to await the presented frame;
+    # the helper is a mock, so is the stream it reads from.
+    monkeypatch.setattr(yd, "_helper", Mock(stdout=Mock()))
+    shows = []
+    monkeypatch.setattr(yd, "_start_helper", lambda: (0, 0, *screen))
+    monkeypatch.setattr(yd, "_redraw", lambda bounds: shows.append(tuple(bounds)))
+    monkeypatch.setattr(yd, "read_until", lambda *_a, **_k: None)
+    monkeypatch.setattr(yd, "_send", lambda payload: True)
+    monkeypatch.setattr(yd, "stop_helper", lambda reason: None)
+    core = Mock()
+    core.listen_modal = Mock(return_value=iter([]))
+    assert yd.handle("again", core) is True
+    assert shows == [expected_bounds]
+    assert [call.args[0] for call in core.speak.call_args_list] == ["Grid"]

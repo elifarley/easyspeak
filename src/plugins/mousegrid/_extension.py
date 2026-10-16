@@ -401,6 +401,24 @@ def handle(cmd, core):
     # "Again" - reopen at last position
     if any(w in words for w in AGAIN_WORDS) and last_bounds:
         screen_size = get_screen_size()
+        # The remembered cell came from a previous session's geometry: a
+        # resolution change or a dock swap between sessions would draw it
+        # clipped and aim its clicks at the edge of the output. The fresh
+        # full rectangle is the only shape the containment invariant
+        # guarantees, so a cell that no longer fits reopens as one — the
+        # same rule the ydotool backend applies in `_open_session`, so the
+        # parity battery can hold both backends to one rectangle per
+        # utterance.
+        left, top, width, height = last_bounds
+        fits = (
+            left >= 0
+            and top >= 0
+            and left + width <= screen_size[0]
+            and top + height <= screen_size[1]
+        )
+        if not fits:
+            logger.info("grid: the remembered cell does not fit; reopening full")
+            last_bounds = (0, 0, screen_size[0], screen_size[1])
         if not dbus_call("Show", screen_size[0], screen_size[1]):
             report_grid_unavailable(core)
             return True
