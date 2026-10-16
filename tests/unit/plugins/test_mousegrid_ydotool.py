@@ -1630,18 +1630,54 @@ class TestModeDispatch:
 
 
 class TestClickKind:
-    def test_each_utterance_maps_to_its_flavour(self):
-        flavours = {
-            "click": "click",
-            "lick": "click",
-            "clique": "click",
-            "double click": "double",
-            "middle click": "middle",
-            "right click": "right",
-            "open firefox": None,
-        }
-        for text, want in flavours.items():
-            assert g._click_kind(text, set(text.split())) == want, text
+    """One click grammar for both backends (`_common.click_kind`).
+
+    The matrix is the contract an interim suite carried and a later rename
+    shrank to one case; every row here is a parity promise: the same
+    utterance resolves to the same flavour whichever backend serves it.
+    """
+
+    @pytest.mark.parametrize(
+        ["text", "want"],
+        [
+            # Plain click, including its mishears.
+            ("click", "click"),
+            ("clicks", "click"),
+            ("lick", "click"),
+            ("clique", "click"),
+            # Double and middle: bare flavour words count, substrings too.
+            ("double", "double"),
+            ("double click", "double"),
+            ("doubleclick", "double"),
+            ("middle", "middle"),
+            ("middle click", "middle"),
+            # Right-click needs the click word beside the direction word,
+            # mishears included: "write click" right-clicks on BOTH backends
+            # (it left-clicked under ydotool when only the extension knew the
+            # mishears).
+            ("right click", "right"),
+            ("write click", "right"),
+            ("rite click", "right"),
+            ("wright click", "right"),
+            # A bare direction word is a nudge where a backend has one and
+            # must never become a right-click where it does not: the two
+            # grammars disagreed on exactly this before the table went
+            # shared.
+            ("right", None),
+            ("write", None),
+            ("rite", None),
+            # No click anywhere.
+            ("up", None),
+            ("open firefox", None),
+        ],
+    )
+    def test_each_utterance_maps_to_its_flavour(self, text, want):
+        assert g.click_kind(text) == want, text
+
+    def test_one_shared_grammar(self):
+        """Identity, not equality: a backend that stops importing the shared
+        resolver is the failure, not a divergence to be caught later."""
+        assert g.click_kind is _extension.click_kind
 
 
 class TestRedraw:

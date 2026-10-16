@@ -43,6 +43,7 @@ from ._common import (
     GRID_TRIGGERS,
     SHOW_BLOCK_WORDS,
     center,
+    click_kind,
     parse_number_sequence,
     subdivide,
 )
@@ -872,13 +873,6 @@ def handle(cmd, core):
     return None
 
 
-CLICK_VERBS = {
-    "double": "double",
-    "middle": "middle",
-    "right": "right",
-}
-
-
 def _redraw(bounds):
     """Tell the helper to redraw the numbered grid over these bounds."""
     _send({"cmd": "show", "bounds": list(bounds)})
@@ -932,7 +926,7 @@ def _run_mode(core):
             core.speak(_("Grid closed"))
             return
 
-        kind = _click_kind(text, words)
+        kind = click_kind(text)
         if kind:
             _fire_click(kind, core)
             return
@@ -942,16 +936,6 @@ def _run_mode(core):
             for zone in zones:
                 _bounds = subdivide(_bounds, zone)
             _redraw(_bounds)
-
-
-def _click_kind(_text, words):
-    """Return the click flavour named by an utterance, or None."""
-    for marker, kind in CLICK_VERBS.items():
-        if marker in words:
-            return kind
-    if "click" in words or "lick" in words or "clique" in words:
-        return "click"
-    return None
 
 
 def _fire_click(kind, core):

@@ -101,6 +101,38 @@ AGAIN_WORDS = {"again", "repeat", "reopen"}
 # OPEN the grid.
 SHOW_BLOCK_WORDS = {"close", "hide"}
 
+# Click grammar: which words name which click flavour. The right-click
+# mishears are the extension backend's tuned vocabulary and the plain-click
+# ones are the ydotool backend's; under one feature they are one set.
+CLICK_WORDS = ("click", "lick", "clique")
+RIGHT_WORDS = ("right", "write", "rite", "wright")
+
+
+def click_kind(text):
+    """Return the click flavour an utterance names, or None.
+
+    Precedence follows the extension backend's original loop (double, middle,
+    right, click), and the words match as substrings so "doubleclick" and
+    "clicks" resolve too.
+
+    A flavour needs the click word itself attached: bare "right" is a
+    direction (a nudge on the backend that has one), never a right-click.
+    When each backend owned its grammar, that bare form right-clicked under
+    ydotool and nudged under the extension — one utterance, two actions —
+    which is exactly the divergence this shared resolver exists to make
+    impossible.
+    """
+    has_click = any(word in text for word in CLICK_WORDS)
+    if "double" in text:
+        return "double"
+    if "middle" in text:
+        return "middle"
+    if has_click and any(word in text for word in RIGHT_WORDS):
+        return "right"
+    if has_click:
+        return "click"
+    return None
+
 
 def subdivide(bounds, zone):
     """Return the ninth of `bounds` named by `zone` (1-9, row-major).

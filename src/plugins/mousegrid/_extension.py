@@ -29,6 +29,7 @@ from ._common import (
     WORD_TO_NUM,
     ZONE_MAP,
     center,
+    click_kind,
     parse_number_sequence,
     subdivide,
 )
@@ -54,6 +55,16 @@ DIRECTIONS = {
 }
 
 KIND = "gnome"
+
+# The spoken confirmation per click flavour, keyed by `_common.click_kind`'s
+# answer. "Holding" stays in the drag branch: grid mode keeps listening and
+# a reply containing "mark" would start a second drag.
+CLICK_REPLIES = {
+    "double": "Double clicked",
+    "middle": "Middle clicked",
+    "right": "Right clicked",
+    "click": "Clicked",
+}
 
 
 # This backend drives the GNOME Shell extension over D-Bus (see dbus_call);
@@ -505,30 +516,18 @@ def _run_grid_mode(core):
             continue
 
         # === Clicks ===
-        has_click = "click" in cmd_lower
-
-        if "double" in cmd_lower:
-            do_click("double")
-            core.speak(_("Double clicked"))
-            return
-        if "middle" in cmd_lower:
-            do_click("middle")
-            core.speak(_("Middle clicked"))
-            return
-        if has_click and any(
-            w in cmd_lower for w in ["right", "write", "rite", "wright"]
-        ):
-            do_click("right")
-            core.speak(_("Right clicked"))
-            return
-        if has_click:
-            do_click("click")
-            core.speak(_("Clicked"))
+        # `_common.click_kind` resolves the flavour for both backends; an
+        # utterance that names no click word falls through to the nudge
+        # below, where bare direction words belong.
+        kind = click_kind(cmd_lower)
+        if kind:
+            do_click(kind)
+            core.speak(_(CLICK_REPLIES[kind]))
             return
 
         # === Nudge ===
         direction = parse_direction(cmd_lower)
-        if direction and not has_click:
+        if direction:
             nudge_grid(direction, parse_count(cmd_lower))
             continue
 
