@@ -444,11 +444,18 @@ def double_click():
 
     Each click is one invocation, as on 0.1.8: the pair must stay inside the
     desktop's double-click window, and `--delay 0` — or 1.0.x's argv, which has
-    no delay to spend — is what keeps it there.
+    no delay to spend — is what keeps it there. The pair carries the worst
+    outcome by rank — `errored` if either half refused, `ran` only when both
+    ran — so a refused double speaks the definite line, as a refused single
+    already does.
     """
     first = click("click")
     second = click("click")
-    return "ran" if first == second == "ran" else "unknown"
+    if "errored" in (first, second):
+        return "errored"
+    if first == second == "ran":
+        return "ran"
+    return "unknown"
 
 
 GRID_PYTHON_CANDIDATES = ("python3", "/usr/bin/python3", "/usr/bin/python")
@@ -958,6 +965,13 @@ def _run_mode(core):
             for zone in zones:
                 _bounds = subdivide(_bounds, zone)
             _redraw(_bounds)
+            continue
+
+        # Extension-only verbs (nudge, scroll, mark/drag) reach here on this
+        # backend and are named instead of silently swallowed: a user who says
+        # "scroll down" must be able to learn where the boundary is.
+        if any(word in text for word in ("nudge", "scroll", "mark", "drag")):
+            core.speak(_("That needs the GNOME extension."))
 
 
 def _fire_click(kind, core):

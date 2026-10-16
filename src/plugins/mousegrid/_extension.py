@@ -525,7 +525,7 @@ def _run_grid_mode(core):
         kind = click_kind(cmd_lower)
         if kind:
             do_click(kind)
-            core.speak(_(CLICK_REPLIES[kind]))
+            core.speak(CLICK_REPLIES[kind])
             return
 
         # === Nudge ===

@@ -62,6 +62,9 @@ msgstr "Clic derecho"
 msgid "Scrolled"
 msgstr "Desplazado"
 
+msgid "That needs the GNOME extension."
+msgstr "Eso necesita la extensión de GNOME."
+
 msgid "The mouse grid needs either the GNOME extension or ydotool."
 msgstr "La cuadrícula del ratón necesita la extensión de GNOME o ydotool."
 

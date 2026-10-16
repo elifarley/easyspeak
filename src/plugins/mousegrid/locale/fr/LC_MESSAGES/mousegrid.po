@@ -62,6 +62,9 @@ msgstr "Clic droit"
 msgid "Scrolled"
 msgstr "Défilé"
 
+msgid "That needs the GNOME extension."
+msgstr "Cela nécessite l'extension GNOME."
+
 msgid "The mouse grid needs either the GNOME extension or ydotool."
 msgstr "La grille de souris nécessite l'extension GNOME ou ydotool."
 

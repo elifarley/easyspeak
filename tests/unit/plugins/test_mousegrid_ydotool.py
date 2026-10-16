@@ -948,21 +948,27 @@ class TestAdapterArgv:
 
     def test_double_click_aggregates_the_two_outcomes(self, monkeypatch):
         """protects: the pair is one gesture, so `double_click` reports `ran`
-        only when both clicks ran; a refused or uncertain half is never a false
-        `ran`, which `_fire_click` would read as success and stay silent on.
+        only when both clicks ran, and `errored` when either half refused —
+        a refused double must speak the definite line ("I couldn't click."),
+        as a refused single already does, not the uncertain one. An uncertain
+        half without a refusal stays `unknown`.
         fails_when: the first click's outcome is returned alone (a second click
-        that never ran reports success), or the pair always reports `ran`.
+        that never ran reports success), the pair always reports `ran`, or a
+        refused half is coarsened to `unknown`.
         no_claim: does not claim the desktop received either click, nor that
-        `errored` and `unknown` are told apart inside the pair - both collapse
-        to `unknown`, the same coarsening a refused move already gets.
+        the pointer moved.
         seam: none
         """
         outcomes = {
             ("ran", "ran"): "ran",
             ("ran", "unknown"): "unknown",
-            ("ran", "errored"): "unknown",
             ("unknown", "ran"): "unknown",
-            ("errored", "ran"): "unknown",
+            ("unknown", "unknown"): "unknown",
+            ("ran", "errored"): "errored",
+            ("errored", "ran"): "errored",
+            ("unknown", "errored"): "errored",
+            ("errored", "unknown"): "errored",
+            ("errored", "errored"): "errored",
         }
         for pair, want in outcomes.items():
             answers = iter(pair)
@@ -1527,6 +1533,28 @@ class TestRouting:
         )
         assert g.handle("again", core) is None
 
+    def test_extension_only_verbs_are_named_not_swallowed(self, monkeypatch, core):
+        """protects: "scroll down" and friends match nothing this backend can
+        do; the mode names the boundary out loud instead of leaving the user
+        to retry a verb the desktop will never honour.
+        fails_when: the utterance is answered with silence, a click, or an
+        end of the mode.
+        no_claim: does not claim the grid closes — the mode keeps listening.
+        seam: none
+        """
+        monkeypatch.setattr(g, "_active", True)
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        core.listen_modal = Mock(return_value=iter(["scroll down", "close"]))
+
+        g._run_mode(core)
+
+        # "scroll down" is named; the grid stays up for the "close" that ends
+        # the mode — the boundary is announced, the session is not punished.
+        spoken = [call.args[0] for call in core.speak.call_args_list]
+        assert spoken[0] == "That needs the GNOME extension."
+        assert spoken[-1] == "Grid closed"
+        g._dismiss.assert_called_once()
+
     def test_unknown_input_passes_to_the_next_plugin(self, monkeypatch, core):
         monkeypatch.setattr(g, "_active", True)
         assert g.handle("open firefox", core) is None
@@ -1708,16 +1736,17 @@ class TestModeDispatch:
         g._run_mode(core)
         assert seen == [("move", 450, 300), ("double_click",), ("dismiss",)]
 
-    def test_a_double_click_with_a_failed_half_speaks_the_uncertain_line(
+    def test_a_double_click_with_a_failed_half_speaks_the_definite_line(
         self, monkeypatch, core
     ):
-        """protects: a "double click" whose second click did not run still ends
-        the mode with the uncertain line, through the real aggregation - silence
-        would leave the user guessing whether the gesture landed, and the
-        definite failure line would claim a refusal that only half happened.
+        """protects: a "double click" whose second click was refused ends the
+        mode with the definite failure line, through the real aggregation —
+        the pair carries the worst outcome by rank, so a refused gesture is
+        never spoken as "not sure" while a refused single click speaks
+        "I couldn't click."
         fails_when: `_fire_click` reads a partial `double_click` outcome as
-        success (no speech at all) or swaps in the move's outcome instead of
-        the pair's.
+        success (no speech at all), swaps in the move's outcome instead of
+        the pair's, or coarsens the refused pair back to the uncertain line.
         no_claim: does not claim where the pointer sat after the first click,
         nor what the desktop received.
         seam: none
@@ -1733,10 +1762,7 @@ class TestModeDispatch:
         core.listen_modal = Mock(return_value=iter(["double click"]))
         g._run_mode(core)
         g._dismiss.assert_called_once()
-        assert (
-            core.speak.call_args_list[-1].args[0]
-            == "I tried, but I'm not sure it worked."
-        )
+        assert core.speak.call_args_list[-1].args[0] == "I couldn't click."
 
     def test_click_without_bounds_does_nothing(self, monkeypatch, core):
         monkeypatch.setattr(g, "move_to", Mock())
