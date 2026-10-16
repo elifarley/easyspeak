@@ -124,6 +124,7 @@ def _fresh_client_state(monkeypatch):
     monkeypatch.setattr(g, "injector_socket", lambda *a, **k: None)
     monkeypatch.setattr(g, "_socket_last_good", None)
     monkeypatch.setattr(g, "_socket_last_good_env", None)
+    monkeypatch.setattr(g, "_socket_search_failed", None)
 
 
 class TestZoneMath:
@@ -591,6 +592,100 @@ class TestSocketDiscovery:
             g, "_socket_accepts", lambda path, timeout=g.PROBE_TIMEOUT: False
         )
         assert g.injector_socket() is None
+
+    def test_a_failed_rediscovery_is_shared_within_the_cooldown(self, monkeypatch):
+        """protects: the per-injection callers ask up to four times per click
+        utterance (the move's delay args and client env, then the click's);
+        each must share one failed fan-out instead of repeating the full walk
+        — a stale socket that accepts but never serves would otherwise cost
+        the per-use bound per candidate per call, ~2 s of silent voice-thread
+        stall between a move and its click.
+        fails_when: every call re-walks the candidates after a failure, or
+        the window never closes (a daemon that starts later would never be
+        found).
+        no_claim: does not claim how long a real connect takes; the clock and
+        every probe answer are stubbed.
+        seam: time.monotonic is pinned; `_socket_accepts` counts its asks.
+        """
+        monkeypatch.setattr(g, "injector_socket", _real_injector_socket)
+        monkeypatch.setattr(g, "ydotool_socket_candidates", lambda: ["/dead"])
+        monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
+        now = 1000.0
+        monkeypatch.setattr(g.time, "monotonic", lambda: now)
+        asked = []
+        monkeypatch.setattr(
+            g,
+            "_socket_accepts",
+            lambda path, timeout=g.PROBE_TIMEOUT: asked.append(path) or False,
+        )
+        assert g.injector_socket() is None
+        assert asked == ["/dead"]  # the walk ran once
+        now += g.REDISCOVERY_COOLDOWN / 2
+        assert g.injector_socket() is None
+        assert asked == ["/dead"]  # inside the window: the answer is shared
+        now += g.REDISCOVERY_COOLDOWN
+        assert g.injector_socket() is None
+        assert asked == ["/dead", "/dead"]  # the window closed: walk again
+
+    def test_a_changed_environment_always_walks_again(self, monkeypatch):
+        """protects: the failed-discovery memory is keyed by the resolution
+        environment, so a moved `YDOTOOL_SOCKET`/`XDG_RUNTIME_DIR` cannot be
+        answered "none" out of a failure recorded under the old one.
+        fails_when: the cooldown short-circuits a walk whose candidates have
+        changed since the failure.
+        no_claim: does not claim where a real daemon binds; every probe
+        answer is stubbed.
+        seam: time.monotonic is pinned; `_socket_accepts` counts its asks.
+        """
+        monkeypatch.setattr(g, "injector_socket", _real_injector_socket)
+        monkeypatch.setattr(g, "ydotool_socket_candidates", lambda: ["/dead"])
+        monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
+        now = 1000.0
+        monkeypatch.setattr(g.time, "monotonic", lambda: now)
+        asked = []
+        monkeypatch.setattr(
+            g,
+            "_socket_accepts",
+            lambda path, timeout=g.PROBE_TIMEOUT: asked.append(path) or False,
+        )
+        assert g.injector_socket() is None
+        assert asked == ["/dead"]
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/elsewhere")
+        assert g.injector_socket() is None
+        # The candidate list is stubbed to the same path, but the environment
+        # key changed, so the walk reruns instead of trusting the memory.
+        assert asked == ["/dead", "/dead"]
+
+    def test_an_answer_clears_the_failed_rediscovery_memory(self, monkeypatch):
+        """protects: once a socket answers, the "none" memory must be gone —
+        a failure recorded before the daemon appeared must not outlive the
+        daemon it was recorded about.
+        fails_when: the success path leaves `_socket_search_failed` set, so
+        the memory claims "no daemon" about a resolver that just found one.
+        no_claim: does not claim the same socket keeps answering; each call's
+        probe answer is stubbed separately.
+        seam: time.monotonic is pinned; `_socket_accepts` answers from a
+        script.
+        """
+        monkeypatch.setattr(g, "injector_socket", _real_injector_socket)
+        monkeypatch.setattr(g, "ydotool_socket_candidates", lambda: ["/dead"])
+        monkeypatch.setattr(g, "_socket_owned", lambda _path: True)
+        now = 1000.0
+        monkeypatch.setattr(g.time, "monotonic", lambda: now)
+        asked = []
+        monkeypatch.setattr(
+            g,
+            "_socket_accepts",
+            lambda path, timeout=g.PROBE_TIMEOUT: asked.append(path) or False,
+        )
+        assert g.injector_socket() is None  # the walk fails; memory set
+        assert g._socket_search_failed is not None
+        now += g.REDISCOVERY_COOLDOWN
+        monkeypatch.setattr(
+            g, "_socket_accepts", lambda path, timeout=g.PROBE_TIMEOUT: True
+        )
+        assert g.injector_socket() == "/dead"  # window closed: the walk runs
+        assert g._socket_search_failed is None  # ...and the memory is gone
 
 
 class TestClientEnv:

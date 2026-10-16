@@ -231,6 +231,17 @@ def _socket_owned(path):
 # candidate is probed before any still-alive default.
 _socket_last_good = None
 _socket_last_good_env = None
+# A full fan-out that answered nothing is remembered this long, keyed by the
+# resolution environment it failed under: one click utterance calls
+# `injector_socket` up to four times (the move's delay args and client env,
+# then the click's), and a stale socket that accepts but never serves would
+# otherwise tax every one of those calls with the full walk — the per-use
+# bound per candidate, ~2 s of silent voice-thread stall between a move and
+# its click. Within the window the answer "none" is shared; past it the walk
+# runs again, so a daemon that starts (or moves) is found on the next
+# utterance without help.
+REDISCOVERY_COOLDOWN = 1.0
+_socket_search_failed = None
 
 
 def _socket_env_key():
@@ -253,9 +264,13 @@ def injector_socket(timeout=PROBE_TIMEOUT):
     `timeout` bounds each connect. The per-injection callers pass the short
     per-use bound: a daemon that is alive but wedged answers no connect, and
     the voice thread must not sit through the startup bound between a move and
-    its click.
+    its click. A full walk that answered nothing is remembered for
+    `REDISCOVERY_COOLDOWN` — per environment, so a changed
+    `YDOTOOL_SOCKET`/`XDG_RUNTIME_DIR` always forces a fresh walk — and the
+    per-injection calls inside that window share the one failed walk instead
+    of repeating it.
     """
-    global _socket_last_good, _socket_last_good_env
+    global _socket_last_good, _socket_last_good_env, _socket_search_failed
     candidates = ydotool_socket_candidates()
     env_key = _socket_env_key()
     if (
@@ -268,11 +283,23 @@ def injector_socket(timeout=PROBE_TIMEOUT):
         ):
             return _socket_last_good
         _socket_last_good = None
+    elif (
+        _socket_search_failed is not None
+        and _socket_search_failed[0] == env_key
+        and time.monotonic() - _socket_search_failed[1] < REDISCOVERY_COOLDOWN
+    ):
+        # No path answered inside the window and the environment has not
+        # changed since: repeating the walk would spend the per-use bound per
+        # candidate to re-learn "none". The startup probe never lands here —
+        # its first call finds no failure to remember.
+        return None
     for candidate in candidates:
         if _socket_owned(candidate) and _socket_accepts(candidate, timeout):
             _socket_last_good = candidate
             _socket_last_good_env = env_key
+            _socket_search_failed = None
             return candidate
+    _socket_search_failed = (env_key, time.monotonic())
     return None
 
 
