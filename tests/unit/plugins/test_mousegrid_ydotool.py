@@ -2115,9 +2115,7 @@ class TestHelperLifecycle:
             g._("Grid closed"),
         ]
 
-    def test_a_speech_failure_after_the_draw_still_closes(
-        self, core, fake_helper
-    ):
+    def test_a_speech_failure_after_the_draw_still_closes(self, core, fake_helper):
         """protects: the show, the `presented` read and the announcement all
         run while a live helper holds the overlay on screen; a raise in that
         stretch — a TTS backend blowing up inside `core.speak` — must tear the
