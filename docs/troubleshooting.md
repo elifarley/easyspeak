@@ -134,6 +134,25 @@ builds ([pop-os/cosmic-comp#2289](https://github.com/pop-os/cosmic-comp/issues/2
 [#2738](https://github.com/pop-os/cosmic-comp/issues/2738)); re-check after a
 session restart.
 
+From the CLI — headless machines, or any setup where the settings GUI is out
+of reach — write the profile cosmic-comp actually reads, then restart the
+session:
+
+```text
+~/.config/cosmic/com.system76.CosmicComp/v1/input_default
+(
+    state: Enabled,
+    acceleration: Some((profile: Some(Flat), speed: 0.0)),
+)
+```
+
+Two traps, both verified on Pop!_OS 24.04: the struct field is `acceleration` —
+naming it after the type (`AccelConfig: (…)`) parses without error and silently
+applies nothing, because unknown fields are dropped, not rejected; and even a
+correct file only takes effect after a session restart. Cosmic config values
+that are options are written as explicit `Some(...)`, matching the other files
+in that directory.
+
 ## Dictation not working
 
 EasySpeak enables the GNOME accessibility bridge on first run; log out and back
