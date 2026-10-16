@@ -52,6 +52,23 @@ COMMANDS = [
     _("close/cancel - hide grid"),
 ]
 
+# The verbs the ydotool backend cannot honour (nudge, scroll, mark/drag)
+# stay out of the help surface it serves. Core reads `COMMANDS` at help
+# time, so `setup()` rebinds it to the list matching the gate's selection;
+# the import-time default is the full list, under the same contract as
+# `_backend` below (importing without running `setup()` behaves exactly
+# like the original single-backend plugin).
+COMMANDS_YDOTOOL = [
+    _("grid/mouse/pointer - show mouse grid"),
+    _("1-9 or chains like '3 7 5' - zoom to zone(s)"),
+    _("click - left click"),
+    _("right click / double click / middle click"),
+    _("again - reopen grid at last position"),
+    _("close/cancel - hide grid"),
+]
+
+_COMMANDS_FULL = COMMANDS
+
 # The backend serving the conversation. Defaults to the extension backend so
 # that importing the module without running `setup()` (as older tests and any
 # direct consumer do) behaves exactly like the original single-backend plugin.
@@ -68,7 +85,7 @@ def setup(core):
     (`setup(core=None)`); the loader itself calls it positionally.
     """
     _extension.setup(core)
-    global _backend
+    global _backend, COMMANDS
     forced = os.environ.get("EASYSPEAK_GRID_BACKEND")
     if forced == "uinput":
         _backend = _ydotool
@@ -86,6 +103,10 @@ def setup(core):
             )
         _backend = _ydotool if _ydotool.resolve_active() else _extension
     logger.info("grid backend: %s", _backend.KIND)
+    # The help surface matches the backend that will answer: a ydotool
+    # desktop is not advertised the verbs that answer "That needs the GNOME
+    # extension." there.
+    COMMANDS = COMMANDS_YDOTOOL if _backend is _ydotool else _COMMANDS_FULL
 
 
 def handle(cmd, core):

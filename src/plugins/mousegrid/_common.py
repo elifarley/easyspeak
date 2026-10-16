@@ -107,6 +107,18 @@ SHOW_BLOCK_WORDS = {"close", "hide"}
 CLICK_WORDS = ("click", "lick", "clique")
 RIGHT_WORDS = ("right", "write", "rite", "wright")
 
+# Verbs only the extension backend can honour (ydotool has no wheel verb and
+# no press-and-hold): the ydotool mode names them instead of swallowing
+# them. The split mirrors the extension loop's own precedence — mark, drag
+# and scroll are checked BEFORE the click words, nudge AFTER — so a compound
+# utterance ("scroll click", "scroll down 3") classifies as the verb on
+# both backends instead of clicking or zooming on one and scrolling on the
+# other. Precedence is part of the phrase surface, which is why the words
+# sit here with the rest of the grammar and not inline at the branch that
+# checks them.
+EXTENSION_ONLY_WORDS_BEFORE_CLICKS = ("mark", "drag", "scroll")
+EXTENSION_ONLY_WORDS_AFTER_CLICKS = ("nudge",)
+
 
 def dismiss_match(text):
     """True when an utterance names a dismissal, inside an open grid session.

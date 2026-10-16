@@ -1088,6 +1088,27 @@ class TestGate:
         assert g.active() is False
         assert mousegrid._backend is _extension
 
+    def test_the_help_surface_matches_the_selected_backend(self, monkeypatch, core):
+        """protects: a ydotool desktop's help must not advertise the verbs
+        its backend refuses — core reads plugin.COMMANDS at help time, so
+        setup() rebinds it to the gate's selection.
+        fails_when: the scroll/nudge/mark rows survive a uinput selection,
+        or a gnome selection loses them.
+        seam: none
+        """
+        monkeypatch.setattr(mousegrid, "_backend", mousegrid._extension)
+        monkeypatch.setattr(mousegrid, "COMMANDS", mousegrid._COMMANDS_FULL)
+        monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "uinput")
+        mousegrid.setup(core)
+        advertised = " ".join(mousegrid.COMMANDS)
+        assert "scroll" not in advertised
+        assert "nudge" not in advertised
+        assert "mark" not in advertised
+        assert "click" in advertised
+        monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "gnome")
+        mousegrid.setup(core)
+        assert mousegrid.COMMANDS is mousegrid._COMMANDS_FULL
+
     def test_needs_both_halves(self, monkeypatch, core):
         monkeypatch.delenv("EASYSPEAK_GRID_BACKEND", raising=False)
         monkeypatch.setattr(g, "_probe_overlay", lambda: True)
@@ -1541,6 +1562,81 @@ class TestRouting:
         spoken = [call.args[0] for call in core.speak.call_args_list]
         assert spoken[0] == "That needs the GNOME extension."
         assert spoken[-1] == "Grid closed"
+        g._dismiss.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ["utterance"],
+        [
+            ["scroll down 3"],
+            ["mark 3"],
+        ],
+    )
+    def test_a_count_after_an_extension_only_verb_is_not_a_zoom(
+        self, monkeypatch, core, utterance
+    ):
+        """protects: the count suffix the COMMANDS help advertises must not
+        turn a refused verb into grid navigation. The extension loop honours
+        scroll and mark BEFORE the zone numbers, so this backend names the
+        boundary before its zones parse runs, too.
+        fails_when: the zones branch consumes the digit and subdivides.
+        seam: none
+        """
+        monkeypatch.setattr(g, "_active", True)
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        redraw = Mock()
+        monkeypatch.setattr(g, "_redraw", redraw)
+        monkeypatch.setattr(g, "_bounds", (0, 0, 900, 600))
+        core.listen_modal = Mock(return_value=iter([utterance, "close"]))
+
+        g._run_mode(core)
+
+        redraw.assert_not_called()
+        assert g._bounds == (0, 0, 900, 600)
+        assert core.speak.call_args_list[0].args[0] == (
+            "That needs the GNOME extension."
+        )
+
+    def test_a_verb_word_before_a_click_word_is_never_a_click(self, monkeypatch, core):
+        """protects: "scroll click" must not fire a real click on this
+        backend — the extension reads it as a scroll attempt, and a click
+        presses whatever sits under the aimed cell.
+        fails_when: click_kind claims the utterance before the verb check.
+        seam: none
+        """
+        monkeypatch.setattr(g, "_active", True)
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        monkeypatch.setattr(g, "move_to", Mock())
+        monkeypatch.setattr(g, "click", Mock())
+        core.listen_modal = Mock(return_value=iter(["scroll click", "close"]))
+
+        g._run_mode(core)
+
+        g.move_to.assert_not_called()
+        g.click.assert_not_called()
+        assert core.speak.call_args_list[0].args[0] == (
+            "That needs the GNOME extension."
+        )
+
+    def test_a_click_word_with_nudge_still_clicks(self, monkeypatch, core):
+        """protects: the extension honours nudge AFTER the click words, so
+        this backend must not let it swallow a click utterance either —
+        "click nudge" clicks on both.
+        fails_when: the extension-only check runs before click_kind (the
+        blind hoist of all four verb words would introduce exactly that
+        divergence).
+        seam: none
+        """
+        monkeypatch.setattr(g, "_active", True)
+        monkeypatch.setattr(g, "_dismiss", Mock())
+        monkeypatch.setattr(g, "_bounds", (0, 0, 900, 600))
+        monkeypatch.setattr(g, "move_to", Mock(return_value="ran"))
+        click = Mock(return_value="ran")
+        monkeypatch.setattr(g, "click", click)
+        core.listen_modal = Mock(return_value=iter(["click nudge"]))
+
+        g._run_mode(core)
+
+        click.assert_called_once_with("click")
         g._dismiss.assert_called_once()
 
     def test_unknown_input_passes_to_the_next_plugin(self, monkeypatch, core):
@@ -2141,7 +2237,7 @@ class TestHelperLifecycle:
         flight through the mode's finally (or print a traceback at atexit).
         fails_when: stop_helper lets the second wait's TimeoutExpired escape.
         no_claim: does not claim the kernel reaps a D-state helper, only that
-        the reaping is left to init.
+        the corpse is left for this process to reap at exit.
         seam: none
         """
         import subprocess

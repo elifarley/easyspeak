@@ -39,6 +39,8 @@ from easyspeak.core.i18n import translator
 from . import _overlay
 from ._common import (
     AGAIN_WORDS,
+    EXTENSION_ONLY_WORDS_AFTER_CLICKS,
+    EXTENSION_ONLY_WORDS_BEFORE_CLICKS,
     GRID_TRIGGERS,
     SHOW_BLOCK_WORDS,
     center,
@@ -949,10 +951,26 @@ def _run_mode(core):
             core.speak(_("Grid closed"))
             return
 
+        # Extension-only verbs are named instead of silently swallowed: a
+        # user who says "scroll down" must be able to learn where the
+        # boundary is. Each group is checked where the extension loop would
+        # have honoured it (`_extension._run_grid_mode`: mark, drag, scroll
+        # BEFORE the click words, nudge AFTER), not at this loop's tail — a
+        # compound utterance like "scroll down 3" or "scroll click" must
+        # classify as the verb, the extension's answer, rather than as a
+        # zone zoom or a real click.
+        if any(word in text for word in EXTENSION_ONLY_WORDS_BEFORE_CLICKS):
+            core.speak(_("That needs the GNOME extension."))
+            continue
+
         kind = click_kind(text)
         if kind:
             _fire_click(kind, core)
             return
+
+        if any(word in text for word in EXTENSION_ONLY_WORDS_AFTER_CLICKS):
+            core.speak(_("That needs the GNOME extension."))
+            continue
 
         zones = parse_number_sequence(text)
         if zones and _bounds:
@@ -960,12 +978,6 @@ def _run_mode(core):
                 _bounds = subdivide(_bounds, zone)
             _redraw(_bounds)
             continue
-
-        # Extension-only verbs (nudge, scroll, mark/drag) reach here on this
-        # backend and are named instead of silently swallowed: a user who says
-        # "scroll down" must be able to learn where the boundary is.
-        if any(word in text for word in ("nudge", "scroll", "mark", "drag")):
-            core.speak(_("That needs the GNOME extension."))
 
 
 def _fire_click(kind, core):
@@ -1160,9 +1172,14 @@ def stop_helper(reason):
             # a while. Raising here would replace whatever was in flight
             # through the mode's finally, and print a traceback at atexit —
             # the one teardown path whose purpose is "cannot freeze" must not
-            # be the one that can raise. Init reaps the corpse.
+            # be the one that can raise. The corpse stays a zombie of THIS
+            # process until the daemon exits — init reaps orphans only, and
+            # the daemon is the parent — so one zombie PID per occurrence is
+            # the accepted price of teardown that can neither freeze nor
+            # raise.
             logger.warning(
-                "grid: helper survived SIGKILL (%s); leaving it to init", reason
+                "grid: helper survived SIGKILL (%s); zombie until daemon exit",
+                reason,
             )
 
 
