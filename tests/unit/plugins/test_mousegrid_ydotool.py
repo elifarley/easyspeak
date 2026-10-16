@@ -205,6 +205,14 @@ class TestParityWithExtension:
     def test_parser_is_the_shared_implementation(self):
         assert g.parse_number_sequence is _extension.parse_number_sequence
 
+    def test_non_decimal_digit_characters_do_not_crash_the_parser(self):
+        """`str.isdigit()` answers True for superscripts, but `int("²")`
+        raises: one transcribed "zone ²" would kill the mode loop. Decimal
+        characters parse, everything non-decimal is simply not a zone."""
+        assert g.parse_number_sequence("zone ²") == []
+        assert g.parse_number_sequence("3 ² 5") == [3, 5]
+        assert g.parse_number_sequence("٣") == [3]  # Arabic-Indic three: a real decimal
+
     @pytest.mark.parametrize(
         ["text", "want"],
         [

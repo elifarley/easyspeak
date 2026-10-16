@@ -183,4 +183,8 @@ def parse_number_sequence(text):
     token).
     """
     lowered = _NUM_RE.sub(lambda m: str(WORD_TO_NUM[m[0]]), text.lower())
-    return [int(char) for char in lowered if char.isdigit() and char != "0"]
+    # `isdecimal`, not `isdigit`: `isdigit()` also answers True for
+    # superscripts and other non-decimal digit characters, and `int("²")`
+    # raises - one transcribed "zone ²" would crash the mode loop. Decimal
+    # characters are exactly the ones `int()` accepts per character.
+    return [int(char) for char in lowered if char.isdecimal() and char != "0"]
