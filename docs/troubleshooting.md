@@ -88,9 +88,10 @@ installed from the client itself:
   without one — the log says why, and `mousegrid` keeps the words rather than
   promising a grid that cannot click.
 
-Not every distro ships a `ydotoold` binary with the client (Ubuntu 25.10's
-`ydotool` package is CLI-only and the daemon is a separate package; 26.04 ships
-the daemon in the same package). If your distro has the daemon but no user unit,
+Not every distro ships a `ydotoold` binary with the client (Ubuntu 24.04 and
+25.10's `ydotool` package is CLI-only and the daemon is a separate `ydotoold`
+package; 26.04 ships the daemon in the same package). If your distro has the
+daemon but no user unit,
 `systemctl --user enable --now ydotoold` answering "Unit ydotoold.service not
 found" means installing this as `~/.config/systemd/user/ydotoold.service`:
 
@@ -119,6 +120,19 @@ daemon answers, the daemon logs `grid backend inert` at startup with the reason,
 says nothing out loud, and `mousegrid` keeps the words. On 0.1.8 a missing
 `ydotoold` alone does not: the log names the per-invocation mode and the grid
 still answers.
+
+## Mouse grid: clicks land in the wrong place
+
+Injected motion passes through the desktop's pointer-acceleration curve, so a
+click lands where the grid says only when that curve is flat. With the default
+profile (adaptive), the cursor travels roughly twice the aimed distance —
+measured on Pop!_OS 24.04's COSMIC for both ydotool dialects, with and without
+`ydotoold`, at the output's default scale. Set the pointer acceleration
+profile to **Flat** in your desktop's settings and the clicks land inside the
+aimed cell. Switching the profile does not always apply on current cosmic-comp
+builds ([pop-os/cosmic-comp#2289](https://github.com/pop-os/cosmic-comp/issues/2289),
+[#2738](https://github.com/pop-os/cosmic-comp/issues/2738)); re-check after a
+session restart.
 
 ## Dictation not working
 
