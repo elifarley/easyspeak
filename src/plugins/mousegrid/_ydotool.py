@@ -799,15 +799,14 @@ def _open_session(core, bounds=None):
     """Open the overlay, take its geometry, and drive the mode until it ends.
 
     `bounds` is the cell to reopen at (the "again" path) and defaults to the
-    whole output. Returns the mode's exit reason for the unit tests to assert
-    on; the caller never reads it, because this function already speaks on
-    every failure path itself.
+    whole output. Every outcome is spoken here, so the caller needs nothing
+    back from this function.
     """
     global _monitor_origin, _bounds
     geometry = _start_helper()
     if geometry is None:
         core.speak(_("I couldn't show the grid."))
-        return None
+        return
     _monitor_origin = (geometry[0], geometry[1])
     if bounds:
         left, top, width, height = bounds
@@ -847,7 +846,7 @@ def _open_session(core, bounds=None):
         logger.warning("grid: helper refused the show: %s", announcement.get("message"))
         stop_helper("show refused")
         core.speak(_("I couldn't show the grid."))
-        return None
+        return
     elif announcement and announcement.get("event") == "_eof":
         logger.warning("grid: the helper exited right after ready")
     else:
@@ -857,7 +856,6 @@ def _open_session(core, bounds=None):
         _run_mode(core)
     finally:
         _close_session()
-    return "done"
 
 
 def handle(cmd, core):

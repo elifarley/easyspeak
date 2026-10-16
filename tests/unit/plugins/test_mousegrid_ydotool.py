@@ -170,36 +170,24 @@ class TestContainmentInvariant:
 class TestParityWithExtension:
     """One phrase surface, two backends: both must land on the same pixel.
 
-    Driven through the extension backend's own `update_grid` path. Since the
-    consolidation, that path delegates to the same `_common.subdivide` this
-    class compares against — the run is a regression net, not an independent
-    oracle, and its on-screen starts and valid zones never fire the
-    wrapper's clamp or zone guard: what the 729 sequences pin is the happy
-    path. The clamp and the guard have their own rows in test_mousegrid.py's
-    update_grid tests.
+    Parity is structural since the consolidation: both backends serve one
+    `_common`, so a divergence is an ImportError away from being impossible.
+    What a test can still pin is the identity — that neither backend grew a
+    private copy back — and the row-level behaviour of the shared pieces
+    lives in TestZoneMath above and in test_mousegrid.py's update_grid,
+    parse and exit rows.
     """
 
-    @staticmethod
-    def _extension_bounds(sequence, monitor, monkeypatch):
-        monkeypatch.setattr(_extension, "dbus_call", lambda *args: True)
-        monkeypatch.setattr(_extension, "screen_size", monitor)
-        monkeypatch.setattr(_extension, "grid_active", True)
-        monkeypatch.setattr(_extension, "grid_bounds", (0, 0, monitor[0], monitor[1]))
-        for zone in sequence:
-            _extension.update_grid(zone)
-        return _extension.grid_bounds
-
-    def test_all_sequences_agree(self, monkeypatch):
-        monitor = (1920, 1080)
-        for a in range(1, 10):
-            for b in range(1, 10):
-                for c in range(1, 10):
-                    theirs = self._extension_bounds((a, b, c), monitor, monkeypatch)
-                    bounds = (0, 0, monitor[0], monitor[1])
-                    for zone in (a, b, c):
-                        bounds = g.subdivide(bounds, zone)
-                    assert bounds == theirs, (a, b, c)
-                    assert g.center(bounds) == _extension.get_center()
+    def test_zone_math_is_the_shared_implementation(self):
+        """All 729 three-zone sequences used to be driven through
+        `_extension.update_grid` and compared against `subdivide` — the same
+        function object on both sides, once the consolidation made
+        `update_grid` delegate to `_common`. Every disagreement was
+        structurally impossible, so the loop shrank to the identity it was
+        actually asserting; a wrong inline copy in `update_grid` is what
+        test_mousegrid.py's exact-bounds rows catch instead."""
+        assert g.subdivide is _extension.subdivide
+        assert g.center is _extension.center
 
     def test_trigger_words_are_one_shared_table(self):
         """A divergence used to be caught by comparing two maintained copies;
@@ -2015,7 +2003,7 @@ class TestHelperLifecycle:
         has to reap the helper and drop the session."""
         fake_helper(self._ready_script())
         core.listen_modal = Mock(return_value=iter([]))
-        assert g._open_session(core) == "done"
+        g._open_session(core)
         assert g._helper is None
         assert [call.args[0] for call in core.speak.call_args_list] == [g._("Grid")]
 
@@ -2024,7 +2012,7 @@ class TestHelperLifecycle:
         grid, then the `finally` closes the session a second time."""
         fake_helper(self._ready_script())
         core.listen_modal = Mock(return_value=iter(["close"]))
-        assert g._open_session(core) == "done"
+        g._open_session(core)
         assert g._helper is None
         assert [call.args[0] for call in core.speak.call_args_list] == [
             g._("Grid"),
@@ -2059,7 +2047,7 @@ class TestHelperLifecycle:
 
         core.listen_modal = Mock(return_value=utterances())
         with caplog.at_level("WARNING"):
-            assert g._open_session(core) == "done"
+            g._open_session(core)
         move_to.assert_not_called()
         click.assert_not_called()
         assert g._helper is None
@@ -2100,7 +2088,7 @@ class TestHelperLifecycle:
 
         core.listen_modal = Mock(return_value=utterances())
         with caplog.at_level("WARNING"):
-            assert g._open_session(core) == "done"
+            g._open_session(core)
         assert any("last words" in r.message for r in caplog.records)
         assert any("no click-through" in r.message for r in caplog.records)
 
@@ -2228,7 +2216,7 @@ class TestHelperStartFailures:
 
     def test_open_session_speaks_when_the_helper_cannot_start(self, monkeypatch, core):
         monkeypatch.setattr(g, "_start_helper", lambda: None)
-        assert g._open_session(core) is None
+        g._open_session(core)
         core.speak.assert_called_once_with("I couldn't show the grid.")
 
 
