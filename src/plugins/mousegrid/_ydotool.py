@@ -627,7 +627,10 @@ def parse_tool_list(text):
     if start is None:
         return set()
     return {
-        line.strip()
+        # The verb is the line's first token: some builds append a per-verb
+        # description on the same line, and a whole-line entry would never
+        # match the verbs this backend needs.
+        line.split()[0]
         for line in lines[start + 1 :]
         if line.strip() and line[:1] in (" ", "\t")
     }
@@ -1142,7 +1145,17 @@ def stop_helper(reason):
     except subprocess.TimeoutExpired:
         logger.warning("grid: helper ignored SIGTERM (%s); killing", reason)
         helper.kill()
-        helper.wait(timeout=REAP_GRACE)
+        try:
+            helper.wait(timeout=REAP_GRACE)
+        except subprocess.TimeoutExpired:
+            # A helper in uninterruptible sleep (D-state) ignores SIGKILL for
+            # a while. Raising here would replace whatever was in flight
+            # through the mode's finally, and print a traceback at atexit —
+            # the one teardown path whose purpose is "cannot freeze" must not
+            # be the one that can raise. Init reaps the corpse.
+            logger.warning(
+                "grid: helper survived SIGKILL (%s); leaving it to init", reason
+            )
 
 
 def cleanup():

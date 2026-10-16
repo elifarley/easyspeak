@@ -76,6 +76,23 @@ def parse_command(line):
     return payload if isinstance(payload, dict) else None
 
 
+def usable_bounds(command):
+    """Return the integer bounds list a show command must carry, or None.
+
+    Mirrors parse_command's absorb-and-log: one malformed message must not
+    take the stdin watch — and the mapped grid — down with a KeyError. The
+    integer check mirrors the ready event's own geometry sanity test.
+    """
+    bounds = command.get("bounds")
+    if (
+        isinstance(bounds, list)
+        and len(bounds) == 4
+        and all(isinstance(v, int) and not isinstance(v, bool) for v in bounds)
+    ):
+        return bounds
+    return None
+
+
 def take_lines(pending, chunk):
     """Split every complete line out of `pending + chunk`.
 
@@ -440,7 +457,13 @@ def run(gtk, layer_shell):  # pragma: no cover - drives the GTK loop
             return True
         name = command.get("cmd")
         if name == "show" and overlay is not None:
-            problem = overlay.show(command["bounds"])
+            bounds = usable_bounds(command)
+            if bounds is None:
+                sys.stderr.write(
+                    f"grid-overlay: ignoring show without usable bounds: {command}\n"
+                )
+                return True
+            problem = overlay.show(bounds)
             if problem is not None:
                 return refuse(problem)
         elif name == "hide" and overlay is not None:

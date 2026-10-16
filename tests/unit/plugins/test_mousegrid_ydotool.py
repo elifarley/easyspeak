@@ -1056,6 +1056,17 @@ class TestToolListParsing:
         text = "Available commands:\n  click\nUse YDOTOOL_SOCKET to pick a daemon.\n"
         assert g.parse_tool_list(text) == {"click"}
 
+    def test_a_described_verb_is_read_by_its_first_token(self):
+        """Some builds append a per-verb description on the verb's own line;
+        the verb is the first token, and a whole-line entry would never match
+        the verbs the gate requires."""
+        text = (
+            "Available commands:\n"
+            "  mousemove    Move the pointer\n"
+            "  click 1      Press and release a button\n"
+        )
+        assert g.parse_tool_list(text) == {"mousemove", "click"}
+
     def test_the_probe_reads_the_list_from_stderr(self, monkeypatch):
         monkeypatch.setattr(
             g,
@@ -2112,6 +2123,31 @@ class TestHelperLifecycle:
         assert g._helper is None
         assert any("ignored SIGTERM" in r.message for r in caplog.records)
 
+    def test_a_surviving_sigkill_does_not_raise(self, monkeypatch, caplog):
+        """protects: the post-kill wait is bounded and its expiry is logged,
+        never raised — teardown's whole purpose is to not freeze or crash,
+        and an uncaught TimeoutExpired here would replace whatever was in
+        flight through the mode's finally (or print a traceback at atexit).
+        fails_when: stop_helper lets the second wait's TimeoutExpired escape.
+        no_claim: does not claim the kernel reaps a D-state helper, only that
+        the reaping is left to init.
+        seam: none
+        """
+        import subprocess
+
+        helper = Mock()
+        helper.poll.return_value = None
+        helper.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="helper", timeout=0.1),
+            subprocess.TimeoutExpired(cmd="helper", timeout=0.1),
+        ]
+        monkeypatch.setattr(g, "_helper", helper)
+        with caplog.at_level("WARNING"):
+            g.stop_helper("unstoppable")
+        helper.kill.assert_called_once()
+        assert any("survived SIGKILL" in r.message for r in caplog.records)
+        assert g._helper is None
+
     def test_a_broken_pipe_swallows_the_command(self, monkeypatch, caplog):
         """A helper that died between the handshake and a command is not a
         crash: the write fails, the line is dropped, the log says so, and the
@@ -2209,6 +2245,29 @@ class TestOverlayPureParts:
         assert overlay.parse_command('{"cmd": "hide"}') == {"cmd": "hide"}
         assert overlay.parse_command("") is None
         assert overlay.parse_command("{oops") is None
+
+    def test_usable_bounds_absorbs_a_malformed_show(self):
+        """protects: one malformed show message must not take the stdin watch
+        (and the mapped grid) down with a KeyError — parse_command absorbs
+        unparsable lines, and a parsable line without usable bounds gets the
+        same treatment. The integers-only rule mirrors the ready event's own
+        geometry sanity test.
+        fails_when: handle_line indexes command["bounds"] unguarded, or the
+        predicate accepts non-integer or wrongly-shaped bounds.
+        no_claim: does not claim the parent cannot send garbage, only that
+        the helper survives it.
+        seam: none
+        """
+        overlay = _overlay_module()
+        assert overlay.usable_bounds({"cmd": "show"}) is None
+        assert overlay.usable_bounds({"cmd": "show", "bounds": [1, 2, 3]}) is None
+        assert overlay.usable_bounds({"cmd": "show", "bounds": "1024x768"}) is None
+        assert overlay.usable_bounds(
+            {"cmd": "show", "bounds": [1, 2, 3, True]}
+        ) is None
+        assert overlay.usable_bounds(
+            {"cmd": "show", "bounds": [1, 2, 3, 4]}
+        ) == [1, 2, 3, 4]
 
     def test_take_lines_splits_every_complete_line_of_one_chunk(self):
         """A `stop` behind another command in the same write must arrive too."""
