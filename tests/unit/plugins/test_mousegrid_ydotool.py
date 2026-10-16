@@ -205,6 +205,23 @@ class TestParityWithExtension:
     def test_parser_is_the_shared_implementation(self):
         assert g.parse_number_sequence is _extension.parse_number_sequence
 
+    @pytest.mark.parametrize(
+        ["text", "want"],
+        [
+            ("close", True),
+            ("stopwatch", True),  # substring semantics, both backends alike
+            ("stay open", False),
+            ("", False),
+        ],
+    )
+    def test_dismissal_grammar_is_shared(self, text, want):
+        """In-session dismissal must end the grid on the same utterance on
+        every desktop: the ydotool backend used to match whole words only,
+        so "stopwatch" closed the grid under GNOME and stranded it under
+        sway. Both now read one shared matcher."""
+        assert g.dismiss_match(text) == want
+        assert g.dismiss_match is _extension.dismiss_match
+
 
 @pytest.fixture
 def core():

@@ -108,6 +108,18 @@ CLICK_WORDS = ("click", "lick", "clique")
 RIGHT_WORDS = ("right", "write", "rite", "wright")
 
 
+def dismiss_match(text):
+    """True when an utterance names a dismissal, inside an open grid session.
+
+    Both backends must close on the same utterance — "stopwatch" cannot end
+    the grid on one desktop and strand it on another — so the match lives
+    here. The semantics are substring-based, which is the extension backend's
+    shipped behaviour: one grammar had to move to the other, and moving the
+    newer backend's toward the shipped one costs no existing user anything.
+    """
+    return any(word in text for word in DISMISS_WORDS)
+
+
 def click_kind(text):
     """Return the click flavour an utterance names, or None.
 

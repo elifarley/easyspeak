@@ -39,11 +39,11 @@ from easyspeak.core.i18n import translator
 from . import _overlay
 from ._common import (
     AGAIN_WORDS,
-    DISMISS_WORDS,
     GRID_TRIGGERS,
     SHOW_BLOCK_WORDS,
     center,
     click_kind,
+    dismiss_match,
     parse_number_sequence,
     subdivide,
 )
@@ -920,9 +920,8 @@ def _run_mode(core):
 
         text = spoken.lower()
         logger.debug("grid: heard %r", spoken)
-        words = set(text.split())
 
-        if words & DISMISS_WORDS:
+        if dismiss_match(text):
             _dismiss()
             core.speak(_("Grid closed"))
             return

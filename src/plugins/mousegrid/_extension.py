@@ -23,13 +23,13 @@ from easyspeak.core.tray import on_gnome
 
 from ._common import (
     AGAIN_WORDS,
-    DISMISS_WORDS,
     GRID_TRIGGERS,
     SHOW_BLOCK_WORDS,
     WORD_TO_NUM,
     ZONE_MAP,
     center,
     click_kind,
+    dismiss_match,
     parse_number_sequence,
     subdivide,
 )
@@ -491,7 +491,7 @@ def _run_grid_mode(core):
         logger.debug("  ← %s", cmd_lower)
 
         # === Exit ===
-        if any(w in cmd_lower for w in DISMISS_WORDS):
+        if dismiss_match(cmd_lower):
             close_grid()
             core.speak(_("Grid closed"))
             logger.info("Grid closed")
