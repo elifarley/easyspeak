@@ -39,13 +39,14 @@ from easyspeak.core.i18n import translator
 from . import _overlay
 from ._common import (
     AGAIN_WORDS,
-    EXTENSION_ONLY_WORDS_AFTER_CLICKS,
+    CLICK_REPLIES,
     EXTENSION_ONLY_WORDS_BEFORE_CLICKS,
     GRID_TRIGGERS,
     SHOW_BLOCK_WORDS,
     center,
     click_kind,
     dismiss_match,
+    parse_direction,
     parse_number_sequence,
     subdivide,
 )
@@ -968,7 +969,12 @@ def _run_mode(core):
             _fire_click(kind, core)
             return
 
-        if any(word in text for word in EXTENSION_ONLY_WORDS_AFTER_CLICKS):
+        # Bare directions are the extension's nudge grammar — its COMMANDS
+        # line advertises "up/down/left/right [N]", verb word optional — and
+        # the extension honours them here, before the zone numbers. This
+        # backend has no nudge to serve them with, so it names the boundary
+        # instead: "up 5" must not zoom into zone 5.
+        if "nudge" in text or parse_direction(text):
             core.speak(_("That needs the GNOME extension."))
             continue
 
@@ -1012,6 +1018,12 @@ def _fire_click(kind, core):
         core.speak(_("I couldn't move the pointer."))
     elif moved == "unknown":
         core.speak(_("I tried, but I'm not sure it worked."))
+    else:
+        # The success reply, the same word the extension backend speaks: the
+        # overlay vanishing is the only other cue, and it says nothing about
+        # what was done — a silent vanish is indistinguishable from an idle
+        # timeout.
+        core.speak(CLICK_REPLIES[kind])
 
 
 def _start_helper():

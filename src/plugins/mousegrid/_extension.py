@@ -23,6 +23,7 @@ from easyspeak.core.tray import on_gnome
 
 from ._common import (
     AGAIN_WORDS,
+    CLICK_REPLIES,
     GRID_TRIGGERS,
     SHOW_BLOCK_WORDS,
     WORD_TO_NUM,
@@ -30,6 +31,7 @@ from ._common import (
     center,
     click_kind,
     dismiss_match,
+    parse_direction,
     parse_number_sequence,
     subdivide,
 )
@@ -47,27 +49,7 @@ drag_start = None
 
 NUDGE_AMOUNT = 20
 
-DIRECTIONS = {
-    "up": ["up", "north", "top", "upper", "above"],
-    "down": ["down", "south", "bottom", "lower", "below"],
-    "left": ["left", "west", "lift", "let", "lef", "laughed", "loft"],
-    "right": ["right", "east", "write", "rite", "wright"],
-}
-
 KIND = "gnome"
-
-# The spoken confirmation per click flavour, keyed by `_common.click_kind`'s
-# answer. The strings are translated here at import (the same extraction the
-# COMMANDS list relies on): a plain string dict would vanish from the
-# gettext catalogs, and `just translations` strips entries the extractor can
-# no longer see. "Holding" stays in the drag branch: grid mode keeps
-# listening and a reply containing "mark" would start a second drag.
-CLICK_REPLIES = {
-    "double": _("Double clicked"),
-    "middle": _("Middle clicked"),
-    "right": _("Right clicked"),
-    "click": _("Clicked"),
-}
 
 
 # This backend drives the GNOME Shell extension over D-Bus (see dbus_call);
@@ -195,15 +177,6 @@ def parse_count(text):
     if match:
         return min(int(match.group(1)), 20)
     return 1
-
-
-def parse_direction(text):
-    """Return the direction (up/down/left/right) named in text, or None."""
-    for direction, words in DIRECTIONS.items():
-        for word in words:
-            if word in text:
-                return direction
-    return None
 
 
 def get_center():

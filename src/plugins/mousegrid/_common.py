@@ -16,6 +16,10 @@ being shipped.
 
 import re
 
+from easyspeak.core.i18n import translator
+
+_ = translator(__file__)
+
 # Whisper mishears "grid" as any of these often enough that the extension
 # backend tunes a whole set, and a backend that hears fewer words than the
 # other is a regression in the user's eyes, not a simplification.
@@ -109,15 +113,41 @@ RIGHT_WORDS = ("right", "write", "rite", "wright")
 
 # Verbs only the extension backend can honour (ydotool has no wheel verb and
 # no press-and-hold): the ydotool mode names them instead of swallowing
-# them. The split mirrors the extension loop's own precedence — mark, drag
-# and scroll are checked BEFORE the click words, nudge AFTER — so a compound
-# utterance ("scroll click", "scroll down 3") classifies as the verb on
-# both backends instead of clicking or zooming on one and scrolling on the
-# other. Precedence is part of the phrase surface, which is why the words
-# sit here with the rest of the grammar and not inline at the branch that
-# checks them.
+# them. These are checked BEFORE the click words because that is where the
+# extension loop honours them — a compound utterance ("scroll click",
+# "scroll down 3") must classify as the verb on both backends instead of
+# clicking or zooming on one and scrolling on the other. (Nudge and bare
+# directions are the extension's post-click grammar; the ydotool loop reads
+# `parse_direction` below its click branch for the same reason.) Precedence
+# is part of the phrase surface, which is why the words sit here with the
+# rest of the grammar and not inline at the branch that checks them.
 EXTENSION_ONLY_WORDS_BEFORE_CLICKS = ("mark", "drag", "scroll")
-EXTENSION_ONLY_WORDS_AFTER_CLICKS = ("nudge",)
+
+# Nudge directions, with Whisper's usual mishearings. Both backends read
+# this table: the extension backend nudges with it, and the ydotool backend
+# reads the same words at its boundary branch — the extension's nudge
+# grammar makes the verb word optional ("up 5" is advertised syntax), so a
+# direction word must classify the same way on both sides or the count
+# suffix zooms the grid on one desktop and nudges on the other.
+DIRECTIONS = {
+    "up": ["up", "north", "top", "upper", "above"],
+    "down": ["down", "south", "bottom", "lower", "below"],
+    "left": ["left", "west", "lift", "let", "lef", "laughed", "loft"],
+    "right": ["right", "east", "write", "rite", "wright"],
+}
+
+# The spoken confirmation per click flavour, keyed by `click_kind`'s
+# answer. Translated here at import (the same extraction the COMMANDS list
+# relies on): a plain string dict would vanish from the gettext catalogs,
+# and `just translations` strips entries the extractor can no longer see.
+# Both backends announce a click with the same word: the overlay vanishing
+# is the only other cue, and it says nothing about what was done.
+CLICK_REPLIES = {
+    "double": _("Double clicked"),
+    "middle": _("Middle clicked"),
+    "right": _("Right clicked"),
+    "click": _("Clicked"),
+}
 
 
 def dismiss_match(text):
@@ -155,6 +185,22 @@ def click_kind(text):
         return "right"
     if has_click:
         return "click"
+    return None
+
+
+def parse_direction(text):
+    """Return the direction (up/down/left/right) named in text, or None.
+
+    Shared since the direction words became the ydotool boundary's grammar
+    too: the extension nudges on them and the ydotool backend names its
+    boundary on them, and both must answer a direction word alike (see
+    [`DIRECTIONS`][_common.DIRECTIONS] for why the verb-optional nudge
+    grammar makes this load-bearing).
+    """
+    for direction, words in DIRECTIONS.items():
+        for word in words:
+            if word in text:
+                return direction
     return None
 
 
