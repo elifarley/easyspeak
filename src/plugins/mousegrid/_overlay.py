@@ -374,6 +374,20 @@ class Overlay:  # pragma: no cover - needs GTK; run live
         ):
             layer_shell.set_anchor(self.window, edge, True)  # noqa: FBT003
         layer_shell.set_layer(self.window, layer_shell.Layer.OVERLAY)
+        # Span the whole monitor, panel and dock strips included. Layer-shell
+        # surfaces default to exclusive zone 0, which smithay resolves to
+        # "monitor minus every strip that claimed an exclusive zone" — the
+        # panel and dock are two cosmic-panel instances claiming exactly such
+        # zones, so with the default this surface ended at the strips, and
+        # zooming into them drew cells that were cut off the glass entirely
+        # (measured: a depth-3 zoom into the dock rendered nothing at all).
+        # -1 is the layer-shell "ignore exclusive zones" value, and cosmic-
+        # osd's overlays are the in-tree precedent for it: plain Overlay
+        # layer, zone -1, which is the whole reason they float above the
+        # panels (source-verified: smithay's layer mapping sizes the surface
+        # by the zone, layer.rs:311-347; cosmic-comp orders Overlay above
+        # Top, focus/order.rs:180-196; cosmic-osd osd_indicator.rs:200-203).
+        layer_shell.set_exclusive_zone(self.window, -1)
         # Never take focus, and never eat the injected click. `set_can_target`
         # stops GTK from targeting the window; the empty input region - applied
         # by `make_click_through` as soon as the surface exists - is what
