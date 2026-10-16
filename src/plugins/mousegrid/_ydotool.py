@@ -828,34 +828,43 @@ def _open_session(core, bounds=None):
             logger.info("grid: the remembered cell does not fit; reopening full")
             bounds = None
     _bounds = tuple(bounds) if bounds else (0, 0, geometry[2], geometry[3])
-    # The first show goes out before the mode starts listening: without it the
-    # grid is never drawn and the session looks like a dead daemon.
-    _redraw(_bounds)
-    # Consume the `presented` announcement so the protocol's promise is kept.
-    # It can only arrive HERE: `_draw` announces the first frame once it has
-    # bounds to draw, and bounds exist only after the show above — waiting in
-    # the ready handshake would expire every time and stall each open by the
-    # full bound. A compositor that never frames costs the bound once here and
-    # only lowers the log's confidence.
-    announcement = read_until(_helper.stdout, time.monotonic() + PRESENT_TIMEOUT)
-    if announcement and announcement.get("event") == "presented":
-        logger.info("grid: first frame on screen")
-    elif announcement and announcement.get("event") == "error":
-        # The same read is the first consumer of a show-triggered refusal: the
-        # helper emits `error` and quits when the surface went up but the
-        # click-through region could not be applied. Mirroring
-        # `_start_helper`'s refusal path keeps the helper's contract whole on
-        # this side too.
-        logger.warning("grid: helper refused the show: %s", announcement.get("message"))
-        stop_helper("show refused")
-        core.speak(_("I couldn't show the grid."))
-        return
-    elif announcement and announcement.get("event") == "_eof":
-        logger.warning("grid: the helper exited right after ready")
-    else:
-        logger.debug("grid: no presented announcement inside PRESENT_TIMEOUT")
-    core.speak(_("Grid"))
+    # Everything from the first show on runs with a live helper holding the
+    # overlay on screen, so it is all inside the try: a raise in the
+    # announcement read or the announcement speak (route_command swallows
+    # those per plugin, so the daemon would keep running) must not leave the
+    # grid drawn with nobody left to close it. `_close_session` is safe to
+    # call twice, which is also what makes the show-refusal path below —
+    # stop_helper, speak, return — fall out through the finally for free.
     try:
+        # The first show goes out before the mode starts listening: without it
+        # the grid is never drawn and the session looks like a dead daemon.
+        _redraw(_bounds)
+        # Consume the `presented` announcement so the protocol's promise is
+        # kept. It can only arrive HERE: `_draw` announces the first frame
+        # once it has bounds to draw, and bounds exist only after the show
+        # above — waiting in the ready handshake would expire every time and
+        # stall each open by the full bound. A compositor that never frames
+        # costs the bound once here and only lowers the log's confidence.
+        announcement = read_until(_helper.stdout, time.monotonic() + PRESENT_TIMEOUT)
+        if announcement and announcement.get("event") == "presented":
+            logger.info("grid: first frame on screen")
+        elif announcement and announcement.get("event") == "error":
+            # The same read is the first consumer of a show-triggered refusal:
+            # the helper emits `error` and quits when the surface went up but
+            # the click-through region could not be applied. Mirroring
+            # `_start_helper`'s refusal path keeps the helper's contract whole
+            # on this side too.
+            logger.warning(
+                "grid: helper refused the show: %s", announcement.get("message")
+            )
+            stop_helper("show refused")
+            core.speak(_("I couldn't show the grid."))
+            return
+        elif announcement and announcement.get("event") == "_eof":
+            logger.warning("grid: the helper exited right after ready")
+        else:
+            logger.debug("grid: no presented announcement inside PRESENT_TIMEOUT")
+        core.speak(_("Grid"))
         _run_mode(core)
     finally:
         _close_session()

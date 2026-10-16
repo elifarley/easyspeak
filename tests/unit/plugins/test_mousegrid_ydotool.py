@@ -2115,6 +2115,28 @@ class TestHelperLifecycle:
             g._("Grid closed"),
         ]
 
+    def test_a_speech_failure_after_the_draw_still_closes(
+        self, core, fake_helper
+    ):
+        """protects: the show, the `presented` read and the announcement all
+        run while a live helper holds the overlay on screen; a raise in that
+        stretch — a TTS backend blowing up inside `core.speak` — must tear the
+        session down, not leave the grid drawn with nobody to close it
+        (route_command swallows the exception per plugin, so the daemon would
+        have kept running with the overlay stranded until the next open or
+        `atexit`).
+        fails_when: the `finally` covers only `_run_mode`, so a raise between
+        the first show and the mode leaves `_helper` alive.
+        no_claim: does not claim anything about which speech backends can
+        raise; the raise is injected.
+        seam: `core.speak` raises; the helper is the real fake protocol.
+        """
+        fake_helper(self._ready_script())
+        core.speak = Mock(side_effect=RuntimeError("tts backend died"))
+        with pytest.raises(RuntimeError, match="tts backend died"):
+            g._open_session(core)
+        assert g._helper is None
+
     def test_a_helper_that_dies_with_the_grid_open_ends_the_mode(
         self, monkeypatch, core, fake_helper, caplog
     ):
