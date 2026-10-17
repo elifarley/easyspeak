@@ -43,6 +43,7 @@ from ._common import (
     EXTENSION_ONLY_WORDS_BEFORE_CLICKS,
     GRID_TRIGGERS,
     SHOW_BLOCK_WORDS,
+    ZONE_MAP,
     center,
     click_kind,
     dismiss_match,
@@ -1020,9 +1021,20 @@ def _run_mode(core):
 
         zones = parse_number_sequence(text)
         if zones and _bounds:
+            applied = False
             for zone in zones:
+                if zone not in ZONE_MAP:
+                    # A parsed "digit" outside the 1-9 zones is the
+                    # extension's silent no-op (`update_grid` returns False
+                    # at its own ZONE_MAP guard), not a crash: a fullwidth
+                    # zero passes `isdecimal` exactly like ３ does, and
+                    # letting it reach `subdivide` killed this backend's
+                    # session on an utterance the extension shrugs off.
+                    continue
                 _bounds = subdivide(_bounds, zone)
-            _redraw(_bounds)
+                applied = True
+            if applied:
+                _redraw(_bounds)
             continue
 
 

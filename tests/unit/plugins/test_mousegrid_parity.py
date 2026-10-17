@@ -226,6 +226,12 @@ BATTERY = [
     ),
     ("drag", ("Hide",), (), True, (), (BOUNDARY,), True),
     ("nudge", ("Hide",), (), True, (), (BOUNDARY,), True),
+    # A fullwidth zero passes isdecimal but names no zone: the extension's
+    # update_grid returns False at its ZONE_MAP guard (no Update), and the
+    # ydotool loop must skip it the same way — before this row, it reached
+    # `subdivide`, raised KeyError, and killed the session on one backend
+    # only (the adversarial pass verified the crash by execution).
+    ("０", ("Hide",), (), True, (), (), True),
     ("nudge up 5", ("Update", "Hide"), (), True, (), (BOUNDARY,), True),
     ("up 5", ("Update", "Hide"), (), True, (), (BOUNDARY,), True),
     ("up", ("Update", "Hide"), (), True, (), (BOUNDARY,), True),
