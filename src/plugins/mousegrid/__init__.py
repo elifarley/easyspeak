@@ -13,7 +13,9 @@ One plugin, two backends, chosen once at daemon startup by a capability gate:
 The gate (see `_ydotool.resolve_active`) claims the ydotool backend only where
 a layer-shell-capable compositor AND a working injector are both present, and
 fails closed: everywhere else the GNOME backend keeps serving, so on GNOME
-47+ behaviour is unchanged. `EASYSPEAK_GRID_BACKEND=uinput|gnome` forces
+47+ backend selection is unchanged — the one disclosed delta is the shared
+click vocabulary (`lick`/`clique` now click on GNOME too, where they used to
+fall through and be dropped). `EASYSPEAK_GRID_BACKEND=uinput|gnome` forces
 either side — a deliberate override that short-circuits the probes, which is
 what the integration harness uses to observe the overlay without a daemon.
 
