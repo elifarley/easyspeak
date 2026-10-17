@@ -2443,6 +2443,27 @@ class TestReadUntil:
         stream.fileno.side_effect = ValueError("closed")
         assert g.read_until(stream, time.monotonic() + 1) is None
 
+    def test_a_non_object_json_line_is_skipped_not_returned(self, tmp_path, caplog):
+        """protects: every caller asks `.get("event")` on what this returns;
+        a bare JSON number or string parses but is not an event, and returning
+        one would raise AttributeError mid-handshake — in `_start_helper` that
+        escape lands after `Popen` and before any `stop_helper`, leaking the
+        child. A protocol line is an object or it is noise.
+        fails_when: `json.loads`' result is returned unchecked.
+        no_claim: does not claim the shipped helper can produce such a line
+        (it only emits objects); the guard makes the contract total for any
+        helper this module is pointed at.
+        seam: none — a real file stream carries the lines.
+        """
+        path = tmp_path / "stream"
+        path.write_text('42\n"stray"\n{"event": "ready"}\n', encoding="utf-8")
+        with caplog.at_level("WARNING"):
+            with path.open() as stream:
+                assert g.read_until(stream, time.monotonic() + 5) == {
+                    "event": "ready"
+                }
+        assert any("non-object protocol line" in r.message for r in caplog.records)
+
 
 def _overlay_module():
     """Import the helper without importing gi: the module defers that import so

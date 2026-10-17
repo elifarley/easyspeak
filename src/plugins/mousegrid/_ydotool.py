@@ -1145,10 +1145,13 @@ def read_until(stream, deadline):
     reads ahead: a line that layer holds is invisible to `select`, and a chunk
     read here would strand every line after the one returned. One byte at a
     time is what leaves the unread protocol in the one place `select` can see
-    it. Anything that does not parse is logged and skipped. EOF returns the
-    `_eof` event rather than None — a helper that died instantly and a helper
-    that said nothing are different failures, and the callers log them
-    differently.
+    it. Anything that does not parse — or parses to something that is not an
+    object — is logged and skipped: a bare JSON number or string is valid
+    JSON but not an event, and returning it would hand every caller, which
+    asks `.get("event")`, an AttributeError instead of a protocol answer. EOF
+    returns the `_eof` event rather than None — a helper that died instantly
+    and a helper that said nothing are different failures, and the callers
+    log them differently.
     """
     pending = b""
     while True:
@@ -1156,10 +1159,16 @@ def read_until(stream, deadline):
             line = pending.decode("utf-8", "replace")
             pending = b""
             try:
-                return json.loads(line)
+                message = json.loads(line)
             except ValueError:
                 logger.warning(
                     "grid: ignoring unparsable protocol line: %r", line[:120]
+                )
+            else:
+                if isinstance(message, dict):
+                    return message
+                logger.warning(
+                    "grid: ignoring non-object protocol line: %r", line[:120]
                 )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
