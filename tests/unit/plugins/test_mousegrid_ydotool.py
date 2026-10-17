@@ -24,6 +24,10 @@ from easyspeak.plugins.mousegrid import _ydotool as g
 # The fixture pins this daemonless; tests that exercise the real resolver
 # re-pin it to the function captured here at import time.
 _real_injector_socket = g.injector_socket
+# Snapshotted before any fixture runs: `test_inert_at_import` asserts the
+# module's import-time shape, which the autouse reset would otherwise
+# make unfalsifiable (the RH-5 class: a test that asserts its own setup).
+_IMPORT_TIME_ACTIVE = g._active
 
 # What Ubuntu 25.10's ydotool 0.1.8 prints for `ydotool help`, read off the VM:
 # the five verbs are the whole surface there, and `mousemove_relative` is not
@@ -1273,7 +1277,10 @@ class TestToolListParsing:
 
 class TestGate:
     def test_inert_at_import(self):
-        assert g._active is False
+        """The import-time gate state, snapshotted before any fixture
+        resets it: an import-time `_active = True` default (or a stray
+        import-time assignment) fails HERE, not nowhere."""
+        assert _IMPORT_TIME_ACTIVE is False
 
     def test_a_wedged_probe_shuts_the_gate_at_the_deadline(self, monkeypatch):
         """protects: `resolve_active` joins its probe threads on a deadline
@@ -1327,6 +1334,36 @@ class TestGate:
         mousegrid.setup(core)
         mousegrid.cleanup()
         extension_cleanup.assert_called_once_with()
+
+    def test_handle_routes_to_the_selected_backend(self, monkeypatch, core):
+        """protects: `mousegrid.handle` is the claim entry point core calls —
+        a routing regression (always the extension backend, say) sends every
+        grid utterance into the wrong backend's conversation, and only
+        integration arm A would notice (it skips on CI-standard runs, where
+        sway and the typelib are absent). Mutation-verified in review pass 3:
+        hardwiring this to `_extension.handle` kept all 2000 unit tests green.
+        fails_when: the utterance does not reach the selected backend.
+        no_claim: does not claim the backends' own handle decisions work
+        (their suites cover them); the dispatcher's routing is the subject.
+        seam: the selected backend's handle is a stub.
+        """
+        monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "uinput")
+        monkeypatch.setattr(g, "_probe_overlay", Mock(side_effect=AssertionError))
+        monkeypatch.setattr(g, "_probe_injector", Mock(side_effect=AssertionError))
+        mousegrid.setup(core)
+        ydotool_handle = Mock()
+        monkeypatch.setattr(g, "handle", ydotool_handle)
+        extension_handle = Mock()
+        monkeypatch.setattr(_extension, "handle", extension_handle)
+        assert mousegrid.handle("grid", core) is ydotool_handle.return_value
+        ydotool_handle.assert_called_once_with("grid", core)
+        extension_handle.assert_not_called()
+
+        monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "gnome")
+        mousegrid.setup(core)
+        assert mousegrid.handle("grid", core) is extension_handle.return_value
+        extension_handle.assert_called_once_with("grid", core)
+        ydotool_handle.assert_called_once()
 
     def test_forced_backend_is_active_without_probing(self, monkeypatch, core):
         monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "uinput")
