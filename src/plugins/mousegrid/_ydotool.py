@@ -132,11 +132,6 @@ _helper = None
 _dialect = None
 
 
-def active():
-    """Return whether the gate let this backend claim the grid words."""
-    return _active
-
-
 def _probe_dialect():
     """Read the installed client's argv dialect from the client itself.
 
@@ -888,7 +883,16 @@ def _open_session(core, bounds=None):
             core.speak(_("I couldn't show the grid."))
             return
         elif announcement and announcement.get("event") == "_eof":
+            # The same read's EOF answer: the helper is gone without having
+            # presented a frame, so the grid is provably not on screen —
+            # mirroring the refusal arm keeps the user from hearing "Grid"
+            # for a surface that will never appear (the mode's own death on
+            # the next poll is silent, so the fall-through would leave exactly
+            # that).
             logger.warning("grid: the helper exited right after ready")
+            stop_helper("died after ready")
+            core.speak(_("I couldn't show the grid."))
+            return
         else:
             logger.debug("grid: no presented announcement inside PRESENT_TIMEOUT")
         core.speak(_("Grid"))

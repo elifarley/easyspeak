@@ -8,7 +8,9 @@ import importlib.util
 import io
 import json
 import os
+import socket
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -125,6 +127,12 @@ def _fresh_client_state(monkeypatch):
     monkeypatch.setattr(g, "_socket_last_good", None)
     monkeypatch.setattr(g, "_socket_last_good_env", None)
     monkeypatch.setattr(g, "_socket_search_failed", None)
+    # TestGate's setup() calls rebind the dispatcher's module globals (the
+    # selected backend and the help surface); reset them too, so no test
+    # inherits another's gate decision — the same file-order discipline the
+    # _ydotool resets above already enforce.
+    monkeypatch.setattr(mousegrid, "_backend", mousegrid._extension)
+    monkeypatch.setattr(mousegrid, "COMMANDS", mousegrid._COMMANDS_FULL)
 
 
 class TestZoneMath:
@@ -498,28 +506,71 @@ class TestSocketDiscovery:
         planted there by another uid would pass a bare `connect()` probe,
         receive every injected coordinate, and inject nothing.
         fails_when: ownership or socket-type is not checked before the
-        candidate is offered to `_socket_accepts`, or a foreign socket is
-        returned as the injector.
+        candidate is offered to `_socket_accepts`, or a foreign (or same-uid
+        non-socket) path is returned as the injector.
         no_claim: does not claim a same-uid impostor is impossible (unix
         sockets cannot authenticate beyond ownership); does not touch the
         filesystem — `Path.stat` is stubbed.
-        seam: none
+        seam: none — the real resolver runs (the autouse fixture stubs it;
+        this test re-pins it, or the checks below would never execute).
         """
         monkeypatch.setenv("YDOTOOL_SOCKET", "/tmp/.ydotool_socket")
-        foreign_mode = 0o140600  # S_IFSOCK | 0600, without importing stat
-        foreign = Mock(st_mode=foreign_mode, st_uid=os.getuid() + 1)
+        monkeypatch.setattr(g, "injector_socket", _real_injector_socket)
+        monkeypatch.setattr(
+            g, "ydotool_socket_candidates", lambda: ["/tmp/.ydotool_socket"]
+        )
+        # Two calls must both reach the ownership check: without this, the
+        # first failed walk's rediscovery cooldown would swallow the second.
+        monkeypatch.setattr(g, "REDISCOVERY_COOLDOWN", 0)
+        socket_mode = 0o140600  # S_IFSOCK | 0600, without importing stat
+        plain_mode = 0o100600  # S_IFREG | 0600: same uid, but not a socket
+        answers = [
+            Mock(st_mode=socket_mode, st_uid=os.getuid() + 1),  # foreign socket
+            Mock(st_mode=plain_mode, st_uid=os.getuid()),  # own regular file
+        ]
         # Patch the method, not the os module attribute: Path().stat() binds
         # through the os module differently across the supported Pythons, and
         # the method patch behaves the same on every one of them.
-        monkeypatch.setattr(Path, "stat", lambda self, **_kwargs: foreign)
+        monkeypatch.setattr(Path, "stat", lambda self, **_kwargs: answers.pop(0))
         asked = []
         monkeypatch.setattr(
             g,
             "_socket_accepts",
             lambda path, timeout=g.PROBE_TIMEOUT: asked.append(path) or True,
         )
-        assert g.injector_socket() is None
+        assert g.injector_socket() is None  # a foreign uid: never offered
+        assert g.injector_socket() is None  # own uid, but not a socket: same
         assert asked == []
+        assert g._socket_last_good is None
+
+    def test_an_owned_listening_socket_is_trusted_and_cached(
+        self, monkeypatch, tmp_path
+    ):
+        """protects: the acceptance branch of `_socket_owned` — own uid AND a
+        real socket — is the only path that ever finds a daemon; its two
+        rejection twins are pinned above, but this branch had no test
+        (mutation-proven: `return True` → `return False` kept the whole suite
+        green while disabling daemon discovery entirely). Also the suite's
+        first real connect() through `_socket_accepts`, against a real
+        listener instead of socket-module mocks.
+        fails_when: the acceptance branch stops trusting an owned socket, or
+        the answer is not cached as last-good.
+        no_claim: does not claim a same-uid impostor is impossible (unix
+        sockets cannot authenticate beyond ownership); the listener is real
+        and bound by this test's own uid.
+        seam: none — the real resolver runs against a real AF_UNIX listener.
+        """
+        path = tmp_path / ".ydotool_socket"
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(str(path))
+            sock.listen(1)
+            monkeypatch.setattr(g, "injector_socket", _real_injector_socket)
+            monkeypatch.setattr(g, "ydotool_socket_candidates", lambda: [str(path)])
+            assert g.injector_socket() == str(path)
+            assert g._socket_last_good == str(path)
+        finally:
+            sock.close()
 
     def test_the_last_good_socket_is_probed_first(self, monkeypatch):
         """protects: the path that answered last time is re-validated before
@@ -563,6 +614,19 @@ class TestSocketDiscovery:
         assert g.injector_socket() == order[1]
         assert asked == [order[1]]
         assert g._socket_last_good == order[1]
+
+        # Third call: the cached path stops answering — the cache is
+        # invalidated and the full walk runs again (last-good first, then the
+        # priority order), instead of the dead path being trusted.
+        monkeypatch.setattr(
+            g,
+            "_socket_accepts",
+            lambda path, timeout=g.PROBE_TIMEOUT: asked.append(path) or False,
+        )
+        asked.clear()
+        assert g.injector_socket() is None
+        assert asked == [order[1], order[0], order[1], "/tmp/.ydotool_socket"]
+        assert g._socket_last_good is None
 
     def test_repeated_paths_are_collapsed(self, monkeypatch):
         uid = os.getuid()
@@ -1167,20 +1231,73 @@ class TestToolListParsing:
 
 class TestGate:
     def test_inert_at_import(self):
-        assert g.active() is False
+        assert g._active is False
+
+    def test_a_wedged_probe_shuts_the_gate_at_the_deadline(self, monkeypatch):
+        """protects: `resolve_active` joins its probe threads on a deadline
+        derived from PROBE_TIMEOUT — the threads exist exactly so a wedged
+        probe cannot hold setup() hostage (the module's own stated reason for
+        their existence). Mutation-proven: replacing the bounded join with an
+        unbounded one keeps the whole suite green, and the failure mode is a
+        daemon that hangs at every start.
+        fails_when: the join blocks past the deadline, or the gate answers
+        True from a late result nobody read.
+        no_claim: does not claim the late thread's write is discarded
+        atomically (GIL-atomic writes; the bounded overshoot residual is
+        recorded in the review record).
+        seam: the overlay probe blocks on an Event; PROBE_TIMEOUT is shrunk
+        so the deadline is ~0.4s.
+        """
+        release = threading.Event()
+        monkeypatch.setattr(g, "_probe_overlay", lambda: release.wait(10))
+        monkeypatch.setattr(g, "_probe_injector", lambda: True)
+        monkeypatch.setattr(g, "PROBE_TIMEOUT", 0.1)
+        started = time.monotonic()
+        try:
+            assert g.resolve_active() is False
+        finally:
+            release.set()
+        assert time.monotonic() - started < 5
+
+    def test_cleanup_routes_to_the_selected_backend(self, monkeypatch, core):
+        """protects: the atexit teardown must reach whichever backend setup()
+        selected — a routing regression (always calling the extension
+        backend, or reading the pre-setup default) leaves the ydotool overlay
+        on screen at interpreter exit, the exact failure the registration
+        exists to prevent.
+        fails_when: cleanup() does not reach the selected backend's teardown.
+        no_claim: does not claim the backends' own teardowns work (each is
+        tested in its own suite); the dispatcher's routing is the subject.
+        seam: the selected backend's cleanup is a stub.
+        """
+        monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "uinput")
+        monkeypatch.setattr(g, "_probe_overlay", Mock(side_effect=AssertionError))
+        monkeypatch.setattr(g, "_probe_injector", Mock(side_effect=AssertionError))
+        mousegrid.setup(core)
+        ydotool_cleanup = Mock()
+        monkeypatch.setattr(g, "cleanup", ydotool_cleanup)
+        mousegrid.cleanup()
+        ydotool_cleanup.assert_called_once_with()
+
+        monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "gnome")
+        extension_cleanup = Mock()
+        monkeypatch.setattr(_extension, "cleanup", extension_cleanup)
+        mousegrid.setup(core)
+        mousegrid.cleanup()
+        extension_cleanup.assert_called_once_with()
 
     def test_forced_backend_is_active_without_probing(self, monkeypatch, core):
         monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "uinput")
         monkeypatch.setattr(g, "_probe_overlay", Mock(side_effect=AssertionError))
         monkeypatch.setattr(g, "_probe_injector", Mock(side_effect=AssertionError))
         mousegrid.setup(core)
-        assert g.active() is True
+        assert g._active is True
         assert mousegrid._backend is g
 
     def test_forced_gnome_selects_the_extension_backend(self, monkeypatch, core):
         monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "gnome")
         mousegrid.setup(core)
-        assert g.active() is False
+        assert g._active is False
         assert mousegrid._backend is _extension
 
     def test_the_help_surface_matches_the_selected_backend(self, monkeypatch, core):
@@ -1209,16 +1326,16 @@ class TestGate:
         monkeypatch.setattr(g, "_probe_overlay", lambda: True)
         monkeypatch.setattr(g, "_probe_injector", lambda: False)
         mousegrid.setup(core)
-        assert g.active() is False
+        assert g._active is False
         assert mousegrid._backend is _extension
         monkeypatch.setattr(g, "_probe_overlay", lambda: False)
         monkeypatch.setattr(g, "_probe_injector", lambda: True)
         mousegrid.setup(core)
-        assert g.active() is False
+        assert g._active is False
         assert mousegrid._backend is _extension
         monkeypatch.setattr(g, "_probe_overlay", lambda: True)
         mousegrid.setup(core)
-        assert g.active() is True
+        assert g._active is True
         assert mousegrid._backend is g
 
     def test_an_unknown_forced_value_is_named_and_probes_run(self, monkeypatch, caplog):
@@ -2230,13 +2347,54 @@ class TestHelperLifecycle:
             g._open_session(core)
         assert g._helper is None
 
-    def test_a_helper_that_dies_with_the_grid_open_ends_the_mode(
+    def test_a_helper_that_refuses_the_first_show_is_reaped_and_answered(
+        self, core, fake_helper
+    ):
+        """protects: the `presented` read is the first consumer of a
+        show-triggered refusal — the helper emits `error` and quits when the
+        surface went up but the click-through region could not be applied.
+        The plugin must reap the corpse, speak the failure (not "Grid"), and
+        open nothing.
+        fails_when: the refusal is dropped (the mode starts on a dead
+        helper), the helper leaks, or "Grid" is spoken for a grid that never
+        appeared.
+        no_claim: does not claim which compositor states trigger the
+        refusal; the helper's own contract is simulated.
+        seam: none — the real fake-helper protocol carries the refusal.
+        """
+        fake_helper(
+            "import json, sys\n"
+            "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 900, 600]}),"
+            " flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    if 'show' in line:\n"
+            "        print(json.dumps({'event': 'error', 'message':"
+            " 'click-through refused'}), flush=True)\n"
+            "        sys.exit(1)\n"
+        )
+        g._open_session(core)
+        assert g._helper is None
+        assert [call.args[0] for call in core.speak.call_args_list] == [
+            g._("I couldn't show the grid.")
+        ]
+
+    def test_a_helper_that_dies_before_presenting_is_answered_not_announced(
         self, monkeypatch, core, fake_helper, caplog
     ):
-        """The spec's row: a helper that dies with the grid open is logged, the
-        mode ends, the bounds are discarded - and a click is never injected
-        against geometry that no longer exists. The death shows at the loop
-        top, so the session is driven one utterance past it."""
+        """protects: the `_eof` arm of the announcement read — a helper that
+        dies right after ready, without ever presenting a frame, is reaped and
+        answered with the refusal line, never announced as "Grid". The
+        fall-through it replaces spoke success for a grid that provably never
+        appeared, and the mode's own death on the next poll is silent, so the
+        user heard "Grid" followed by nothing (the red-team read; the
+        earlier log-only choice predates the refusal arm's reply string).
+        fails_when: the fall-through returns — "Grid" is spoken and the mode
+        starts on a dead helper.
+        no_claim: does not claim the mid-mode death path here (a helper that
+        presented first is the loop-top liveness check's row, tested below);
+        the subject is the pre-present death only.
+        seam: none — the real fake-helper protocol carries the death.
+        """
         fake_helper(
             "import json, sys\n"
             "print(json.dumps({'event': 'ready', 'monitor': [0, 0, 900, 600]}),"
@@ -2252,7 +2410,8 @@ class TestHelperLifecycle:
         def utterances():
             # The fake helper exits after the first show reaches it, the way a
             # crashed helper would; make sure it has done so before the first
-            # utterance is consumed, or the check would race the death.
+            # utterance would be consumed — which it never is, because the
+            # mode must never start.
             assert g._helper.wait(timeout=5) == 0
             yield "click"
 
@@ -2262,10 +2421,10 @@ class TestHelperLifecycle:
         move_to.assert_not_called()
         click.assert_not_called()
         assert g._helper is None
-        assert g._bounds is None
-        assert any("grid open" in r.message for r in caplog.records)
-        # Logged, not spoken: no new reply string for this path.
-        assert [call.args[0] for call in core.speak.call_args_list] == [g._("Grid")]
+        assert any("exited right after ready" in r.message for r in caplog.records)
+        assert [call.args[0] for call in core.speak.call_args_list] == [
+            g._("I couldn't show the grid.")
+        ]
 
     def test_a_refusal_that_arrived_before_the_death_is_read_as_the_last_words(
         self, monkeypatch, core, fake_helper, caplog

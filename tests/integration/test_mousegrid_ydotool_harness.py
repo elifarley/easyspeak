@@ -321,7 +321,7 @@ class TestGate:
         monkeypatch.setattr(backend, "_probe_overlay", lambda: True)
         monkeypatch.setattr(backend, "_probe_injector", lambda: False)
         mousegrid.setup(core=None)
-        assert backend.active() is False
+        assert backend._active is False
         assert mousegrid._backend is mousegrid._extension
         assert backend.handle("grid", core=None) is None
 
@@ -342,6 +342,10 @@ class TestGate:
         """
         if shutil.which("ydotool") is None:
             pytest.skip("ydotool is not installed")
+        # The dry-run seam would answer the no-op without spawning the real
+        # client this test exists to exercise — a stale export must not buy a
+        # vacuous pass.
+        monkeypatch.delenv("EASYSPEAK_GRID_DRY_RUN", raising=False)
         if backend.injector_socket() is None:
             pytest.skip(
                 "no ydotoold socket answers (Ubuntu packages one as a user unit); "
@@ -353,7 +357,7 @@ class TestGate:
         assert any("injections " in r.message for r in caplog.records)
         monkeypatch.setattr(backend, "_probe_overlay", lambda: True)
         mousegrid.setup(core=None)
-        assert backend.active() is True
+        assert backend._active is True
         assert mousegrid._backend is backend
 
     def test_the_injector_gate_fails_closed_without_a_socket(
@@ -366,6 +370,9 @@ class TestGate:
         on there and the case skips by name."""
         if shutil.which("ydotool") is None:
             pytest.skip("ydotool is not installed")
+        # Same vacuous-pass guard as the passing twin: a stale DRY_RUN export
+        # would answer the probe's no-op without the real client refusing.
+        monkeypatch.delenv("EASYSPEAK_GRID_DRY_RUN", raising=False)
         if backend.dialect() != backend.YDTOOL_DIALECT_MODERN:
             pytest.skip(
                 "0.1.8's client emits without a daemon; nothing to fail closed on"
@@ -415,7 +422,7 @@ class TestForcedBackendArm:
         with caplog.at_level("INFO"):
             core = FakeCore()
             mousegrid.setup(core)
-            assert backend.active() is True
+            assert backend._active is True
             mousegrid.handle(commands[0], core)
 
         ready = [r for r in caplog.records if "ready on" in r.message]
@@ -432,7 +439,9 @@ class TestForcedBackendArm:
     reason="live injection is opt-in: set EASYSPEAK_GRID_LIVE=click",
 )
 class TestLiveArm:
-    def test_the_click_lands_in_the_expected_cell(self, session, tmp_path, monkeypatch):
+    def test_the_click_lands_in_the_expected_cell(
+        self, session, tmp_path, monkeypatch, request
+    ):
         monkeypatch.setenv("EASYSPEAK_GRID_BACKEND", "uinput")
         repo_root = Path(backend.__file__).parents[3]
         # The probe window runs under the system interpreter, not the venv the
@@ -459,6 +468,22 @@ class TestLiveArm:
             stdout=subprocess.PIPE,
             text=True,
         )
+
+        # The terminate/communicate pair at the end of this test runs only on
+        # the success path; any assertion failure between the spawn and it
+        # would strand the probe window (the session fixture kills sway, but
+        # the probe is this test's own child). A finalizer covers every exit
+        # path and is a no-op after the success-path terminate — same hygiene
+        # rule the helper reap fixture enforces for the backend's own child.
+        def _reap_probe():
+            if probe.poll() is None:
+                probe.terminate()
+                try:
+                    probe.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    probe.kill()
+
+        request.addfinalizer(_reap_probe)
         time.sleep(1.5)
         before = tmp_path / "before.png"
         _grim(session, before)
