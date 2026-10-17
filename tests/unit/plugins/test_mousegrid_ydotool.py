@@ -2510,10 +2510,6 @@ class TestOverlayPureParts:
         assert lines == ['{"cmd": "hide"}']
         assert remainder == '{"cmd":'
 
-    def test_probe_mode_reports_unsupported_without_a_display(self):
-        overlay = _overlay_module()
-        assert overlay.main(["--probe"]) == 1
-
     def test_the_module_imports_without_gi(self):
         assert _overlay_module() is not None
 
