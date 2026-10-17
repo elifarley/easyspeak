@@ -72,7 +72,10 @@ KERNEL=="uinput", MODE="0660", GROUP="input"
 then `sudo udevadm control --reload-rules`, `sudo udevadm trigger`, add yourself
 to the group (`sudo usermod -aG input $USER`) and log out and back in. This is
 input-injection grade access — the same class as the `input` group hold-to-dictate
-needs — so grant it to the account that should be able to click.
+needs — so grant it to the account that should be able to click. A daemon
+(`ydotoold`) opens `/dev/uinput` once at startup and keeps that fd: permission
+changes only bite a daemon (re)started after them — the same restart the grid's
+fail-closed probe needs before it reports the injector unusable.
 
 `ydotool` ships in two command dialects, and the backend reads which one is
 installed from the client itself:
@@ -127,7 +130,8 @@ Injected motion passes through the desktop's pointer-acceleration curve, so a
 click lands where the grid says only when that curve is flat. With the default
 profile (adaptive), the cursor travels roughly twice the aimed distance —
 measured on Pop!_OS 24.04's COSMIC for both ydotool dialects, with and without
-`ydotoold`, at the output's default scale. Set the pointer acceleration
+`ydotoold`, at the output's default scale, and confirmed on KDE Plasma 6
+(KWin), where adaptive scales a grid click exactly 2x. Set the pointer acceleration
 profile to **Flat** in your desktop's settings and the clicks land inside the
 aimed cell. Switching the profile does not always apply on current cosmic-comp
 builds ([pop-os/cosmic-comp#2289](https://github.com/pop-os/cosmic-comp/issues/2289),
@@ -145,6 +149,12 @@ session:
     acceleration: Some((profile: Some(Flat), speed: 0.0)),
 )
 ```
+
+On KDE Plasma 6 the same fix lives in System Settings → Mouse & Touchpad →
+Mouse, and it is per device: open the **Device** dropdown, pick
+`ydotoold virtual device`, then set the acceleration profile to **Flat**.
+There is no working command-line equivalent on Plasma — profile entries
+written to `kcminputrc` with `kwriteconfig6` are ignored by KWin.
 
 Two traps, both verified on Pop!_OS 24.04: the struct field is `acceleration` —
 naming it after the type (`AccelConfig: (…)`) parses without error and silently

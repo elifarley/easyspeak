@@ -45,8 +45,9 @@ replacement for that extension that doesn't exist yet.
     (Ubuntu 26.04) it also needs a running `ydotoold`: that client refuses to emit
     without a socket. 0.1.8 (25.10) works without one and only warns about
     latency. Click precision follows the desktop's pointer-acceleration
-    profile: the default (adaptive) profile lands clicks roughly twice the
-    aimed distance; the Flat profile lands them exactly.
+    profile: on COSMIC and KDE Plasma 6 alike, the default (adaptive)
+    profile lands clicks roughly twice the aimed distance; the Flat profile
+    lands them exactly.
 
 KDE Plasma support is new, so this table reflects a first test on Plasma 6. If you
 find something that works differently, please [report it][issues].
