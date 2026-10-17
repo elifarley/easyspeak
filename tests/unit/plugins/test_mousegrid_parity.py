@@ -231,7 +231,15 @@ BATTERY = [
     # ydotool loop must skip it the same way — before this row, it reached
     # `subdivide`, raised KeyError, and killed the session on one backend
     # only (the adversarial pass verified the crash by execution).
-    ("０", ("Hide",), (), True, (), (), True),
+    (
+        "０",  # noqa: RUF001 — the fullwidth zero IS the fixture data
+        ("Hide",),
+        (),
+        True,
+        (),
+        (),
+        True,
+    ),
     ("nudge up 5", ("Update", "Hide"), (), True, (), (BOUNDARY,), True),
     ("up 5", ("Update", "Hide"), (), True, (), (BOUNDARY,), True),
     ("up", ("Update", "Hide"), (), True, (), (BOUNDARY,), True),

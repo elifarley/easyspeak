@@ -1027,9 +1027,10 @@ def _run_mode(core):
                     # A parsed "digit" outside the 1-9 zones is the
                     # extension's silent no-op (`update_grid` returns False
                     # at its own ZONE_MAP guard), not a crash: a fullwidth
-                    # zero passes `isdecimal` exactly like ３ does, and
-                    # letting it reach `subdivide` killed this backend's
-                    # session on an utterance the extension shrugs off.
+                    # zero passes `isdecimal` exactly like a fullwidth three
+                    # does, and letting it reach `subdivide` killed this
+                    # backend's session on an utterance the extension shrugs
+                    # off.
                     continue
                 _bounds = subdivide(_bounds, zone)
                 applied = True
