@@ -2457,11 +2457,8 @@ class TestReadUntil:
         """
         path = tmp_path / "stream"
         path.write_text('42\n"stray"\n{"event": "ready"}\n', encoding="utf-8")
-        with caplog.at_level("WARNING"):
-            with path.open() as stream:
-                assert g.read_until(stream, time.monotonic() + 5) == {
-                    "event": "ready"
-                }
+        with caplog.at_level("WARNING"), path.open() as stream:
+            assert g.read_until(stream, time.monotonic() + 5) == {"event": "ready"}
         assert any("non-object protocol line" in r.message for r in caplog.records)
 
 
