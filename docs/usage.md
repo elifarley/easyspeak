@@ -144,4 +144,5 @@ not packaged.
 | ------------------------ | ------- | -------------------------------------------------------------- |
 | `EASYSPEAK_GRID_BACKEND` | probed  | `uinput` or `gnome`: force one grid backend instead of probing. `uinput` skips the probes entirely. |
 | `EASYSPEAK_GRID_PYTHON`  | probed  | Path to an interpreter with PyGObject and the gtk4-layer-shell typelib, if the probe cannot find one. |
+| `EASYSPEAK_GRID_TYPELIB` | unset   | Path to an uninstalled gtk4-layer-shell build tree's `src` directory, prepended to `GI_TYPELIB_PATH` and `LD_LIBRARY_PATH` for the helper and its probes — the fallback where no distro packages the layer-shell stack. |
 | `EASYSPEAK_GRID_DRY_RUN` | unset   | Test seam: every injection reports `ran` without spawning `ydotool`. Leave unset outside the test harness — a session with it set answers clicks without touching the pointer. |
