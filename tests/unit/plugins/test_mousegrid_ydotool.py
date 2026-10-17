@@ -628,6 +628,30 @@ class TestSocketDiscovery:
         assert asked == [order[1], order[0], order[1], "/tmp/.ydotool_socket"]
         assert g._socket_last_good is None
 
+        # Fifth call: the resolution environment changes (a nested compositor
+        # repoints YDOTOOL_SOCKET) — the last-good cache is keyed to that
+        # environment, so the stale path is not even probed; the fresh
+        # override answers instead (mutation-verified: dropping the
+        # `_socket_last_good_env == env_key` compare kept the suite green
+        # while the old path was probed first and reused).
+        monkeypatch.setenv("YDOTOOL_SOCKET", "/override/.ydotool_socket")
+        monkeypatch.setattr(
+            g,
+            "ydotool_socket_candidates",
+            lambda: ["/override/.ydotool_socket", order[1]],
+        )
+        monkeypatch.setattr(
+            g,
+            "_socket_accepts",
+            lambda path, timeout=g.PROBE_TIMEOUT: (
+                asked.append(path) or path == "/override/.ydotool_socket"
+            ),
+        )
+        asked.clear()
+        assert g.injector_socket() == "/override/.ydotool_socket"
+        assert asked == ["/override/.ydotool_socket"]
+        assert g._socket_last_good == "/override/.ydotool_socket"
+
     def test_repeated_paths_are_collapsed(self, monkeypatch):
         uid = os.getuid()
         monkeypatch.setenv("YDOTOOL_SOCKET", f"/run/user/{uid}/.ydotool_socket")
@@ -989,6 +1013,24 @@ class TestInterpreterResolution:
             Mock(side_effect=AssertionError("a cached resolver must not re-probe")),
         )
         assert g.grid_python() == "/opt/grid/python3"
+
+        # A repoint invalidates the cache: the new override is probed and
+        # returned, and clearing the override falls back to the built-ins —
+        # neither may silently answer with the old interpreter (mutation-
+        # verified: dropping the `_grid_python_override == override` compare
+        # kept the suite green while a stale interpreter was returned for
+        # ever).
+        monkeypatch.setenv("EASYSPEAK_GRID_PYTHON", "/elsewhere/python3")
+        monkeypatch.setattr(
+            g.subprocess,
+            "run",
+            lambda cmd, **kwargs: seen.append(list(cmd)) or Mock(returncode=0),
+        )
+        assert g.grid_python() == "/elsewhere/python3"
+        assert seen[-1][0] == "/elsewhere/python3"
+        monkeypatch.delenv("EASYSPEAK_GRID_PYTHON")
+        assert g.grid_python() == g.GRID_PYTHON_CANDIDATES[0]
+        assert seen[-1][0] == g.GRID_PYTHON_CANDIDATES[0]
 
 
 class TestAdapterArgv:
@@ -2529,16 +2571,27 @@ class TestHelperLifecycle:
         assert any("survived SIGKILL" in r.message for r in caplog.records)
         assert g._helper is None
 
-    def test_a_broken_pipe_swallows_the_command(self, monkeypatch, caplog):
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            BrokenPipeError("the helper is gone"),
+            # The ValueError arm covers writing or flushing a stream that was
+            # already closed (the wrapper's own close, or interpreter GC).
+            ValueError("I/O operation on closed file"),
+        ],
+        ids=["broken-pipe", "closed-stream"],
+    )
+    def test_a_failed_write_swallows_the_command(self, monkeypatch, caplog, exc):
         """A helper that died between the handshake and a command is not a
         crash: the write fails, the line is dropped, the log says so, and the
         dead stream is closed so the undelivered line is not re-flushed - and
         reported as an ignored exception - when the wrapper is collected."""
         stdin = Mock()
-        stdin.write.side_effect = BrokenPipeError("the helper is gone")
+        stdin.write.side_effect = exc
         monkeypatch.setattr(g, "_helper", Mock(stdin=stdin, poll=Mock(return_value=1)))
         with caplog.at_level("WARNING"):
             assert g._send({"cmd": "hide"}) is False
+        # The log names the drop, not the exception class.
         assert any("the helper is gone" in r.message for r in caplog.records)
         stdin.close.assert_called_once_with()
 
@@ -2646,6 +2699,12 @@ class TestOverlayPureParts:
         assert overlay.parse_command('{"cmd": "hide"}') == {"cmd": "hide"}
         assert overlay.parse_command("") is None
         assert overlay.parse_command("{oops") is None
+        # A parsable non-object line is noise, not a command: handle_line asks
+        # `.get("cmd")` on whatever this returns, so returning the bare payload
+        # would raise AttributeError inside the GLib stdin watch and strand the
+        # live helper — the helper-side twin of read_until's non-object guard.
+        assert overlay.parse_command("42") is None
+        assert overlay.parse_command('"stray"') is None
 
     def test_usable_bounds_absorbs_a_malformed_show(self):
         """protects: one malformed show message must not take the stdin watch
@@ -2786,6 +2845,14 @@ class TestOverlayGridFace:
         assert m["center"] == (511, 384)
         assert m["cross_size"] == 50  # min(50, 96)
         assert m["cells"][0] == (1, 366.5, 271.0)
+
+    def test_the_font_size_clamps_at_the_floor_for_deep_cells(self):
+        """The lower clamp is production-reachable at exactly the cell the
+        live harness aims at (1920x1080 depth 3: 71x40 -> 71//3//3 = 7); a
+        `max(0, ...)` mutation would draw unreadable digits while every other
+        font assertion stays green."""
+        overlay = _overlay_module()
+        assert overlay.grid_metrics((0, 0, 71, 40))["font_size"] == 24
 
     def test_the_centre_formula_never_drifts_from_common(self):
         """`_overlay` must stay import-standalone (it runs as a bare script

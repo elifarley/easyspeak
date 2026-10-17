@@ -61,6 +61,25 @@ EXPECTED_CELL = (1351, 280, 71, 40)
 EXPECTED_TOLERANCE = 10  # a quarter of the cell's smaller dimension, 40
 
 
+@pytest.fixture(autouse=True)
+def _fresh_backend_state(monkeypatch):
+    """The gate tests exercise the backend's real module state machine, so
+    reset it around every test: a failed injector probe records a discovery
+    failure whose 1s cooldown would otherwise short-circuit the next test's
+    resolver into a false skip, and setup() rebinds the dispatcher's globals.
+    The same discipline the unit suite's `_fresh_client_state` enforces."""
+    monkeypatch.setattr(backend, "_dialect", None)
+    monkeypatch.setattr(backend, "_active", False)
+    monkeypatch.setattr(backend, "_socket_last_good", None)
+    monkeypatch.setattr(backend, "_socket_last_good_env", None)
+    monkeypatch.setattr(backend, "_socket_search_failed", None)
+    monkeypatch.setattr(backend, "_grid_python", None)
+    monkeypatch.setattr(backend, "_grid_python_override", None)
+    monkeypatch.setattr(backend, "_grid_python_found", False)
+    monkeypatch.setattr(mousegrid, "_backend", mousegrid._extension)
+    monkeypatch.setattr(mousegrid, "COMMANDS", mousegrid._COMMANDS_FULL)
+
+
 def _missing_prerequisite():
     """What stops the harness from running here, or None when nothing does.
 
