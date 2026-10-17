@@ -132,6 +132,22 @@ _last_bounds = None
 _helper = None
 _dialect = None
 
+# --- Injector plumbing (backend-agnostic) -----------------------------------
+#
+# The ydotool-facing helpers in this file — `_probe_dialect`, `dialect`,
+# `ydotool_socket_candidates`, `_socket_owned`, `_socket_env_key`,
+# `injector_socket`, `_client_env`, `_spawn`, `_run_bounded`,
+# `run_ydotool`, `_socket_accepts`, `parse_tool_list`, `_probe_tools`,
+# `_probe_injector`, and `noop_argv` — speak ydotool dialects, sockets
+# and bounded runs, not the mouse grid. They are earmarked for
+# extraction into core by the compositor-agnostic key-injection
+# follow-up (docs/superpowers/specs/2026-10-17-compositor-agnostic-
+# typing-for-easyspeak-design.md, section 4.3), which parameterizes the
+# probe's verb surface (`YDTOOL_VERBS` is the grid's) and adds key and
+# chord synthesis. The pointer verbs, overlay helper plumbing, gate
+# policy (`activate` / `resolve_active`), and conversation below stay
+# grid-owned.
+
 
 def _probe_dialect():
     """Read the installed client's argv dialect from the client itself.
@@ -703,6 +719,12 @@ def _probe_injector():
     backend rather than a grid that cannot click. Every other half still fails
     closed the same way: no binary, no verbs, or a probe that does not report
     `ran`.
+
+    The verb check compares against `YDTOOL_VERBS`, which is the mouse grid's
+    surface. A consumer with a different verb set — the compositor-agnostic
+    key-injection follow-up and its `key` verb — parameterizes that list and
+    keeps the rest of this probe (binary presence, dialect, socket, no-op)
+    exactly as it stands.
     """
     if shutil.which("ydotool") is None:
         logger.info("grid: ydotool is not installed")
@@ -812,6 +834,9 @@ def resolve_active():
     _active = overlay and injector
     logger.info("grid backend %s", "active" if _active else "inert")
     return _active
+
+
+# --- Grid conversation: session, overlay lifecycle, pointer verbs -----------
 
 
 def _dismiss():
